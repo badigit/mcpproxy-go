@@ -62,6 +62,11 @@ components:
           $ref: '#/components/schemas/secureenv.EnvConfig'
         features:
           $ref: '#/components/schemas/config.FeatureFlags'
+        instructions:
+          description: |-
+            Instructions text returned in the MCP initialize response to guide AI agents.
+            When empty, a built-in default is used that explains retrieve_tools workflow.
+          type: string
         intent_declaration:
           $ref: '#/components/schemas/config.IntentDeclarationConfig'
         listen:
@@ -458,6 +463,8 @@ components:
       type: object
     config.ServerConfig:
       properties:
+        annotation_defaults:
+          $ref: '#/components/schemas/config.ToolAnnotations'
         args:
           items:
             type: string
@@ -560,6 +567,23 @@ components:
           type: boolean
         encoding:
           description: Default encoding (e.g., "cl100k_base")
+          type: string
+      type: object
+    config.ToolAnnotations:
+      description: |-
+        AnnotationDefaults provides fallback tool annotations for upstream servers
+        that don't supply their own. Individual hint fields are applied only when
+        the upstream tool has nil for that specific hint (per-field merge).
+      properties:
+        destructiveHint:
+          type: boolean
+        idempotentHint:
+          type: boolean
+        openWorldHint:
+          type: boolean
+        readOnlyHint:
+          type: boolean
+        title:
           type: string
       type: object
     configimport.FailedServer:

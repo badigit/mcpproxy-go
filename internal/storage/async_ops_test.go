@@ -243,8 +243,9 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		"Updated":        true, // Updated is set by saveServerSync, not copied
 		"Isolation":      true,
 		"Shared":         true, // Teams-only: persisted in JSON config, not in BBolt
-		"SkipQuarantine": true, // Spec 032: runtime-only field, not persisted to BBolt
-		"ReconnectOnUse": true, // Spec 354: persisted to BBolt for on-demand reconnection
+		"SkipQuarantine":    true, // Spec 032: runtime-only field, not persisted to BBolt
+		"ReconnectOnUse":    true, // Spec 354: persisted to BBolt for on-demand reconnection
+		"AnnotationDefaults": true, // Fork: per-server annotation defaults, runtime-only config
 	}
 
 	// Get all fields from ServerConfig
@@ -278,6 +279,10 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		}
 		if fieldName == "SkipQuarantine" {
 			// Spec 032: runtime-only field, not persisted to BBolt
+			continue
+		}
+		if fieldName == "AnnotationDefaults" {
+			// Fork: per-server annotation defaults, runtime-only config not persisted to BBolt
 			continue
 		}
 		if !upstreamFields[fieldName] {
