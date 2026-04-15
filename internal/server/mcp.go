@@ -925,6 +925,54 @@ func (p *MCPProxyServer) handleListRegistries(ctx context.Context, _ mcp.CallToo
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
 
+// buildServerCatalog returns a catalog of connected servers and their tool names.
+// Used as fallback when BM25 search returns zero results.
+// Each server entry includes at most maxToolsPerServer tool names.
+func (p *MCPProxyServer) buildServerCatalog(ctx context.Context, maxToolsPerServer int) []map[string]interface{} {
+	clients := p.upstreamManager.GetAllClients()
+	var catalog []map[string]interface{}
+
+	for name, client := range clients {
+		cfg := client.GetConfig()
+		if cfg == nil || !cfg.Enabled || cfg.Quarantined {
+			continue
+		}
+		if !client.IsConnected() {
+			continue
+		}
+
+		tools, err := client.ListTools(ctx)
+		if err != nil || len(tools) == 0 {
+			continue
+		}
+
+		toolNames := make([]string, 0, len(tools))
+		for _, t := range tools {
+			// Extract tool name without server prefix
+			toolName := t.Name
+			if idx := strings.Index(toolName, ":"); idx >= 0 {
+				toolName = toolName[idx+1:]
+			}
+			toolNames = append(toolNames, toolName)
+		}
+
+		entry := map[string]interface{}{
+			"server":     name,
+			"tool_count": len(toolNames),
+		}
+
+		if len(toolNames) > maxToolsPerServer {
+			entry["tools"] = toolNames[:maxToolsPerServer]
+		} else {
+			entry["tools"] = toolNames
+		}
+
+		catalog = append(catalog, entry)
+	}
+
+	return catalog
+}
+
 // handleRetrieveToolsForMode returns a handler closure with the routing mode baked in.
 // This allows the retrieve_tools handler to adapt its usage_instructions based on
 // whether it's being used in code_execution mode or retrieve_tools (call_tool) mode.
@@ -1151,6 +1199,17 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		"query":              query,
 		"total":              len(results),
 		"usage_instructions": usageInstructions,
+	}
+
+	// Fallback: when BM25 returns zero results, include a server catalog
+	// so the agent can see what tools exist and retry with exact names.
+	if len(results) == 0 {
+		catalog := p.buildServerCatalog(ctx, 10)
+		if len(catalog) > 0 {
+			response["fallback"] = "no_results"
+			response["hint"] = "No tools matched your query. Browse the catalog below and retry with an exact tool name, or try different keywords."
+			response["catalog"] = catalog
+		}
 	}
 
 	// Spec 035 F2: Session risk analysis — analyze all connected servers' tool annotations
