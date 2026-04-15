@@ -211,6 +211,11 @@ type ServerConfig struct {
 	Isolation      *IsolationConfig  `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
 	ReconnectOnUse bool              `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
 
+	// AllowedTools restricts which tools are exposed from this server.
+	// When non-empty, only tools whose names appear in this list are indexed
+	// and available for discovery. An empty list means all tools are allowed.
+	AllowedTools []string `json:"allowed_tools,omitempty" mapstructure:"allowed-tools"`
+
 	// AnnotationDefaults provides fallback tool annotations for upstream servers
 	// that don't supply their own. Individual hint fields are applied only when
 	// the upstream tool has nil for that specific hint (per-field merge).

@@ -317,6 +317,11 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 			}
 		}
 
+		// Skip tools not in the allowed list (when configured)
+		if len(c.config.AllowedTools) > 0 && !isToolAllowed(tool.Name, c.config.AllowedTools) {
+			continue
+		}
+
 		// Compute hash for tool change detection
 		// Hash is based on serverName + toolName + inputSchema
 		toolMeta.Hash = hash.ComputeToolHash(c.config.Name, tool.Name, tool.Description, tool.InputSchema)
@@ -760,4 +765,14 @@ func mergeAnnotationDefaults(dst, defaults *config.ToolAnnotations) {
 	if dst.Title == "" && defaults.Title != "" {
 		dst.Title = defaults.Title
 	}
+}
+
+// isToolAllowed checks if a tool name is in the allowed list.
+func isToolAllowed(name string, allowed []string) bool {
+	for _, a := range allowed {
+		if a == name {
+			return true
+		}
+	}
+	return false
 }
