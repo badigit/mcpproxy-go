@@ -424,21 +424,21 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 
 	switch variant {
 	case contracts.ToolVariantRead:
-		description = "Execute a READ-ONLY tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: search, query, list, get, fetch, find, check, view, read, show, describe, lookup, retrieve, browse, explore, discover, scan, inspect, analyze, examine, validate, verify. Examples: search_files, get_user, list_repositories, query_database, find_issues, check_status. This is the DEFAULT choice when unsure - most tools are read-only."
+		description = "Execute a read-only upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For data retrieval operations without side effects. This is the DEFAULT choice when unsure."
 		title = "Call Tool (Read)"
 		nameExample = "github:get_user"
 		sensitivityDesc = "Classify data being accessed: public, internal, private, or unknown. Helps track sensitive data access patterns."
 		reasonDesc = "Why is this tool being called? Provide context like 'User asked to check status' or 'Gathering data for report'."
 		opts = []mcp.ToolOption{mcp.WithReadOnlyHintAnnotation(true)}
 	case contracts.ToolVariantWrite:
-		description = "Execute a STATE-MODIFYING tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: create, update, modify, add, set, send, edit, change, write, post, put, patch, insert, upload, submit, assign, configure, enable, register, subscribe, publish, move, copy, rename, merge. Examples: create_issue, update_file, send_message, add_comment, set_status, edit_page. Use only when explicitly modifying state."
+		description = "Execute a state-modifying upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For create, update, send, and other write operations."
 		title = "Call Tool (Write)"
 		nameExample = "github:create_issue"
 		sensitivityDesc = "Classify data being modified: public, internal, private, or unknown. Helps track sensitive data changes."
 		reasonDesc = "Why is this modification needed? Provide context like 'User requested update' or 'Fixing reported issue'."
 		opts = []mcp.ToolOption{mcp.WithDestructiveHintAnnotation(false)}
 	case contracts.ToolVariantDestructive:
-		description = "Execute a DESTRUCTIVE tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: delete, remove, drop, revoke, disable, destroy, purge, reset, clear, unsubscribe, cancel, terminate, close, archive, ban, block, disconnect, kill, wipe, truncate, force, hard. Examples: delete_repo, remove_user, drop_table, revoke_access, clear_cache, terminate_session. Use for irreversible or high-impact operations."
+		description = "Execute a destructive upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For delete, remove, and other irreversible operations."
 		title = "Call Tool (Destructive)"
 		nameExample = "github:delete_repo"
 		sensitivityDesc = "Classify data being deleted: public, internal, private, or unknown. Important for tracking destructive operations on sensitive data."
@@ -483,7 +483,7 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 func (p *MCPProxyServer) registerTools(_ bool) {
 	// retrieve_tools - THE PRIMARY TOOL FOR DISCOVERING TOOLS - Enhanced with clear instructions
 	retrieveToolsTool := mcp.NewTool("retrieve_tools",
-		mcp.WithDescription("🔍 CALL THIS FIRST to discover relevant tools! This is the primary tool discovery mechanism that searches across ALL upstream MCP servers using intelligent BM25 full-text search. Always use this before attempting to call any specific tools. Use natural language to describe what you want to accomplish (e.g., 'create GitHub repository', 'query database', 'weather forecast'). Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation indicating which tool variant to use (call_tool_read/write/destructive). Then use the recommended variant with an 'intent' parameter. NOTE: Quarantined servers are excluded from search results for security. Use 'quarantine_security' tool to examine and manage quarantined servers. TO ADD NEW SERVERS: Use 'list_registries' then 'search_servers' to find and add new MCP servers."),
+		mcp.WithDescription("PRIMARY TOOL DISCOVERY — must be called before using any upstream tools. Searches all connected MCP servers using BM25 full-text search. Describe what you need in natural language (e.g., 'create GitHub issue', 'find company by INN', 'list CRM deals'). Returns matching tools with exact names, inputSchema, annotations, and call_with recommendation indicating which variant to use (call_tool_read/write/destructive). Quarantined servers excluded from results. To add NEW servers: use list_registries + search_servers instead."),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
@@ -645,7 +645,7 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 	// search_servers - Registry search and discovery
 	{
 		searchServersTool := mcp.NewTool("search_servers",
-			mcp.WithDescription("🔍 Discover MCP servers from known registries with repository type detection. Search and filter servers from embedded registry list to find new MCP servers that can be added as upstreams. Features npm/PyPI package detection for enhanced install commands. WORKFLOW: 1) Call 'list_registries' first to see available registries, 2) Use this tool with a registry ID to search servers. Results include server URLs and repository information ready for direct use with upstream_servers add command."),
+			mcp.WithDescription("Browse external registries to find and add NEW upstream MCP servers. Not for discovering existing tools — use retrieve_tools for that. Call list_registries first to see available registries, then search within a registry by name or description."),
 			mcp.WithTitleAnnotation("Search Servers"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("registry",
@@ -668,7 +668,7 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 	// list_registries - Explicit registry discovery tool
 	{
 		listRegistriesTool := mcp.NewTool("list_registries",
-			mcp.WithDescription("📋 List all available MCP registries. Use this FIRST to discover which registries you can search with the 'search_servers' tool. Each registry contains different collections of MCP servers that can be added as upstreams."),
+			mcp.WithDescription("List available external MCP server registries for use with search_servers."),
 			mcp.WithTitleAnnotation("List Registries"),
 			mcp.WithReadOnlyHintAnnotation(true),
 		)
