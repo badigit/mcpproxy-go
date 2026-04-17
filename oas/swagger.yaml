@@ -474,6 +474,22 @@ components:
           type: string
         created:
           type: string
+        disable_enrichment:
+          description: |-
+            DisableEnrichment skips the LLM enrichment step for this server even
+            when enrichment is globally enabled. Useful for servers whose tool
+            descriptions are already high quality or for air-gapped environments.
+          type: boolean
+        domain_tags:
+          description: |-
+            DomainTags classifies this server into high-level domains used for
+            catalog grouping in retrieve_tools responses (e.g. ["crm", "sales"]).
+            First entry is the server's default tool domain when no per-tool
+            override is known.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         enabled:
           type: boolean
         env:
@@ -501,12 +517,31 @@ components:
           description: Attempt reconnection when a tool call targets a disconnected
             server
           type: boolean
+        search_aliases:
+          description: |-
+            SearchAliases adds keywords that boost every tool on this server when
+            matched by a retrieve_tools query. Use for cross-language synonyms,
+            short forms, or common misspellings (e.g. ["битрикс", "b24", "crm"]).
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         shared:
           description: 'Server edition: shared with all users'
           type: boolean
         skip_quarantine:
           description: Skip tool-level quarantine for this server
           type: boolean
+        tool_aliases:
+          additionalProperties:
+            items:
+              type: string
+            type: array
+          description: |-
+            ToolAliases maps a tool's base name (without the server prefix) to
+            extra keywords that boost only that tool. Takes precedence over
+            SearchAliases and LLM-derived keywords at the same rank.
+          type: object
         updated:
           type: string
         url:
