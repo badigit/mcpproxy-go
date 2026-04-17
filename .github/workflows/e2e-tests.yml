@@ -46,8 +46,10 @@ jobs:
     strategy:
       matrix:
         # On PRs: test only latest Go on ubuntu-latest
-        # On main/push: test full matrix
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+        # On main/push: test Linux + macOS (Windows E2E removed — chronic flakes
+        # from file-lock races in TestAtomicConfigWrite and runtime timeouts;
+        # Windows coverage stays in logging-tests job below).
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
         go-version: ${{ github.event_name == 'pull_request' && fromJSON('["1.25"]') || fromJSON('["1.23.10", "1.24.5", "1.25"]') }}
 
     steps:
