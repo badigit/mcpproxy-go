@@ -430,6 +430,51 @@ func (m *Manager) DeleteServerToolApprovals(serverName string) error {
 	return m.db.DeleteServerToolApprovals(serverName)
 }
 
+// Tool enrichment operations (LLM-derived search metadata cache)
+
+// SaveToolEnrichment persists an enrichment result. Overwrites any prior
+// entry for the same (server, tool) pair.
+func (m *Manager) SaveToolEnrichment(record *EnrichedToolMeta) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveToolEnrichment(record)
+}
+
+// GetToolEnrichment returns a cached enrichment if the stored description
+// hash and prompt version match. A mismatch is reported as a cache miss.
+func (m *Manager) GetToolEnrichment(serverName, toolName, descriptionHash string, promptVersion int) (*EnrichedToolMeta, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetToolEnrichment(serverName, toolName, descriptionHash, promptVersion)
+}
+
+// ListToolEnrichments returns every stored enrichment, optionally scoped
+// to a single server.
+func (m *Manager) ListToolEnrichments(serverName string) ([]*EnrichedToolMeta, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListToolEnrichments(serverName)
+}
+
+// DeleteToolEnrichment removes a single enrichment record.
+func (m *Manager) DeleteToolEnrichment(serverName, toolName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteToolEnrichment(serverName, toolName)
+}
+
+// DeleteServerToolEnrichments removes every enrichment record for a server.
+func (m *Manager) DeleteServerToolEnrichments(serverName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteServerToolEnrichments(serverName)
+}
+
 // Security Scanner methods (Spec 039)
 
 // SaveScanner saves a scanner plugin record

@@ -86,6 +86,7 @@ func (b *BoltDB) initBuckets() error {
 			ToolStatsBucket,
 			ToolHashBucket,
 			ToolApprovalBucket,
+			ToolEnrichmentBucket,
 			OAuthTokenBucket,
 			MetaBucket,
 			ActivityRecordsBucket,

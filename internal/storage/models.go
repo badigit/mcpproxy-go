@@ -19,6 +19,9 @@ const (
 	CacheStatsBucket      = "cache_stats"
 	SessionsBucket        = "sessions"
 
+	// Tool enrichment cache (Spec 2026-04-17)
+	ToolEnrichmentBucket = "tool_enrichment"
+
 	// Security scanner buckets (Spec 039)
 	ScannersBucket           = "security_scanners"
 	ScanJobsBucket           = "security_scan_jobs"
@@ -220,4 +223,41 @@ func (d *DockerRecoveryState) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary implements encoding.BinaryUnmarshaler
 func (d *DockerRecoveryState) UnmarshalBinary(data []byte) error {
 	return json.Unmarshal(data, d)
+}
+
+// EnrichedToolMeta is the cached result of LLM-based tool enrichment.
+// Each record captures search keywords, example user queries, and a
+// single domain tag for one upstream tool. Entries live in
+// ToolEnrichmentBucket keyed by EnrichmentCacheKey(server, tool, description, promptVersion).
+//
+// The cache is invalidated automatically when the underlying tool's
+// description changes (different hash) or when the enrichment prompt
+// template is bumped (different PromptVersion).
+type EnrichedToolMeta struct {
+	ServerName      string    `json:"server_name"`
+	ToolName        string    `json:"tool_name"`
+	DescriptionHash string    `json:"description_hash"` // sha256 hex of source description; used for invalidation
+	Keywords        []string  `json:"keywords,omitempty"`
+	ExampleQueries  []string  `json:"example_queries,omitempty"`
+	Domain          string    `json:"domain,omitempty"`
+	PromptVersion   int       `json:"prompt_version"`
+	Model           string    `json:"model,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// EnrichmentKey returns the BBolt key for a tool enrichment record.
+// The key is "<server>:<tool>"; invalidation is done by matching
+// DescriptionHash and PromptVersion inside the value.
+func EnrichmentKey(serverName, toolName string) string {
+	return serverName + ":" + toolName
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler
+func (e *EnrichedToolMeta) MarshalBinary() ([]byte, error) {
+	return json.Marshal(e)
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler
+func (e *EnrichedToolMeta) UnmarshalBinary(data []byte) error {
+	return json.Unmarshal(data, e)
 }

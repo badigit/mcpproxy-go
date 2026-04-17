@@ -215,6 +215,27 @@ type ServerConfig struct {
 	// that don't supply their own. Individual hint fields are applied only when
 	// the upstream tool has nil for that specific hint (per-field merge).
 	AnnotationDefaults *ToolAnnotations `json:"annotation_defaults,omitempty" mapstructure:"annotation-defaults"`
+
+	// SearchAliases adds keywords that boost every tool on this server when
+	// matched by a retrieve_tools query. Use for cross-language synonyms,
+	// short forms, or common misspellings (e.g. ["битрикс", "b24", "crm"]).
+	SearchAliases []string `json:"search_aliases,omitempty" mapstructure:"search-aliases"`
+
+	// DomainTags classifies this server into high-level domains used for
+	// catalog grouping in retrieve_tools responses (e.g. ["crm", "sales"]).
+	// First entry is the server's default tool domain when no per-tool
+	// override is known.
+	DomainTags []string `json:"domain_tags,omitempty" mapstructure:"domain-tags"`
+
+	// ToolAliases maps a tool's base name (without the server prefix) to
+	// extra keywords that boost only that tool. Takes precedence over
+	// SearchAliases and LLM-derived keywords at the same rank.
+	ToolAliases map[string][]string `json:"tool_aliases,omitempty" mapstructure:"tool-aliases"`
+
+	// DisableEnrichment skips the LLM enrichment step for this server even
+	// when enrichment is globally enabled. Useful for servers whose tool
+	// descriptions are already high quality or for air-gapped environments.
+	DisableEnrichment bool `json:"disable_enrichment,omitempty" mapstructure:"disable-enrichment"`
 }
 
 // OAuthConfig represents OAuth configuration for a server

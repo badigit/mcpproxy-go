@@ -246,6 +246,10 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		"SkipQuarantine":    true, // Spec 032: runtime-only field, not persisted to BBolt
 		"ReconnectOnUse":    true, // Spec 354: persisted to BBolt for on-demand reconnection
 		"AnnotationDefaults": true, // Fork: per-server annotation defaults, runtime-only config
+		"SearchAliases":     true, // Fork: config-only search metadata, sourced from JSON config
+		"DomainTags":        true, // Fork: config-only domain grouping, sourced from JSON config
+		"ToolAliases":       true, // Fork: config-only per-tool aliases, sourced from JSON config
+		"DisableEnrichment": true, // Fork: config-only enrichment opt-out, sourced from JSON config
 	}
 
 	// Get all fields from ServerConfig
@@ -283,6 +287,11 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		}
 		if fieldName == "AnnotationDefaults" {
 			// Fork: per-server annotation defaults, runtime-only config not persisted to BBolt
+			continue
+		}
+		switch fieldName {
+		case "SearchAliases", "DomainTags", "ToolAliases", "DisableEnrichment":
+			// Fork (spec 2026-04-17): config-only search metadata, not persisted to BBolt
 			continue
 		}
 		if !upstreamFields[fieldName] {

@@ -528,17 +528,18 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 	}
 
 	dst := &ServerConfig{
-		Name:           src.Name,
-		URL:            src.URL,
-		Protocol:       src.Protocol,
-		Command:        src.Command,
-		WorkingDir:     src.WorkingDir,
-		Enabled:        src.Enabled,
-		Quarantined:    src.Quarantined,
-		SkipQuarantine: src.SkipQuarantine,
-		Shared:         src.Shared,
-		Created:        src.Created,
-		Updated:        src.Updated,
+		Name:              src.Name,
+		URL:               src.URL,
+		Protocol:          src.Protocol,
+		Command:           src.Command,
+		WorkingDir:        src.WorkingDir,
+		Enabled:           src.Enabled,
+		Quarantined:       src.Quarantined,
+		SkipQuarantine:    src.SkipQuarantine,
+		Shared:            src.Shared,
+		Created:           src.Created,
+		Updated:           src.Updated,
+		DisableEnrichment: src.DisableEnrichment,
 	}
 
 	// Copy slices
@@ -564,6 +565,24 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 	// Copy nested structs
 	dst.Isolation = copyIsolationConfig(src.Isolation)
 	dst.OAuth = copyOAuthConfig(src.OAuth)
+
+	// Copy search/domain/enrichment fields
+	if src.SearchAliases != nil {
+		dst.SearchAliases = make([]string, len(src.SearchAliases))
+		copy(dst.SearchAliases, src.SearchAliases)
+	}
+	if src.DomainTags != nil {
+		dst.DomainTags = make([]string, len(src.DomainTags))
+		copy(dst.DomainTags, src.DomainTags)
+	}
+	if src.ToolAliases != nil {
+		dst.ToolAliases = make(map[string][]string, len(src.ToolAliases))
+		for k, v := range src.ToolAliases {
+			aliases := make([]string, len(v))
+			copy(aliases, v)
+			dst.ToolAliases[k] = aliases
+		}
+	}
 
 	return dst
 }
