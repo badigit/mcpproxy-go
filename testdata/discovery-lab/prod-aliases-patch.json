@@ -1,0 +1,61 @@
+{
+  "b24": {
+    "search_aliases": ["битрикс", "битрикс24", "bitrix24", "b24", "crm", "портал"],
+    "domain_tags": ["crm", "sales"],
+    "tool_aliases": {
+      "list_items_tool": ["сделки", "deals", "лиды", "leads", "контакты", "contacts", "компании", "companies", "список сделок", "recent deals", "список лидов"],
+      "get_item_tool": ["карточка", "card", "детали элемента", "item details", "get one by id"],
+      "create_item_tool": ["создать сделку", "создать контакт", "создать лид", "создать компанию", "new deal", "create contact", "create lead"],
+      "update_item_tool": ["обновить сделку", "сменить стадию", "change stage", "update deal"],
+      "list_requisites_tool": ["реквизиты", "requisites", "ИНН", "INN", "КПП", "ОГРН", "юридические данные"],
+      "get_requisite_tool": ["реквизит", "банковские реквизиты", "bank details"],
+      "list_document_templates_tool": ["шаблоны", "templates", "счёт", "invoice", "акт", "act", "договор", "contract"],
+      "list_documents_tool": ["документы", "documents", "счета", "invoices"],
+      "create_document_tool": ["создать счёт", "generate invoice", "сгенерировать документ"],
+      "list_tasks_tool": ["задачи", "tasks", "открытые задачи", "in progress"],
+      "create_task_tool": ["создать задачу", "new task", "поставить задачу"],
+      "list_activities_tool": ["активности", "звонки", "calls", "письма", "emails", "meetings", "встречи", "timeline"],
+      "get_pipelines_tool": ["воронка", "pipeline", "стадии", "stages", "воронки продаж"],
+      "list_crm_statuses_tool": ["справочники", "reference books", "статусы"],
+      "list_events_tool": ["календарь", "calendar", "встречи", "events", "расписание"],
+      "list_elapsed_tool": ["учёт времени", "time tracking", "списанные часы", "рабочее время"],
+      "bp_list_tool": ["бизнес-процессы", "роботы", "robots", "workflows"]
+    }
+  },
+  "b24-rest-docs": {
+    "search_aliases": ["битрикс документация", "bitrix rest api", "b24 docs", "справка"],
+    "domain_tags": ["documentation"]
+  },
+  "dadata": {
+    "search_aliases": ["дадата", "dadata", "контрагенты", "counterparty", "справочные"],
+    "domain_tags": ["registry_lookup", "crm"],
+    "tool_aliases": {
+      "find_party": ["поиск по ИНН", "find by INN", "ОГРН", "реквизиты компании", "контрагент"],
+      "clean_address": ["почтовый адрес", "address cleanup", "стандартизация", "КЛАДР", "ФИАС"],
+      "find_company_by_email": ["компания по email", "company by email"],
+      "find_company_by_domain": ["компания по домену", "company by domain"]
+    }
+  },
+  "beget": {
+    "search_aliases": ["бегет", "beget", "хостинг", "hosting", "vps"],
+    "domain_tags": ["infrastructure", "hosting"],
+    "tool_aliases": {
+      "backup_mysql_list": ["бэкапы mysql", "mysql backups", "резервные копии базы"],
+      "backup_files_list": ["бэкапы файлов", "file backups"],
+      "backup_restore_mysql": ["восстановить mysql", "restore database", "восстановить базу", "база данных из бэкапа"],
+      "backup_restore_file": ["восстановить файлы", "restore files"],
+      "mail_forward_add": ["пересылка почты", "mail forward"],
+      "mail_forward_delete": ["отключить пересылку", "remove forward"],
+      "cron_set_email": ["уведомления cron", "cron notifications"],
+      "dns_set_a": ["A-запись", "DNS record"]
+    }
+  },
+  "kontur-diadoc": {
+    "search_aliases": ["диадок", "diadoc", "контур", "электронный документооборот", "ЭДО", "edi"],
+    "domain_tags": ["documents", "edi"]
+  },
+  "remna": {
+    "search_aliases": ["remna", "remnawave", "vpn", "впн", "vless", "xray"],
+    "domain_tags": ["infrastructure", "vpn"]
+  }
+}
