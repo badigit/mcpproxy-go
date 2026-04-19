@@ -40,7 +40,8 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// IndexTool indexes a single tool
+// IndexTool indexes a single tool without aliases. Kept for backward
+// compatibility; prefer IndexToolWithAliases.
 func (m *Manager) IndexTool(toolMeta *config.ToolMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -48,12 +49,34 @@ func (m *Manager) IndexTool(toolMeta *config.ToolMetadata) error {
 	return m.bleveIndex.IndexTool(toolMeta)
 }
 
-// BatchIndexTools indexes multiple tools efficiently
+// IndexToolWithAliases indexes a single tool and attaches aliases.
+// The aliases string is a space-separated list of keywords merged from
+// ServerConfig.SearchAliases, ToolAliases, DomainTags, and any cached
+// LLM enrichment (see CollectAliases helper).
+func (m *Manager) IndexToolWithAliases(toolMeta *config.ToolMetadata, aliases string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.bleveIndex.IndexToolWithAliases(toolMeta, aliases)
+}
+
+// BatchIndexTools indexes multiple tools efficiently without aliases.
+// Kept for backward compatibility; prefer BatchIndexToolsWithAliases.
 func (m *Manager) BatchIndexTools(tools []*config.ToolMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	return m.bleveIndex.BatchIndex(tools)
+}
+
+// BatchIndexToolsWithAliases indexes multiple tools, looking up each
+// tool's aliases in aliasesByFullName (keyed by "<server>:<tool>").
+// Passing nil is equivalent to BatchIndexTools.
+func (m *Manager) BatchIndexToolsWithAliases(tools []*config.ToolMetadata, aliasesByFullName map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.bleveIndex.BatchIndexWithAliases(tools, aliasesByFullName)
 }
 
 // SearchTools searches for tools matching the query

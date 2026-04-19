@@ -106,28 +106,32 @@ type serverAliases struct {
 	perTool map[string][]string
 }
 
-// applyAliases mutates tool descriptions by appending configured aliases.
-// This emulates the future 'aliases' bleve field with a boost, but using the
-// existing description field — enough to demonstrate ranking impact.
-// The aliases are repeated 3× to roughly emulate a boost=3 multiplier.
-func applyAliases(tools []*config.ToolMetadata, cfg aliasesConfig) []*config.ToolMetadata {
-	out := make([]*config.ToolMetadata, len(tools))
-	for i, orig := range tools {
-		tname := strings.TrimPrefix(orig.Name, orig.ServerName+":")
-		var extras []string
-		if s, ok := cfg[orig.ServerName]; ok {
-			extras = append(extras, s.serverLevel...)
-			if tl, ok := s.perTool[tname]; ok {
-				extras = append(extras, tl...)
-			}
+// buildAliasesMap converts the lab aliasesConfig into the map-by-full-name
+// form expected by BatchIndexToolsWithAliases. This is the real code path
+// exercised in Commit B — no description mutation.
+func buildLabAliasesMap(tools []*config.ToolMetadata, cfg aliasesConfig) map[string]string {
+	if len(cfg) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(tools))
+	for _, t := range tools {
+		tname := strings.TrimPrefix(t.Name, t.ServerName+":")
+		s, ok := cfg[t.ServerName]
+		if !ok {
+			continue
 		}
-		copyOf := *orig
-		if len(extras) > 0 {
-			boosted := strings.Join(extras, " ")
-			// Repeat 3× to emulate boost.
-			copyOf.Description = orig.Description + " " + boosted + " " + boosted + " " + boosted
+		var parts []string
+		parts = append(parts, s.serverLevel...)
+		if tl, ok := s.perTool[tname]; ok {
+			parts = append(parts, tl...)
 		}
-		out[i] = &copyOf
+		if len(parts) == 0 {
+			continue
+		}
+		out[t.Name] = strings.Join(parts, " ")
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -220,7 +224,7 @@ type scenarioResult struct {
 	topK     []string // tool full names in rank order
 }
 
-func runScenario(t *testing.T, tools []*config.ToolMetadata, queries []labQuery, topK int) []scenarioResult {
+func runScenario(t *testing.T, tools []*config.ToolMetadata, aliases map[string]string, queries []labQuery, topK int) []scenarioResult {
 	t.Helper()
 	tmpDir, err := os.MkdirTemp("", "lab_bleve_*")
 	if err != nil {
@@ -234,7 +238,7 @@ func runScenario(t *testing.T, tools []*config.ToolMetadata, queries []labQuery,
 	}
 	defer idx.Close()
 
-	if err := idx.BatchIndex(tools); err != nil {
+	if err := idx.BatchIndexWithAliases(tools, aliases); err != nil {
 		t.Fatalf("batch index: %v", err)
 	}
 
@@ -340,18 +344,19 @@ func printReport(t *testing.T, label string, results []scenarioResult, m metrics
 func TestDiscoveryLab_RealProd_Baseline(t *testing.T) {
 	tools := realProdTools()
 	queries := discoveryGroundTruth()
-	results := runScenario(t, tools, queries, 5)
+	results := runScenario(t, tools, nil, queries, 5)
 	m := computeMetrics(results)
 	printReport(t, "BASELINE (no aliases, real prod descriptions)", results, m)
 }
 
-// TestDiscoveryLab_RealProd_WithAliases: measures BM25 after layering config
-// aliases (server_aliases + tool_aliases) into the indexed description.
-// This emulates the proposed 'aliases' field with boost=3.
+// TestDiscoveryLab_RealProd_WithAliases: measures BM25 after indexing
+// the dedicated "aliases" field (boost=3 at query time). Uses the real
+// BatchIndexWithAliases API — no description-inflation hack.
 func TestDiscoveryLab_RealProd_WithAliases(t *testing.T) {
-	tools := applyAliases(realProdTools(), productionAliases())
+	tools := realProdTools()
+	aliases := buildLabAliasesMap(tools, productionAliases())
 	queries := discoveryGroundTruth()
-	results := runScenario(t, tools, queries, 5)
+	results := runScenario(t, tools, aliases, queries, 5)
 	m := computeMetrics(results)
-	printReport(t, "WITH ALIASES (server+tool aliases, boost=3× via repetition)", results, m)
+	printReport(t, "WITH ALIASES (real bleve aliases field, boost=3 via SetBoost)", results, m)
 }

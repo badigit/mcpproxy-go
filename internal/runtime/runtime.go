@@ -2054,6 +2054,24 @@ func (r *Runtime) TelemetryRegistry() *telemetry.CounterRegistry {
 	return r.telemetryService.Registry()
 }
 
+// GetServerConfig returns a pointer to the ServerConfig with the given
+// name from the current runtime snapshot, or nil if no such server is
+// configured. Callers must treat the return value as read-only —
+// mutating it would race with the config hot-reload path.
+func (r *Runtime) GetServerConfig(name string) *config.ServerConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.cfg == nil {
+		return nil
+	}
+	for _, s := range r.cfg.Servers {
+		if s != nil && s.Name == name {
+			return s
+		}
+	}
+	return nil
+}
+
 // GetServerCount returns the total number of configured servers (implements telemetry.RuntimeStats).
 func (r *Runtime) GetServerCount() int {
 	r.mu.RLock()

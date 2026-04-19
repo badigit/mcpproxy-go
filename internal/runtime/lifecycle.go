@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/supervisor"
@@ -443,7 +444,7 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Error(err))
 		// Filter out blocked tools before full batch index
 		allowedTools := filterBlockedTools(newTools, approvalResult.BlockedTools)
-		return r.indexManager.BatchIndexTools(allowedTools)
+		return r.indexManager.BatchIndexToolsWithAliases(allowedTools, r.buildAliasesMap(serverName, allowedTools))
 	}
 
 	// Build maps for efficient lookup
@@ -564,7 +565,7 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Int("count", len(allowedAddedTools)),
 			zap.Int("blocked", len(addedTools)-len(allowedAddedTools)))
 
-		if err := r.indexManager.BatchIndexTools(allowedAddedTools); err != nil {
+		if err := r.indexManager.BatchIndexToolsWithAliases(allowedAddedTools, r.buildAliasesMap(serverName, allowedAddedTools)); err != nil {
 			return fmt.Errorf("failed to index added tools: %w", err)
 		}
 	}
@@ -585,12 +586,62 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 				zap.String("new_hash", tool.Hash))
 		}
 
-		if err := r.indexManager.BatchIndexTools(allowedModifiedTools); err != nil {
+		if err := r.indexManager.BatchIndexToolsWithAliases(allowedModifiedTools, r.buildAliasesMap(serverName, allowedModifiedTools)); err != nil {
 			return fmt.Errorf("failed to re-index modified tools: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// buildAliasesMap returns a per-tool aliases string keyed by the tool's
+// full name ("<server>:<tool>") for use with BatchIndexToolsWithAliases.
+// Looks up the server's ServerConfig for manual search_aliases/tool_aliases/
+// domain_tags, and (when enabled) merges any cached LLM enrichment.
+// Returns nil when neither source contributes anything — callers can pass
+// nil directly and BatchIndexToolsWithAliases will skip alias work.
+func (r *Runtime) buildAliasesMap(serverName string, tools []*config.ToolMetadata) map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+
+	// Locate the server's config. Runtime holds the current config snapshot
+	// in r.cfg; reads here are racy by design (indexing is driven by config
+	// changes and a concurrent config reload will just retrigger indexing).
+	var serverCfg *config.ServerConfig
+	if r.cfg != nil {
+		for _, s := range r.cfg.Servers {
+			if s != nil && s.Name == serverName {
+				serverCfg = s
+				break
+			}
+		}
+	}
+
+	if serverCfg == nil && r.storageManager == nil {
+		return nil
+	}
+
+	out := make(map[string]string, len(tools))
+	for _, t := range tools {
+		toolBaseName := t.Name
+		if idx := strings.Index(t.Name, ":"); idx != -1 {
+			toolBaseName = t.Name[idx+1:]
+		}
+
+		// LLM enrichment lookup is wired here but intentionally left
+		// unused in Commit B — Commit C populates the cache and this
+		// call returns (nil, false, nil) until then.
+		aliases := index.CollectAliases(serverCfg, toolBaseName, nil)
+		if aliases == "" {
+			continue
+		}
+		out[t.Name] = aliases
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // filterBlockedTools removes tools that are blocked by quarantine from the list.

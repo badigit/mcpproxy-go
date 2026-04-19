@@ -28,6 +28,12 @@ type ToolDocument struct {
 	ParamsJSON     string `json:"params_json"`
 	Hash           string `json:"hash"`
 	Tags           string `json:"tags"`
+	// Aliases collects keywords from per-server SearchAliases, per-tool
+	// ToolAliases, DomainTags, and LLM enrichment (keywords +
+	// example_queries). Indexed with boost=3 via SearchTools so a match
+	// here outranks a match in Description. Stored so we can return it
+	// to debug consumers; empty when no aliases are configured.
+	Aliases        string `json:"aliases,omitempty"`
 	SearchableText string `json:"searchable_text"` // Combined searchable content
 }
 
@@ -111,6 +117,15 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	tagsField.Index = true
 	toolMapping.AddFieldMappingsAt("tags", tagsField)
 
+	// Aliases field (standard analyzer) — user-configured search aliases
+	// and LLM-enriched keywords/example_queries. Boost is applied at
+	// query time (see SearchTools), not here.
+	aliasesField := bleve.NewTextFieldMapping()
+	aliasesField.Analyzer = standard.Name
+	aliasesField.Store = true
+	aliasesField.Index = true
+	toolMapping.AddFieldMappingsAt("aliases", aliasesField)
+
 	// Searchable text field (standard analyzer) - combines all searchable content
 	searchableTextField := bleve.NewTextFieldMapping()
 	searchableTextField.Analyzer = standard.Name
@@ -131,8 +146,18 @@ func (b *BleveIndex) Close() error {
 	return b.index.Close()
 }
 
-// IndexTool indexes a tool document
+// IndexTool indexes a tool document with no aliases. Prefer
+// IndexToolWithAliases when the caller has per-server / per-tool aliases
+// (spec 2026-04-17). Kept for backward compatibility with existing callers.
 func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
+	return b.IndexToolWithAliases(toolMeta, "")
+}
+
+// IndexToolWithAliases indexes a tool document, attaching the supplied
+// aliases string. Aliases are space-separated keywords merged from
+// ServerConfig.SearchAliases, ServerConfig.ToolAliases[<tool>], and any
+// LLM enrichment cached for this tool.
+func (b *BleveIndex) IndexToolWithAliases(toolMeta *config.ToolMetadata, aliases string) error {
 	// Extract just the tool name (remove server prefix)
 	toolName := toolMeta.Name
 	if parts := strings.SplitN(toolMeta.Name, ":", 2); len(parts) == 2 {
@@ -140,11 +165,12 @@ func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
 	}
 
 	// Create combined searchable text for better full-text search
-	searchableText := fmt.Sprintf("%s %s %s %s",
+	searchableText := fmt.Sprintf("%s %s %s %s %s",
 		toolName,
 		toolMeta.Name,
 		toolMeta.Description,
-		toolMeta.ParamsJSON)
+		toolMeta.ParamsJSON,
+		aliases)
 
 	doc := &ToolDocument{
 		ToolName:       toolName,
@@ -153,7 +179,8 @@ func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
 		Description:    toolMeta.Description,
 		ParamsJSON:     toolMeta.ParamsJSON,
 		Hash:           toolMeta.Hash,
-		Tags:           "", // Can be extended later
+		Tags:           "",
+		Aliases:        aliases,
 		SearchableText: searchableText,
 	}
 
@@ -246,10 +273,18 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 	searchableTextQuery.SetBoost(1.5)
 	boolQuery.AddShould(searchableTextQuery)
 
+	// 7. Aliases — user-configured search keywords (incl. cross-language)
+	// and LLM-enriched synonyms/example_queries. Boost higher than plain
+	// description so an alias hit wins over coincidental description hits.
+	aliasesQuery := bleve.NewMatchQuery(queryStr)
+	aliasesQuery.SetField("aliases")
+	aliasesQuery.SetBoost(3.0)
+	boolQuery.AddShould(aliasesQuery)
+
 	// Create search request
 	searchReq := bleve.NewSearchRequest(boolQuery)
 	searchReq.Size = limit
-	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash"}
+	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash", "aliases"}
 	searchReq.Highlight = bleve.NewHighlight()
 
 	b.logger.Debug("Searching tools with enhanced query", zap.String("query", queryStr), zap.Int("limit", limit))
@@ -287,8 +322,16 @@ func (b *BleveIndex) GetDocumentCount() (uint64, error) {
 
 // Batch operations for efficiency
 
-// BatchIndex indexes multiple tools in a single batch
+// BatchIndex indexes multiple tools in a single batch with no aliases.
+// Kept for backward compatibility; prefer BatchIndexWithAliases.
 func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
+	return b.BatchIndexWithAliases(tools, nil)
+}
+
+// BatchIndexWithAliases indexes multiple tools in a single batch, looking
+// up each tool's aliases in aliasesByFullName (key = "<server>:<tool>").
+// Pass nil or an empty map to index without aliases.
+func (b *BleveIndex) BatchIndexWithAliases(tools []*config.ToolMetadata, aliasesByFullName map[string]string) error {
 	batch := b.index.NewBatch()
 
 	for _, toolMeta := range tools {
@@ -298,12 +341,18 @@ func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
 			toolName = parts[1]
 		}
 
+		aliases := ""
+		if aliasesByFullName != nil {
+			aliases = aliasesByFullName[toolMeta.Name]
+		}
+
 		// Create combined searchable text
-		searchableText := fmt.Sprintf("%s %s %s %s",
+		searchableText := fmt.Sprintf("%s %s %s %s %s",
 			toolName,
 			toolMeta.Name,
 			toolMeta.Description,
-			toolMeta.ParamsJSON)
+			toolMeta.ParamsJSON,
+			aliases)
 
 		doc := &ToolDocument{
 			ToolName:       toolName,
@@ -313,6 +362,7 @@ func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
 			ParamsJSON:     toolMeta.ParamsJSON,
 			Hash:           toolMeta.Hash,
 			Tags:           "",
+			Aliases:        aliases,
 			SearchableText: searchableText,
 		}
 

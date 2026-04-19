@@ -925,6 +925,49 @@ func (p *MCPProxyServer) handleListRegistries(ctx context.Context, _ mcp.CallToo
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
 
+// resolveToolDomain returns the single domain tag to advertise for
+// <serverName:toolName> in a retrieve_tools response, or "" when unknown.
+// Priority today: first entry of ServerConfig.DomainTags > empty.
+// Commit C adds LLM-enriched per-tool domain lookup — the ResolveDomain
+// helper already prefers it, so wiring enrichment cache here in a later
+// commit is a one-line change.
+func (p *MCPProxyServer) resolveToolDomain(serverName, _ string) string {
+	if p.mainServer == nil || p.mainServer.runtime == nil {
+		return ""
+	}
+	cfg := p.mainServer.runtime.GetServerConfig(serverName)
+	return index.ResolveDomain(cfg, nil)
+}
+
+// groupCatalogByDomain re-groups the flat server catalog emitted by
+// buildServerCatalog into {domain: {server: [tools]}} shape so agents
+// can scan by topic. Servers with no DomainTags land under "_unclassified".
+func (p *MCPProxyServer) groupCatalogByDomain(catalog []map[string]interface{}) map[string]map[string][]string {
+	if p.mainServer == nil || p.mainServer.runtime == nil || len(catalog) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string][]string)
+	for _, entry := range catalog {
+		serverName, _ := entry["server"].(string)
+		toolsAny, _ := entry["tools"].([]string)
+		if serverName == "" || len(toolsAny) == 0 {
+			continue
+		}
+		cfg := p.mainServer.runtime.GetServerConfig(serverName)
+		domains := []string{"_unclassified"}
+		if cfg != nil && len(cfg.DomainTags) > 0 {
+			domains = cfg.DomainTags
+		}
+		for _, domain := range domains {
+			if out[domain] == nil {
+				out[domain] = make(map[string][]string)
+			}
+			out[domain][serverName] = toolsAny
+		}
+	}
+	return out
+}
+
 // buildServerCatalog returns a catalog of connected servers and their tool names.
 // Used as fallback when BM25 search returns zero results.
 // Each server entry includes at most maxToolsPerServer tool names.
@@ -1161,6 +1204,13 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 			}
 			// Add call_with recommendation based on annotations
 			mcpTool["call_with"] = contracts.DeriveCallWith(annotations)
+
+			// Spec 2026-04-17: advertise the tool's resolved domain when the
+			// operator has classified the server (or LLM enrichment has).
+			// Clients use this to group tools in UIs; empty means unknown.
+			if domain := p.resolveToolDomain(serverName, toolName); domain != "" {
+				mcpTool["domain"] = domain
+			}
 		} else {
 			mcpTool["call_with"] = contracts.ToolVariantRead // Default to read - safest option
 		}
@@ -1209,6 +1259,13 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 			response["fallback"] = "no_results"
 			response["hint"] = "No tools matched your query. Browse the catalog below and retry with an exact tool name, or try different keywords."
 			response["catalog"] = catalog
+
+			// Spec 2026-04-17: also emit a domain-first grouping so the
+			// agent can narrow down by topic (crm/documents/hosting/...)
+			// before guessing individual tool names.
+			if byDomain := p.groupCatalogByDomain(catalog); len(byDomain) > 0 {
+				response["catalog_by_domain"] = byDomain
+			}
 		}
 	}
 
