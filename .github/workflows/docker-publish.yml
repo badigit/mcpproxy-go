@@ -34,12 +34,17 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ env.IMAGE_NAME }}
+          # :latest намеренно НЕ публикуем отсюда.
+          # Прод-образ (fat runtime c node+python+stdio-пакетами) собирает
+          # badigit/infra-docker → .github/workflows/build-mcpproxy-go.yml
+          # и он является единственным писателем :latest. Форк публикует
+          # только референс-теги (sha, semver), чтобы их можно было закрепить
+          # в compose при необходимости.
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
