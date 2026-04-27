@@ -373,6 +373,44 @@ func (p *MCPProxyServer) recordBuiltinTool(name string) {
 	telemetry.RecordBuiltinToolOn(p.telemetryRegistry(), name)
 }
 
+// builtinToolNames is the canonical set of mcpproxy's own top-level MCP tool
+// names. Used both by processToolCall to dispatch internal calls and by the
+// call_tool_* validation path to detect agents that mistakenly wrap a built-in
+// name inside call_tool_read/write/destructive.
+var builtinToolNames = map[string]struct{}{
+	operationRetrieveTools:           {},
+	operationCallTool:                {},
+	contracts.ToolVariantRead:        {},
+	contracts.ToolVariantWrite:       {},
+	contracts.ToolVariantDestructive: {},
+	operationReadCache:               {},
+	operationCodeExecution:           {},
+	operationUpstreamServers:         {},
+	operationQuarantineSec:           {},
+	operationSearchServers:           {},
+	operationListRegistries:          {},
+}
+
+// isBuiltinToolName reports whether name is one of mcpproxy's own top-level
+// MCP tools (rather than an upstream server tool). Used to produce precise
+// error messages when an agent passes a built-in name to call_tool_*.
+func isBuiltinToolName(name string) bool {
+	_, ok := builtinToolNames[name]
+	return ok
+}
+
+// builtinToolErrorMessage returns the standard error explaining how to call
+// a built-in mcpproxy tool. The named tool is highlighted; the full list is
+// included so the agent can self-correct without another round-trip.
+func builtinToolErrorMessage(name string) string {
+	return fmt.Sprintf(
+		"'%s' is a built-in mcpproxy tool — call it directly as a top-level MCP tool, "+
+			"not via call_tool_read/write/destructive. "+
+			"Built-in tools (call directly): retrieve_tools, upstream_servers, quarantine_security, "+
+			"read_cache, code_execution, search_servers, list_registries.",
+		name)
+}
+
 // recordUpstreamTool increments the upstream tool call counter without ever
 // recording the tool name. Spec 042 User Story 2.
 func (p *MCPProxyServer) recordUpstreamTool() {
@@ -424,21 +462,21 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 
 	switch variant {
 	case contracts.ToolVariantRead:
-		description = "Execute a read-only upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For data retrieval operations without side effects. This is the DEFAULT choice when unsure."
+		description = "Execute a read-only upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For data retrieval operations without side effects. This is the DEFAULT choice when unsure. Do NOT use this to invoke mcpproxy's own built-in tools (retrieve_tools, upstream_servers, quarantine_security, read_cache, code_execution, search_servers, list_registries) — those are top-level MCP tools and must be called directly."
 		title = "Call Tool (Read)"
 		nameExample = "github:get_user"
 		sensitivityDesc = "Classify data being accessed: public, internal, private, or unknown. Helps track sensitive data access patterns."
 		reasonDesc = "Why is this tool being called? Provide context like 'User asked to check status' or 'Gathering data for report'."
 		opts = []mcp.ToolOption{mcp.WithReadOnlyHintAnnotation(true)}
 	case contracts.ToolVariantWrite:
-		description = "Execute a state-modifying upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For create, update, send, and other write operations."
+		description = "Execute a state-modifying upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For create, update, send, and other write operations. Do NOT use this to invoke mcpproxy's own built-in tools (retrieve_tools, upstream_servers, quarantine_security, read_cache, code_execution, search_servers, list_registries) — those are top-level MCP tools and must be called directly."
 		title = "Call Tool (Write)"
 		nameExample = "github:create_issue"
 		sensitivityDesc = "Classify data being modified: public, internal, private, or unknown. Helps track sensitive data changes."
 		reasonDesc = "Why is this modification needed? Provide context like 'User requested update' or 'Fixing reported issue'."
 		opts = []mcp.ToolOption{mcp.WithDestructiveHintAnnotation(false)}
 	case contracts.ToolVariantDestructive:
-		description = "Execute a destructive upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For delete, remove, and other irreversible operations."
+		description = "Execute a destructive upstream tool. Pass the exact 'server:tool' name from retrieve_tools results. For delete, remove, and other irreversible operations. Do NOT use this to invoke mcpproxy's own built-in tools (retrieve_tools, upstream_servers, quarantine_security, read_cache, code_execution, search_servers, list_registries) — those are top-level MCP tools and must be called directly."
 		title = "Call Tool (Destructive)"
 		nameExample = "github:delete_repo"
 		sensitivityDesc = "Classify data being deleted: public, internal, private, or unknown. Important for tracking destructive operations on sensitive data."
@@ -460,7 +498,7 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 	allOpts = append(allOpts,
 		mcp.WithString("name",
 			mcp.Required(),
-			mcp.Description(fmt.Sprintf("Tool name in format 'server:tool' (e.g., '%s'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail.", nameExample)),
+			mcp.Description(fmt.Sprintf("Upstream tool name in format 'server:tool' (e.g., '%s'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail. Do NOT pass mcpproxy's own built-in names here (retrieve_tools, upstream_servers, quarantine_security, read_cache, code_execution, search_servers, list_registries, call_tool_read, call_tool_write, call_tool_destructive) — those are top-level MCP tools and must be called directly.", nameExample)),
 		),
 		mcp.WithObject("args",
 			mcp.Description("Arguments to pass to the upstream tool as a native JSON object. Refer to the tool's inputSchema from retrieve_tools for required parameters. Example: {\"path\": \"src/index.ts\", \"limit\": 20}. This is the preferred parameter — it eliminates JSON escaping overhead. Use 'args_json' only if your client cannot produce nested JSON objects."),
@@ -1448,6 +1486,21 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 	}
 
+	// Detect agents that wrap a built-in mcpproxy tool name inside call_tool_*.
+	// Two common shapes: bare ("retrieve_tools") or self-prefixed
+	// ("mcpproxy:retrieve_tools"). In both cases, return a precise error that
+	// names the right call so the agent can self-correct in one shot.
+	if isBuiltinToolName(toolName) {
+		errMsg := builtinToolErrorMessage(toolName)
+		p.emitActivityPolicyDecision("mcpproxy", toolName, getSessionID(), "blocked", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	if serverName == "mcpproxy" && isBuiltinToolName(actualToolName) {
+		errMsg := builtinToolErrorMessage(actualToolName)
+		p.emitActivityPolicyDecision("mcpproxy", actualToolName, getSessionID(), "blocked", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
 	// Handle upstream tools via upstream manager (requires server:tool format)
 	if !strings.Contains(toolName, ":") {
 		return mcp.NewToolResultError(fmt.Sprintf("Invalid tool name format: %s (expected server:tool)", toolName)), nil
@@ -1861,10 +1914,10 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		operationQuarantineSec:   true,
 		operationRetrieveTools:   true,
 		operationCallTool:        true,
-		"read_cache":             true,
-		"code_execution":         true,
-		"list_registries":        true,
-		"search_servers":         true,
+		operationReadCache:       true,
+		operationCodeExecution:   true,
+		operationListRegistries:  true,
+		operationSearchServers:   true,
 	}
 
 	if proxyTools[toolName] {
