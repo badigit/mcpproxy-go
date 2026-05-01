@@ -216,6 +216,12 @@ type ServerConfig struct {
 	// the upstream tool has nil for that specific hint (per-field merge).
 	AnnotationDefaults *ToolAnnotations `json:"annotation_defaults,omitempty" mapstructure:"annotation-defaults"`
 
+	// Description is a short human-readable summary of what this upstream
+	// server provides. Surfaced in the MCP initialize manifest so AI agents
+	// know which server to target without first calling retrieve_tools.
+	// Keep to one line; e.g. "Bitrix24 CRM (deals, contacts, tasks)".
+	Description string `json:"description,omitempty" mapstructure:"description"`
+
 	// SearchAliases adds keywords that boost every tool on this server when
 	// matched by a retrieve_tools query. Use for cross-language synonyms,
 	// short forms, or common misspellings (e.g. ["битрикс", "b24", "crm"]).
