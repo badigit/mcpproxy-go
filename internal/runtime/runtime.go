@@ -88,6 +88,11 @@ type Runtime struct {
 	// Key: serverName, Value: struct{} (presence indicates discovery in progress)
 	discoveryInProgress sync.Map
 
+	// Last-good tool snapshots per server used to avoid transient tool loss during
+	// global discovery races/restarts.
+	lastGoodToolsMu sync.RWMutex
+	lastGoodTools   map[string][]*config.ToolMetadata
+
 	// Schema v3 (telemetry): memoized Docker daemon availability. Probed
 	// once lazily on first IsDockerAvailable() call and reused for the
 	// process lifetime — running `docker info` on every heartbeat would be
@@ -235,9 +240,10 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 			Message:     "Runtime is initializing...",
 			LastUpdated: time.Now(),
 		},
-		statusCh:     make(chan Status, 10),
-		eventSubs:    make(map[chan Event]struct{}),
-		phaseMachine: newPhaseMachine(PhaseInitializing),
+		statusCh:      make(chan Status, 10),
+		eventSubs:     make(map[chan Event]struct{}),
+		phaseMachine:  newPhaseMachine(PhaseInitializing),
+		lastGoodTools: make(map[string][]*config.ToolMetadata),
 	}
 
 	return rt, nil
