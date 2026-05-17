@@ -9,6 +9,13 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
 )
 
+// cacheStorer is the minimal cache surface forwardContentResult needs to
+// persist a truncated upstream response so a follow-up read_cache can serve it.
+// Kept as an interface so tests don't have to spin up a real cache.Manager.
+type cacheStorer interface {
+	Store(key, toolName string, args map[string]interface{}, content, recordPath string, totalRecords int) error
+}
+
 // forwardContentResult preserves non-text content blocks (ImageContent, AudioContent,
 // EmbeddedResource) from an upstream CallToolResult while applying truncation only to
 // TextContent blocks. This fixes issue #368 where all content types were being
@@ -28,7 +35,7 @@ import (
 //
 // If result is not a *mcp.CallToolResult, it falls back to JSON-serializing the whole
 // thing into a TextContent block (legacy behavior).
-func forwardContentResult(result interface{}, truncator *truncate.Truncator, toolName string, args map[string]interface{}) (forwarded *mcp.CallToolResult, textRepresentation string, wasTruncated bool) {
+func forwardContentResult(result interface{}, truncator *truncate.Truncator, cache cacheStorer, toolName string, args map[string]interface{}) (forwarded *mcp.CallToolResult, textRepresentation string, wasTruncated bool) {
 	ctr, ok := result.(*mcp.CallToolResult)
 	if !ok || ctr == nil {
 		// Fallback: not a CallToolResult (should not happen with current upstream chain,
@@ -40,6 +47,7 @@ func forwardContentResult(result interface{}, truncator *truncate.Truncator, too
 		text := string(jsonBytes)
 		if truncator != nil && truncator.ShouldTruncate(text) {
 			tr := truncator.Truncate(text, toolName, args)
+			storeTruncated(cache, tr, toolName, args, text)
 			text = tr.TruncatedContent
 			wasTruncated = true
 		}
@@ -56,6 +64,7 @@ func forwardContentResult(result interface{}, truncator *truncate.Truncator, too
 			txt := tc.Text
 			if truncator != nil && truncator.ShouldTruncate(txt) {
 				tr := truncator.Truncate(txt, toolName, args)
+				storeTruncated(cache, tr, toolName, args, txt)
 				txt = tr.TruncatedContent
 				wasTruncated = true
 			}
@@ -88,6 +97,17 @@ func forwardContentResult(result interface{}, truncator *truncate.Truncator, too
 	}
 	textRepresentation = joinTextParts(textBuilder)
 	return forwarded, textRepresentation, wasTruncated
+}
+
+// storeTruncated persists the full pre-truncation content under the cache key
+// embedded in the truncated response so a follow-up read_cache call can serve it.
+// Without this, the truncator advertises a key that nothing wrote — read_cache
+// returns "cache key not found".
+func storeTruncated(cache cacheStorer, tr *truncate.TruncationResult, toolName string, args map[string]interface{}, original string) {
+	if cache == nil || tr == nil || !tr.CacheAvailable || tr.CacheKey == "" {
+		return
+	}
+	_ = cache.Store(tr.CacheKey, toolName, args, original, tr.RecordPath, tr.TotalRecords)
 }
 
 // joinTextParts concatenates text parts with a newline separator.
