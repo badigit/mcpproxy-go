@@ -702,8 +702,9 @@ infra-docker workflow secrets):
 gh workflow run build-mcpproxy-go.yml -R badigit/infra-docker -f mcpproxy_ref=<branch|sha>
 gh run watch -R badigit/infra-docker <run-id>   # build (~4m) + deploy + verify
 ```
-Pin a SHA for reproducibility. Future improvement: add an outbound `repository_dispatch`
-(`mcpproxy-core-updated`) step to the fork's workflow to make this automatic.
+Pin a SHA for reproducibility. Preferred path: run the **`deploy-mcpproxy`** skill in the
+`badigit/infra-docker` repo — it wraps resolve-ref → trigger → watch → verify container →
+optional E2E smoke. Deploy is deliberate/on-demand by design (no auto-deploy on fork push).
 
 ## Active Technologies
 - Go 1.24 (toolchain go1.24.10) (001-update-version-display)

@@ -59,23 +59,3 @@ jobs:
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # Propagate to prod: tell badigit/infra-docker to rebuild :latest from this
-      # commit and redeploy to beget-vps. The infra workflow listens for the
-      # repository_dispatch type `mcpproxy-core-updated` and uses client_payload.sha
-      # as the build ref. Requires a PAT secret with write access to infra-docker —
-      # the default GITHUB_TOKEN is scoped to this repo only and cannot dispatch
-      # cross-repo. Missing token = warn-and-skip so this step never blocks publish.
-      - name: Trigger infra-docker prod deploy
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::INFRA_DISPATCH_TOKEN not set — skipping prod auto-deploy dispatch. Add the PAT secret to enable automatic propagation to prod."
-            exit 0
-          fi
-          gh api repos/badigit/infra-docker/dispatches \
-            -f event_type=mcpproxy-core-updated \
-            -f 'client_payload[sha]=${{ github.sha }}'
-          echo "Dispatched mcpproxy-core-updated (sha=${{ github.sha }}) to badigit/infra-docker"
