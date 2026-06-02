@@ -77,5 +77,5 @@ jobs:
           fi
           gh api repos/badigit/infra-docker/dispatches \
             -f event_type=mcpproxy-core-updated \
-            -f client_payload[sha]="${{ github.sha }}"
+            -f 'client_payload[sha]=${{ github.sha }}'
           echo "Dispatched mcpproxy-core-updated (sha=${{ github.sha }}) to badigit/infra-docker"
