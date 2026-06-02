@@ -2,16 +2,44 @@ package index
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
+	"github.com/blevesearch/bleve/v2/analysis/lang/en"
+	"github.com/blevesearch/bleve/v2/analysis/lang/ru"
+	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
+	"github.com/blevesearch/bleve/v2/analysis/tokenizer/unicode"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
+
+// enruAnalyzerName is the custom analyzer chained as
+//   unicode tokenizer → lowercase → stop_en → stop_ru → stemmer_en → stemmer_ru.
+// Applied to all text fields that may contain Russian or English content
+// (description, aliases, searchable_text, tags). This fixes BM25 ranking on
+// inflected Russian queries — "лицензий" and "лицензии" reduce to the same
+// stem and now match. English words pass through Porter/Snowball stemming
+// (-s, -ed, -ing) which keeps EN matching at parity with the previous
+// standard analyzer for typical tool descriptions.
+const enruAnalyzerName = "enru"
+
+// bleveMappingVersion identifies the current field-mapping schema. Bumped
+// when analyzers or field types change — older indexes are detected via the
+// version marker file and rebuilt from scratch on next startup. Version 1 =
+// pre-enru (standard analyzer on text fields). Version 2 = enru analyzer.
+const bleveMappingVersion = 2
+
+// mappingVersionFile is the sentinel written next to the bleve directory.
+// We deliberately do NOT put it inside index.bleve/ so wiping the index
+// directory does not also drop the marker (we want the marker to survive
+// only as long as the index it describes).
+const mappingVersionFile = "index.bleve.mapping_version"
 
 // BleveIndex wraps Bleve index operations
 type BleveIndex struct {
@@ -37,9 +65,34 @@ type ToolDocument struct {
 	SearchableText string `json:"searchable_text"` // Combined searchable content
 }
 
-// NewBleveIndex creates a new Bleve index
+// NewBleveIndex creates a new Bleve index, rebuilding it from scratch when the
+// stored mapping version does not match bleveMappingVersion. Rebuilds are safe:
+// upstream tools are re-indexed automatically by the runtime on startup, so
+// dropping the directory only costs a few seconds of cold-start latency.
 func NewBleveIndex(dataDir string, logger *zap.Logger) (*BleveIndex, error) {
 	indexPath := filepath.Join(dataDir, "index.bleve")
+	versionPath := filepath.Join(dataDir, mappingVersionFile)
+
+	// If an index already exists, check whether its mapping version matches.
+	// A mismatch (or a missing marker on an existing index) means the schema
+	// changed since this index was built — drop it so we can recreate with
+	// the current mapping.
+	if _, err := os.Stat(indexPath); err == nil {
+		storedVersion, vErr := readMappingVersion(versionPath)
+		if vErr != nil || storedVersion != bleveMappingVersion {
+			logger.Info("Bleve mapping version mismatch — rebuilding index",
+				zap.Int("stored_version", storedVersion),
+				zap.Int("expected_version", bleveMappingVersion),
+				zap.String("path", indexPath),
+				zap.NamedError("marker_error", vErr),
+			)
+			if rmErr := os.RemoveAll(indexPath); rmErr != nil {
+				return nil, fmt.Errorf("failed to remove stale bleve index for migration: %w", rmErr)
+			}
+			// Also drop any stale marker so the rebuild path below writes a fresh one.
+			_ = os.Remove(versionPath)
+		}
+	}
 
 	// Try to open existing index
 	index, err := bleve.Open(indexPath)
@@ -49,6 +102,11 @@ func NewBleveIndex(dataDir string, logger *zap.Logger) (*BleveIndex, error) {
 		index, err = createBleveIndex(indexPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Bleve index: %w", err)
+		}
+		if wErr := writeMappingVersion(versionPath, bleveMappingVersion); wErr != nil {
+			// Non-fatal: index is usable. We'll just rebuild again on next start.
+			logger.Warn("Failed to write bleve mapping version marker — index will rebuild next start",
+				zap.String("path", versionPath), zap.Error(wErr))
 		}
 	} else {
 		logger.Info("Opened existing Bleve index", zap.String("path", indexPath))
@@ -60,10 +118,45 @@ func NewBleveIndex(dataDir string, logger *zap.Logger) (*BleveIndex, error) {
 	}, nil
 }
 
+// readMappingVersion returns the integer version stored in the marker file,
+// or (0, error) when the file is missing or unparseable. We treat any error
+// as "unknown version" → triggers a rebuild, which is the safe default.
+func readMappingVersion(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var version int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &version); err != nil {
+		return 0, fmt.Errorf("parse mapping version: %w", err)
+	}
+	return version, nil
+}
+
+func writeMappingVersion(path string, version int) error {
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", version)), 0o644)
+}
+
 // createBleveIndex creates a new Bleve index with proper mapping
 func createBleveIndex(indexPath string) (bleve.Index, error) {
 	// Create index mapping
 	indexMapping := bleve.NewIndexMapping()
+
+	// Register the bilingual analyzer BEFORE field mappings reference it,
+	// otherwise AddFieldMappingsAt → ValidateCustomAnalyzer would not find it.
+	if err := indexMapping.AddCustomAnalyzer(enruAnalyzerName, map[string]interface{}{
+		"type":      custom.Name,
+		"tokenizer": unicode.Name,
+		"token_filters": []string{
+			lowercase.Name,
+			en.StopName,
+			ru.StopName,
+			en.SnowballStemmerName,
+			ru.SnowballStemmerName,
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("register enru analyzer: %w", err)
+	}
 
 	// Create document mapping for tools
 	toolMapping := bleve.NewDocumentMapping()
@@ -89,14 +182,16 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	serverNameField.Index = true
 	toolMapping.AddFieldMappingsAt("server_name", serverNameField)
 
-	// Description field (standard analyzer for full-text search)
+	// Description field — bilingual analyzer for full-text search across EN/RU.
 	descriptionField := bleve.NewTextFieldMapping()
-	descriptionField.Analyzer = standard.Name
+	descriptionField.Analyzer = enruAnalyzerName
 	descriptionField.Store = true
 	descriptionField.Index = true
 	toolMapping.AddFieldMappingsAt("description", descriptionField)
 
-	// Parameters JSON field (standard analyzer)
+	// Parameters JSON field — kept on standard analyzer. These are API
+	// parameter names ("limit", "offset", etc.), always ASCII, and stemming
+	// could distort them into less-useful tokens.
 	paramsField := bleve.NewTextFieldMapping()
 	paramsField.Analyzer = standard.Name
 	paramsField.Store = true
@@ -110,25 +205,28 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	hashField.Index = false // Don't index hash for search
 	toolMapping.AddFieldMappingsAt("hash", hashField)
 
-	// Tags field (standard analyzer)
+	// Tags field — bilingual analyzer (operators may put russian domain tags).
 	tagsField := bleve.NewTextFieldMapping()
-	tagsField.Analyzer = standard.Name
+	tagsField.Analyzer = enruAnalyzerName
 	tagsField.Store = true
 	tagsField.Index = true
 	toolMapping.AddFieldMappingsAt("tags", tagsField)
 
-	// Aliases field (standard analyzer) — user-configured search aliases
-	// and LLM-enriched keywords/example_queries. Boost is applied at
-	// query time (see SearchTools), not here.
+	// Aliases field — user-configured search aliases and LLM-enriched
+	// keywords/example_queries. Bilingual analyzer so RU aliases match
+	// inflected user queries ("лицензий" → "лицензи" matches "лицензии").
+	// Boost is applied at query time (see SearchTools), not here.
 	aliasesField := bleve.NewTextFieldMapping()
-	aliasesField.Analyzer = standard.Name
+	aliasesField.Analyzer = enruAnalyzerName
 	aliasesField.Store = true
 	aliasesField.Index = true
 	toolMapping.AddFieldMappingsAt("aliases", aliasesField)
 
-	// Searchable text field (standard analyzer) - combines all searchable content
+	// Searchable text field — bilingual analyzer. Combines tool name,
+	// description, params and aliases, so the analyzer choice must match
+	// what is used for the more specific fields.
 	searchableTextField := bleve.NewTextFieldMapping()
-	searchableTextField.Analyzer = standard.Name
+	searchableTextField.Analyzer = enruAnalyzerName
 	searchableTextField.Store = false // Don't store, just index for search
 	searchableTextField.Index = true
 	toolMapping.AddFieldMappingsAt("searchable_text", searchableTextField)
