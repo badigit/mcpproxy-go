@@ -1347,6 +1347,64 @@ func (p *MCPProxyServer) handleCallToolDestructive(ctx context.Context, request 
 	return p.handleCallToolVariant(ctx, request, contracts.ToolVariantDestructive)
 }
 
+// isSelfHealableBuiltin reports whether name is one of the gateway's own built-in
+// tools that callers sometimes invoke through call_tool_* with a server prefix —
+// e.g. a host that namespaces the gateway's tools with the connection name
+// ("my-gateway:retrieve_tools"). The call_tool_* variants are deliberately excluded:
+// they are the transport, not a self-heal target, and re-dispatching them would recurse.
+// See docs/bugs/retrieve-tools-self-prefix-via-call-tool-read.md
+func isSelfHealableBuiltin(name string) bool {
+	switch name {
+	case operationRetrieveTools, "upstream_servers", "quarantine_security",
+		"code_execution", "list_registries", "search_servers", "read_cache", "doctor":
+		return true
+	default:
+		return false
+	}
+}
+
+// dispatchBuiltinTool routes a request to the matching built-in handler by name.
+// Shared by the self-heal path so server-prefixed built-in calls reach the same
+// handlers as direct invocations.
+func (p *MCPProxyServer) dispatchBuiltinTool(ctx context.Context, request mcp.CallToolRequest, name string) (*mcp.CallToolResult, error) {
+	switch name {
+	case "upstream_servers":
+		return p.handleUpstreamServers(ctx, request)
+	case operationRetrieveTools:
+		return p.handleRetrieveTools(ctx, request)
+	case "quarantine_security":
+		return p.handleQuarantineSecurity(ctx, request)
+	case "code_execution":
+		return p.handleCodeExecution(ctx, request)
+	case "list_registries":
+		return p.handleListRegistries(ctx, request)
+	case "search_servers":
+		return p.handleSearchServers(ctx, request)
+	case "read_cache":
+		return p.handleReadCache(ctx, request)
+	case "doctor":
+		return p.handleDoctor(ctx, request)
+	default:
+		return mcp.NewToolResultError(fmt.Sprintf("unknown built-in tool: %s", name)), nil
+	}
+}
+
+// noUpstreamClientError builds the standard, actionable error returned when a tool
+// call references a server that has no connected upstream client. Shared by the
+// call_tool_* variant path and the legacy handleCallTool path for a consistent message.
+func (p *MCPProxyServer) noUpstreamClientError(serverName string) string {
+	availableServers := p.upstreamManager.GetAllServerNames()
+	serverList := strings.Join(availableServers, ", ")
+	if len(availableServers) == 0 {
+		serverList = "(no servers configured)"
+	}
+	return fmt.Sprintf(
+		"No client found for server: %s. Available servers: [%s]. "+
+			"IMPORTANT: Use 'retrieve_tools' first to discover tools and their exact server:tool names, "+
+			"or use 'upstream_servers operation=\"list\"' to see all configured servers.",
+		serverName, serverList)
+}
+
 // handleCallToolVariant is the common handler for all call_tool_* variants (Spec 018)
 func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.CallToolRequest, toolVariant string) (callResult *mcp.CallToolResult, callErr error) {
 	// Spec 042: every call_tool_* invocation is an MCP request, and the actual
@@ -1456,6 +1514,24 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// Validate tool name was parsed correctly
 	if serverName == "" || actualToolName == "" {
 		return mcp.NewToolResultError(fmt.Sprintf("Invalid tool name format: %s", toolName)), nil
+	}
+
+	// Self-heal: some MCP hosts expose the gateway's own built-in tools namespaced
+	// with the connection name (e.g. "my-gateway:retrieve_tools"). Because the gateway
+	// uses the same "server:tool" syntax for upstream addressing, such a call would
+	// otherwise be parsed as an upstream call to a non-existent server. When the prefix
+	// is not a connected upstream and the suffix names a built-in tool, drop the prefix
+	// and run the built-in with the nested args.
+	// See docs/bugs/retrieve-tools-self-prefix-via-call-tool-read.md
+	if _, isUpstream := p.upstreamManager.GetClient(serverName); !isUpstream && isSelfHealableBuiltin(actualToolName) {
+		p.logger.Warn("handleCallToolVariant: self-healing server-prefixed built-in tool",
+			zap.String("requested_name", toolName),
+			zap.String("builtin_tool", actualToolName),
+			zap.String("prefix", serverName))
+		synthReq := request
+		synthReq.Params.Name = actualToolName
+		synthReq.Params.Arguments = args
+		return p.dispatchBuiltinTool(ctx, synthReq, actualToolName)
 	}
 
 	// Spec 028: Enforce agent token scope restrictions
@@ -1622,21 +1698,10 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	} else {
-		// Get list of available servers for helpful error message
-		availableServers := p.upstreamManager.GetAllServerNames()
-		serverList := strings.Join(availableServers, ", ")
-		if len(availableServers) == 0 {
-			serverList = "(no servers configured)"
-		}
-
 		p.logger.Error("handleCallToolVariant: no client found for server",
 			zap.String("server_name", serverName),
-			zap.Strings("available_servers", availableServers))
-		errMsg := fmt.Sprintf(
-			"No client found for server: %s. Available servers: [%s]. "+
-				"IMPORTANT: Use 'retrieve_tools' first to discover tools and their exact server:tool names, "+
-				"or use 'upstream_servers operation=\"list\"' to see all configured servers.",
-			serverName, serverList)
+			zap.Strings("available_servers", p.upstreamManager.GetAllServerNames()))
+		errMsg := p.noUpstreamClientError(serverName)
 		// Log the early failure to activity (Spec 024)
 		var intentMap map[string]interface{}
 		if intent != nil {
@@ -1985,7 +2050,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	} else {
 		p.logger.Error("handleCallTool: no client found for server",
 			zap.String("server_name", serverName))
-		errMsg := fmt.Sprintf("No client found for server: %s", serverName)
+		errMsg := p.noUpstreamClientError(serverName)
 		// Log the early failure to activity (Spec 024)
 		p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
 		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "")
