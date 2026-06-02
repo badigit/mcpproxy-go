@@ -678,6 +678,33 @@ See `docs/github-actions-windows-wix-research.md` for CI setup.
 
 See `docs/prerelease-builds.md` for download instructions.
 
+## Production Deployment — TRUE flow (agents: read before "deploy")
+
+**Pushing to `badigit/mcpproxy-go` does NOT deploy production.** The fork's
+`docker-publish.yml` only publishes `ghcr.io/badigit/mcpproxy-go:**main**` and
+`:sha-<short>`. It deliberately does NOT write `:latest` (see the comment in that
+workflow). So a green Docker Publish on the fork ≠ prod is updated.
+
+**Production** runs on **beget-vps**, compose at `/opt/infra-docker/beget-vps/mcp-gateway/`,
+container `mcpproxy-go`, image `ghcr.io/badigit/mcpproxy-go:**latest**`. `:latest` is built
+ONLY by the **`badigit/infra-docker`** workflow `build-mcpproxy-go.yml`, which:
+1. builds from `beget-vps/mcp-gateway/mcpproxy-go/Dockerfile` (clones the fork and
+   `git checkout <MCPPROXY_REF>`, default `main`), pushing `:latest` + `:infra-<sha>`;
+2. SSHes to beget-vps → `git pull && docker compose pull mcpproxy-go && up -d` → verifies.
+
+Its triggers: manual `workflow_dispatch`, push to `beget-vps/mcp-gateway/mcpproxy-go/**`,
+or `repository_dispatch: mcpproxy-core-updated`. **The fork does NOT send that dispatch**
+(no outbound wire), so fork pushes never auto-deploy.
+
+**To deploy a fork commit to prod** (data needed: only `gh` access — SSH key/host live in
+infra-docker workflow secrets):
+```bash
+gh workflow run build-mcpproxy-go.yml -R badigit/infra-docker -f mcpproxy_ref=<branch|sha>
+gh run watch -R badigit/infra-docker <run-id>   # build (~4m) + deploy + verify
+```
+Pin a SHA for reproducibility. Future improvement: add an outbound `repository_dispatch`
+(`mcpproxy-core-updated`) step to the fork's workflow to make this automatic.
+
 ## Active Technologies
 - Go 1.24 (toolchain go1.24.10) (001-update-version-display)
 - In-memory only for version cache (no persistence per clarification) (001-update-version-display)
