@@ -227,6 +227,81 @@ func DeriveCallWith(annotations *config.ToolAnnotations) string {
 	return ToolVariantRead
 }
 
+// readVerbs are tool-name prefixes/verbs that indicate a read-only operation.
+// Kept in sync with the "DECISION RULES BY TOOL NAME" guidance surfaced to agents
+// in retrieve_tools usage instructions (server/mcp.go).
+var readVerbs = map[string]struct{}{
+	"search": {}, "query": {}, "list": {}, "get": {}, "fetch": {}, "find": {},
+	"check": {}, "view": {}, "read": {}, "show": {}, "describe": {}, "lookup": {},
+	"retrieve": {}, "browse": {}, "explore": {}, "discover": {}, "scan": {},
+	"inspect": {}, "analyze": {}, "examine": {}, "validate": {}, "verify": {},
+}
+
+// writeVerbs are tool-name verbs that indicate a write (mutating, non-destructive) operation.
+var writeVerbs = map[string]struct{}{
+	"create": {}, "update": {}, "modify": {}, "add": {}, "set": {}, "send": {},
+	"edit": {}, "change": {}, "write": {}, "post": {}, "put": {}, "patch": {},
+	"insert": {}, "upload": {}, "submit": {}, "assign": {}, "configure": {},
+	"enable": {}, "register": {}, "subscribe": {}, "publish": {}, "move": {},
+	"copy": {}, "rename": {}, "merge": {},
+}
+
+// destructiveVerbs are tool-name verbs that indicate a destructive operation.
+var destructiveVerbs = map[string]struct{}{
+	"delete": {}, "remove": {}, "drop": {}, "revoke": {}, "disable": {},
+	"destroy": {}, "purge": {}, "reset": {}, "clear": {}, "unsubscribe": {},
+	"cancel": {}, "terminate": {}, "close": {}, "archive": {}, "ban": {},
+	"block": {}, "disconnect": {}, "kill": {}, "wipe": {}, "truncate": {},
+	"force": {}, "hard": {},
+}
+
+// ClassifyOperationByName infers the operation type (read/write/destructive) from a
+// tool's name using a verb heuristic. It mirrors the same verb lists advertised to
+// agents in the retrieve_tools usage instructions, so a tool classified here as
+// "read" is the same one recommended for call_tool_read.
+//
+// The leading token of the tool name (split on '_', '-', or ':') is matched against
+// the verb sets. Destructive and write verbs take priority over read; an unrecognized
+// verb yields "read" as the safe default (most tools are read operations), matching
+// DeriveCallWith's default.
+func ClassifyOperationByName(toolName string) string {
+	verb := leadingVerb(toolName)
+	if verb == "" {
+		return OperationTypeRead
+	}
+	if _, ok := destructiveVerbs[verb]; ok {
+		return OperationTypeDestructive
+	}
+	if _, ok := writeVerbs[verb]; ok {
+		return OperationTypeWrite
+	}
+	if _, ok := readVerbs[verb]; ok {
+		return OperationTypeRead
+	}
+	// Unknown verb — default to read (safest, matches DeriveCallWith default).
+	return OperationTypeRead
+}
+
+// leadingVerb extracts the lowercase leading token of a tool name. It strips an
+// optional "server:" prefix, then takes the first segment split on '_' or '-'.
+func leadingVerb(toolName string) string {
+	name := toolName
+	if idx := strings.LastIndex(name, ":"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return ""
+	}
+	// Split on the first '_' or '-' to isolate the leading verb.
+	for i, r := range name {
+		if r == '_' || r == '-' {
+			return name[:i]
+		}
+	}
+	return name
+}
+
 // Content trust constants for open-world hint scanning (Spec 035)
 const (
 	// ContentTrustUntrusted marks tool output as untrusted (open-world tool, data from external sources)

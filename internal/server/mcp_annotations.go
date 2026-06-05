@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
 )
 
@@ -111,7 +112,10 @@ type annotatedSearchResult struct {
 // Returns only the results that pass all active filters.
 //
 // Filter semantics (per MCP spec, nil hints default to most permissive):
-//   - readOnlyOnly: keep only tools with readOnlyHint=true (explicit)
+//   - readOnlyOnly: keep tools with readOnlyHint=true (explicit). When readOnlyHint
+//     is ABSENT, fall back to the verb-based READ classification used to compute
+//     call_with (search/read/list/get/... => read). Only tools explicitly annotated
+//     readOnlyHint=false, or classified write/destructive by name, are excluded.
 //   - excludeDestructive: exclude tools with destructiveHint=true or nil
 //   - excludeOpenWorld: exclude tools with openWorldHint=true or nil
 func filterByAnnotations(tools []annotatedSearchResult, readOnlyOnly, excludeDestructive, excludeOpenWorld bool) []annotatedSearchResult {
@@ -122,7 +126,7 @@ func filterByAnnotations(tools []annotatedSearchResult, readOnlyOnly, excludeDes
 
 	var filtered []annotatedSearchResult
 	for _, tool := range tools {
-		if shouldExclude(tool.annotations, readOnlyOnly, excludeDestructive, excludeOpenWorld) {
+		if shouldExclude(tool.toolName, tool.annotations, readOnlyOnly, excludeDestructive, excludeOpenWorld) {
 			continue
 		}
 		filtered = append(filtered, tool)
@@ -130,11 +134,11 @@ func filterByAnnotations(tools []annotatedSearchResult, readOnlyOnly, excludeDes
 	return filtered
 }
 
-// shouldExclude returns true if a tool should be excluded based on its annotations and active filters.
-func shouldExclude(annotations *config.ToolAnnotations, readOnlyOnly, excludeDestructive, excludeOpenWorld bool) bool {
+// shouldExclude returns true if a tool should be excluded based on its name,
+// annotations and active filters.
+func shouldExclude(toolName string, annotations *config.ToolAnnotations, readOnlyOnly, excludeDestructive, excludeOpenWorld bool) bool {
 	if readOnlyOnly {
-		// Must have explicit readOnlyHint=true to pass
-		if annotations == nil || annotations.ReadOnlyHint == nil || !*annotations.ReadOnlyHint {
+		if !isReadOnlyForFilter(toolName, annotations) {
 			return true
 		}
 	}
@@ -159,4 +163,31 @@ func shouldExclude(annotations *config.ToolAnnotations, readOnlyOnly, excludeDes
 	}
 
 	return false
+}
+
+// isReadOnlyForFilter decides whether a tool qualifies as read-only for the
+// read_only_only discovery filter.
+//
+//   - Explicit readOnlyHint=true  => read-only (keep).
+//   - Explicit readOnlyHint=false => NOT read-only (exclude), regardless of name.
+//   - readOnlyHint absent (nil annotations, or annotations without the hint) =>
+//     fall back to the verb-based name classifier (the same one behind call_with).
+//     Only names classified as read are kept; write/destructive names are excluded.
+//
+// This resolves the inconsistency where retrieve_tools recommended call_tool_read
+// for an unannotated tool yet read_only_only dropped that very tool (Bug:
+// retrieve-tools-read-only-filter-drops-unannotated-tools).
+func isReadOnlyForFilter(toolName string, annotations *config.ToolAnnotations) bool {
+	if annotations != nil && annotations.ReadOnlyHint != nil {
+		// Server provided an explicit hint — trust it.
+		return *annotations.ReadOnlyHint
+	}
+	// No explicit readOnlyHint. An explicit destructiveHint=true still means the
+	// tool mutates state, so it is not read-only regardless of its name.
+	if annotations != nil && annotations.DestructiveHint != nil && *annotations.DestructiveHint {
+		return false
+	}
+	// Otherwise defer to verb-based classification (the same heuristic behind
+	// call_with): only names classified as read qualify as read-only.
+	return contracts.ClassifyOperationByName(toolName) == contracts.OperationTypeRead
 }

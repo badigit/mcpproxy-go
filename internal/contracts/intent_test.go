@@ -599,3 +599,39 @@ func TestIntentFromMap(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyOperationByName(t *testing.T) {
+	tests := []struct {
+		toolName string
+		want     string
+	}{
+		// Read verbs
+		{"search_notes", OperationTypeRead},
+		{"read_note", OperationTypeRead},
+		{"list_directory", OperationTypeRead},
+		{"get_active_file", OperationTypeRead},
+		{"fetch_url", OperationTypeRead},
+		{"obsidian:search_notes", OperationTypeRead}, // server prefix stripped
+		{"list-events", OperationTypeRead},           // dash separator
+		// Write verbs
+		{"create_note", OperationTypeWrite},
+		{"update_record", OperationTypeWrite},
+		{"send_message", OperationTypeWrite},
+		// Destructive verbs
+		{"delete_note", OperationTypeDestructive},
+		{"remove_item", OperationTypeDestructive},
+		{"purge_cache", OperationTypeDestructive},
+		// Unknown verb defaults to read (safe default, matches DeriveCallWith)
+		{"frobnicate_thing", OperationTypeRead},
+		{"", OperationTypeRead},
+		{"noseparator", OperationTypeRead},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.toolName, func(t *testing.T) {
+			if got := ClassifyOperationByName(tt.toolName); got != tt.want {
+				t.Errorf("ClassifyOperationByName(%q) = %q, want %q", tt.toolName, got, tt.want)
+			}
+		})
+	}
+}
