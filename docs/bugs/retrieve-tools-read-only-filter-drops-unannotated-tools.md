@@ -1,9 +1,15 @@
 # Bug: `read_only_only` filter drops upstream tools that omit annotations
 
-## Status: OPEN
+## Status: FIXED
 
 **Reported:** 2026-06-01
+**Fixed:** 2026-06-08 in commit 9d7742e (branch `fix/retrieve-tools-discovery`, PR #1)
 **Severity:** High (silently hides healthy read tools from discovery)
+
+**Fix:** `read_only_only` now falls back to the verb-based READ classification
+(`contracts.ClassifyOperationByName`) when `readOnlyHint` is absent. Explicit
+`readOnlyHint=false` and explicit `destructiveHint=true` still exclude the tool.
+See `internal/server/mcp_annotations.go` (`isReadOnlyForFilter`).
 
 ## Summary
 

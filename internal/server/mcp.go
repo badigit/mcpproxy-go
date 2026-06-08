@@ -1101,6 +1101,17 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 	}
 
+	// Exact tool-name resolution (Bug: retrieve-tools-exact-name-lookup-returns-no-results).
+	// When the query is an exact "server:tool" reference, the BM25 phrase may not rank the
+	// tool (the colon-joined token is not how tools are indexed), yielding no_results even
+	// though the tool exists. Resolve it directly against the index and surface it at the
+	// top of the results so the documented "retry with an exact tool name" path works.
+	if serverPart, toolPart, ok := splitExactToolName(query); ok {
+		if exact := p.resolveExactTool(serverPart, toolPart); exact != nil {
+			results = prependUniqueResult(results, exact)
+		}
+	}
+
 	// Spec 028: Filter results to only include tools from servers the agent can access
 	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
 		var filtered []*config.SearchResult
@@ -3957,6 +3968,71 @@ func (p *MCPProxyServer) getIndexedToolCount() int {
 		return 0x7FFFFFFF
 	}
 	return int(count)
+}
+
+// splitExactToolName reports whether query is an exact "server:tool" reference and,
+// if so, returns the trimmed server and tool parts. It mirrors analyzeQuery's
+// is_tool_name detection: a single colon with non-empty parts on both sides and no
+// whitespace (a natural-language query like "list events: today" is not a tool name).
+func splitExactToolName(query string) (serverPart, toolPart string, ok bool) {
+	q := strings.TrimSpace(query)
+	if strings.ContainsAny(q, " \t\n") {
+		return "", "", false
+	}
+	parts := strings.SplitN(q, ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	serverPart = strings.TrimSpace(parts[0])
+	toolPart = strings.TrimSpace(parts[1])
+	if serverPart == "" || toolPart == "" {
+		return "", "", false
+	}
+	// A second colon means this is not a simple server:tool reference.
+	if strings.Contains(toolPart, ":") {
+		return "", "", false
+	}
+	return serverPart, toolPart, true
+}
+
+// resolveExactTool looks up a single indexed tool by server and tool name, returning
+// it as a SearchResult (score 1.0) or nil if not present. It reuses the index's
+// per-server lookup so the result carries the same ToolMetadata as BM25 results.
+func (p *MCPProxyServer) resolveExactTool(serverPart, toolPart string) *config.SearchResult {
+	if p.index == nil {
+		return nil
+	}
+	tools, err := p.index.GetToolsByServer(serverPart)
+	if err != nil {
+		p.logger.Debug("exact tool lookup failed",
+			zap.String("server", serverPart),
+			zap.String("tool", toolPart),
+			zap.Error(err))
+		return nil
+	}
+	full := serverPart + ":" + toolPart
+	for _, tool := range tools {
+		// Index stores Name as the full "server:tool" name; match both the full
+		// name and the bare tool part to be robust to indexing differences.
+		if tool.Name == full || tool.Name == toolPart {
+			return &config.SearchResult{Tool: tool, Score: 1.0}
+		}
+	}
+	return nil
+}
+
+// prependUniqueResult places exact at the front of results, removing any existing
+// duplicate (same tool name) so the exact match ranks first without double-listing.
+func prependUniqueResult(results []*config.SearchResult, exact *config.SearchResult) []*config.SearchResult {
+	deduped := make([]*config.SearchResult, 0, len(results)+1)
+	deduped = append(deduped, exact)
+	for _, r := range results {
+		if r.Tool != nil && exact.Tool != nil && r.Tool.Name == exact.Tool.Name {
+			continue
+		}
+		deduped = append(deduped, r)
+	}
+	return deduped
 }
 
 // analyzeQuery analyzes the search query and provides insights

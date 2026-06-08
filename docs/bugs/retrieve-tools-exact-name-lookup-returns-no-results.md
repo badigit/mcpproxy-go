@@ -1,9 +1,14 @@
 # Bug: exact tool-name query `server:tool` returns no_results for an indexed tool
 
-## Status: OPEN
+## Status: FIXED
 
 **Reported:** 2026-06-01
+**Fixed:** 2026-06-08 in commit 9d7742e (branch `fix/retrieve-tools-discovery`, PR #1)
 **Severity:** Medium (breaks the documented "retry with an exact tool name" fallback)
+
+**Fix:** `splitExactToolName` + `resolveExactTool` (via `index.GetToolsByServer`)
+resolve an exact `server:tool` reference and prepend it to the results.
+See `internal/server/mcp.go`.
 
 ## Summary
 
