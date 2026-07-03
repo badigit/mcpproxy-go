@@ -1255,6 +1255,11 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 			"INTENT TRACKING: Always provide intent_reason (why you're calling this tool) and intent_data_sensitivity (public/internal/private/unknown) to enable activity auditing."
 	}
 
+	// Epistemic guardrail (all routing modes): a keyword-search miss is not proof
+	// a tool/server is absent — offline servers are omitted from the index. Tell
+	// the agent how to enumerate ground truth before concluding "does not exist".
+	usageInstructions += retrieveToolsGuardrail
+
 	response := map[string]interface{}{
 		"tools":              mcpTools,
 		"query":              query,
@@ -1297,6 +1302,14 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 				sessionRisk["warning"] = risk.Warning
 			}
 			response["session_risk"] = sessionRisk
+
+			// Surface configured-but-offline servers so a searching agent can see
+			// that a missing tool belongs to a server that is merely unreachable,
+			// not one that does not exist. Present only when something is actually
+			// offline — zero extra payload on a healthy fleet.
+			if offline := buildDisconnectedServers(snapshot); len(offline) > 0 {
+				response["disconnected_servers"] = offline
+			}
 		}
 	}
 

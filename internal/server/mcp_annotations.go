@@ -1,10 +1,65 @@
 package server
 
 import (
+	"sort"
+
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
 )
+
+// retrieveToolsGuardrail is appended to every retrieve_tools usage_instructions
+// payload (all routing modes). It exists because retrieve_tools is a ranked
+// keyword search over CONNECTED servers only: a low-ranked or offline tool is
+// invisible, and agents were reading that invisibility as proof the tool/server
+// does not exist. The guardrail tells the agent, in-band, that a miss is not
+// absence and how to enumerate ground truth (upstream_servers list +
+// disconnected_servers). Leading space so it appends cleanly after a period.
+const retrieveToolsGuardrail = " A SEARCH MISS IS NOT PROOF OF ABSENCE: this is a ranked keyword search, and tools from disconnected or offline servers are omitted from the index entirely. Before telling the user that a tool or server does not exist, call the upstream_servers tool (operation: \"list\") to enumerate every configured server and its live connection state. Servers that exist but are currently unreachable are listed under 'disconnected_servers' in this response — their tools are temporarily unavailable, not gone."
+
+// buildDisconnectedServers lists configured servers that EXIST but are currently
+// unreachable, so a searching agent never mistakes "absent from the results" for
+// "does not exist". A disconnected server contributes no tools to the index and
+// no hits to the BM25 search, making it otherwise invisible to retrieve_tools.
+//
+// Only enabled, non-quarantined servers that are not connected are reported:
+//   - disabled servers were turned off by the operator (deliberately hidden);
+//   - quarantined servers are gated for security review, not an outage.
+//
+// ToolCount is the last-known cached count (survives disconnection, PR #635), so
+// the agent sees "task_reporter, ~41 tools, currently offline" rather than nothing.
+// Output is sorted by server name for deterministic responses/tests.
+func buildDisconnectedServers(snapshot *stateview.ServerStatusSnapshot) []map[string]interface{} {
+	if snapshot == nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(snapshot.Servers))
+	for name := range snapshot.Servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var offline []map[string]interface{}
+	for _, name := range names {
+		server := snapshot.Servers[name]
+		if server == nil || !server.Enabled || server.Quarantined || server.Connected {
+			continue
+		}
+		entry := map[string]interface{}{"server": name}
+		if server.State != "" {
+			entry["state"] = server.State
+		}
+		if server.ToolCount > 0 {
+			entry["tool_count"] = server.ToolCount
+		}
+		if server.LastError != "" {
+			entry["last_error"] = server.LastError
+		}
+		offline = append(offline, entry)
+	}
+	return offline
+}
 
 // SessionRisk holds the result of analyzing all connected servers' tool annotations
 // for the "lethal trifecta" risk combination (Spec 035 F2).
