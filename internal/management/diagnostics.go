@@ -7,9 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 )
 
 // extractHealthFromMap extracts health status from a server map.
@@ -154,6 +157,12 @@ func (s *service) Doctor(ctx context.Context) (*contracts.Diagnostics, error) {
 		diag.DockerStatus = s.checkDockerDaemon()
 	}
 
+	// macOS App-Data (TCC) denial probe (Spec 075 US3): surface a persisted denial
+	// to read MCP client configs as an actionable runtime warning. No-op off darwin.
+	if warning, ok := appDataDenialWarning(); ok {
+		diag.RuntimeWarnings = append(diag.RuntimeWarnings, warning)
+	}
+
 	// Calculate total issues
 	diag.TotalIssues = len(diag.UpstreamErrors) + len(diag.OAuthRequired) +
 		len(diag.OAuthIssues) + len(diag.MissingSecrets) + len(diag.RuntimeWarnings)
@@ -168,7 +177,6 @@ func (s *service) Doctor(ctx context.Context) (*contracts.Diagnostics, error) {
 	return diag, nil
 }
 
-
 // checkDockerDaemon checks if Docker daemon is available and returns status.
 // This implements T042: helper for checking Docker availability.
 func (s *service) checkDockerDaemon() *contracts.DockerStatus {
@@ -176,11 +184,29 @@ func (s *service) checkDockerDaemon() *contracts.DockerStatus {
 		Available: false,
 	}
 
-	// Try to run `docker info` to check daemon availability
+	// Try to run `docker info` to check daemon availability.
+	// Resolve docker via shellwrap so we find Docker Desktop / Homebrew /
+	// Colima installs even when mcpproxy was launched from a tray /
+	// LaunchAgent with a minimal inherited PATH.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}")
+	var logger *zap.Logger
+	if s.logger != nil {
+		logger = s.logger.Desugar()
+	}
+	dockerBin, resolveErr := shellwrap.ResolveDockerPath(logger)
+	if resolveErr != nil || dockerBin == "" {
+		// Honest availability (#696): if the CLI can't be resolved to an
+		// absolute path, Docker-isolated servers can't spawn it. Report
+		// unavailable with an actionable error rather than probing a bare
+		// "docker" that is not the binary used for spawning.
+		status.Available = false
+		status.Error = "Docker CLI not found on PATH or well-known install locations (on macOS the CLI ships at /Applications/Docker.app/Contents/Resources/bin/docker even without the optional CLI-tools step)"
+		s.logger.Debugw("Docker CLI not resolvable; reporting docker unavailable", "error", resolveErr)
+		return status
+	}
+	cmd := exec.CommandContext(ctx, dockerBin, "info", "--format", "{{.ServerVersion}}")
 	output, err := cmd.Output()
 
 	if err != nil {
@@ -221,4 +247,3 @@ func getStringFromMap(m map[string]interface{}, key string) string {
 	}
 	return ""
 }
-

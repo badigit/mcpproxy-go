@@ -53,12 +53,36 @@ struct ServerDetailView: View {
     @State private var editArgs = ""
     @State private var editWorkingDir = ""
     @State private var editEnvVars = ""
+    /// HTTP servers only — KEY=VALUE per line. Pre-populated from
+    /// `server.headers` on enter-edit. The backend masks sensitive
+    /// header values on the read path (see oauth.MaskValue) so the
+    /// textarea may show e.g. `Authorization=••••59 (71 chars)`.
+    /// saveEdits() diffs the parsed map against `server.headers` and
+    /// only sends changed/added/removed keys to the deep-merge PATCH
+    /// endpoint — so leaving the masked line untouched preserves the
+    /// real stored value, and editing/deleting/adding behaves
+    /// intuitively.
+    @State private var editHeaders = ""
     @State private var editEnabled = true
     @State private var editQuarantined = false
     @State private var editDockerIsolation = false
     @State private var editSkipQuarantine = false
+    // Per-server Docker isolation overrides.
+    @State private var editIsolationImage = ""
+    @State private var editIsolationNetworkMode = ""
+    @State private var editIsolationExtraArgs = ""
+    @State private var editIsolationWorkingDir = ""
     @State private var isSavingEdit = false
     @State private var editError: String?
+
+    /// State for the "Convert to secret" sheet shown when the user picks
+    /// the lock icon next to a literal header / env value. Mirrors the
+    /// Web UI flow: prompt for a secret name, POST to /api/v1/secrets,
+    /// then PATCH the server replacing the value with `${keyring:NAME}`.
+    @State private var convertSheet: ConvertToSecretContext?
+    @State private var convertSheetSecretName: String = ""
+    @State private var convertSheetBusy: Bool = false
+    @State private var convertSheetError: String?
 
     // Logs auto-refresh timer
     @State private var logRefreshTimer: Timer?
@@ -81,6 +105,9 @@ struct ServerDetailView: View {
             case .logs: logsTab
             case .config: configTab
             }
+        }
+        .sheet(item: $convertSheet) { ctx in
+            convertToSecretSheet(ctx)
         }
     }
 
@@ -114,11 +141,12 @@ struct ServerDetailView: View {
 
             Spacer()
 
-            // Action buttons
-            if server.health?.action == "login" {
-                Button("Log In") {
+            // Action buttons — OAuth login-required surfaces a calm, prominent
+            // "Sign in" affordance, consistent with the Web UI (MCP-1819/T3).
+            if server.isOAuthLoginRequired {
+                Button("Sign in") {
                     Task { await performAction { try await apiClient?.loginServer(server.id) }
-                        actionMessage = "Login initiated for \(server.name)"
+                        actionMessage = "Sign-in started for \(server.name)"
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -542,6 +570,25 @@ struct ServerDetailView: View {
                                 configRow(label: "URL", value: server.url ?? "N/A")
                             }
                         }
+                        // Headers section: visible whenever we have any headers
+                        // to show OR we're in edit mode (so users can add new
+                        // headers on a server that started without any).
+                        if isEditing || (server.headers?.isEmpty == false) {
+                            configSection(title: "Headers") {
+                                if isEditing {
+                                    configEditRow(
+                                        label: "KEY=VALUE per line",
+                                        text: $editHeaders,
+                                        placeholder: "Authorization=Bearer abc123\nX-API-Key=${keyring:my-key}",
+                                        multiline: true
+                                    )
+                                } else if let headers = server.headers {
+                                    ForEach(headers.keys.sorted(), id: \.self) { key in
+                                        kvRow(scope: .header, key: key, value: headers[key] ?? "")
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if server.protocol == "stdio" {
@@ -562,9 +609,90 @@ struct ServerDetailView: View {
                         }
                     }
 
-                    if isEditing {
+                    if isEditing || (server.env?.isEmpty == false) {
                         configSection(title: "Environment Variables") {
-                            configEditRow(label: "KEY=VALUE per line", text: $editEnvVars, placeholder: "API_KEY=abc123\nDEBUG=true", multiline: true)
+                            if isEditing {
+                                configEditRow(label: "KEY=VALUE per line", text: $editEnvVars, placeholder: "API_KEY=abc123\nDEBUG=true", multiline: true)
+                            } else if let env = server.env {
+                                ForEach(env.keys.sorted(), id: \.self) { key in
+                                    kvRow(scope: .env, key: key, value: env[key] ?? "")
+                                }
+                            }
+                        }
+                    }
+
+                    // Docker isolation overrides (only relevant for stdio servers).
+                    // The global "Docker Isolation" toggle in the General section
+                    // enables isolation for this server; these fields customize how
+                    // that isolation is provisioned.
+                    if server.protocol == "stdio" {
+                        configSection(title: "Docker Isolation Overrides") {
+                            if isEditing {
+                                let defaults = server.isolationDefaults
+                                let imagePlaceholder = isolationPlaceholder(
+                                    for: defaults?.image,
+                                    fallback: "Default image (resolved from runtime)"
+                                )
+                                let networkPlaceholder = isolationPlaceholder(
+                                    for: defaults?.networkMode,
+                                    fallback: "bridge | none | host"
+                                )
+                                let extraArgsPlaceholder: String = {
+                                    if let extra = defaults?.extraArgs, !extra.isEmpty {
+                                        return "Default: \(extra.joined(separator: " "))"
+                                    }
+                                    return "-v\n/Users/you/data:/data:rw"
+                                }()
+                                let workdirPlaceholder = isolationPlaceholder(
+                                    for: defaults?.workingDir,
+                                    fallback: "/vault (Docker default applies when empty)"
+                                )
+
+                                isolationOverrideRow(
+                                    label: "Image",
+                                    text: $editIsolationImage,
+                                    placeholder: imagePlaceholder,
+                                    defaultValue: defaults?.image
+                                )
+                                isolationOverrideRow(
+                                    label: "Network Mode",
+                                    text: $editIsolationNetworkMode,
+                                    placeholder: networkPlaceholder,
+                                    defaultValue: defaults?.networkMode
+                                )
+                                isolationOverrideRow(
+                                    label: "Extra docker args (one per line)",
+                                    text: $editIsolationExtraArgs,
+                                    placeholder: extraArgsPlaceholder,
+                                    defaultValue: (defaults?.extraArgs ?? []).joined(separator: " "),
+                                    multiline: true
+                                )
+                                isolationOverrideRow(
+                                    label: "Container Working Dir",
+                                    text: $editIsolationWorkingDir,
+                                    placeholder: workdirPlaceholder,
+                                    defaultValue: defaults?.workingDir
+                                )
+                            } else if let iso = server.isolation {
+                                if let img = iso.image, !img.isEmpty {
+                                    configRow(label: "Image", value: img)
+                                }
+                                if let nm = iso.networkMode, !nm.isEmpty {
+                                    configRow(label: "Network Mode", value: nm)
+                                }
+                                if let extra = iso.extraArgs, !extra.isEmpty {
+                                    configRow(label: "Extra Args", value: extra.joined(separator: " "))
+                                }
+                                if let wd = iso.workingDir, !wd.isEmpty {
+                                    configRow(label: "Container Working Dir", value: wd)
+                                }
+                                if (iso.image ?? "").isEmpty && (iso.networkMode ?? "").isEmpty
+                                    && (iso.extraArgs?.isEmpty ?? true) && (iso.workingDir ?? "").isEmpty {
+                                    configRow(label: "Overrides", value: "None (inherits global)")
+                                }
+                            } else {
+                                configRow(label: "Overrides", value: "None (inherits global)")
+                            }
                         }
                     }
 
@@ -649,6 +777,85 @@ struct ServerDetailView: View {
                     .textFieldStyle(.roundedBorder)
             }
             Spacer()
+        }
+    }
+
+    /// Format a placeholder string for an isolation override field. When
+    /// the backend reports a resolved default we surface it explicitly so
+    /// the user knows what an empty field will resolve to.
+    private func isolationPlaceholder(for value: String?, fallback: String) -> String {
+        if let v = value, !v.isEmpty {
+            return "Default: \(v)"
+        }
+        return fallback
+    }
+
+    /// Renders one Docker isolation override field with a per-field clear
+    /// button and a "(using default)" caption. Each field is independently
+    /// clearable: tapping the clear button blanks the local edit binding,
+    /// and on Save the empty string is sent to the backend, which clears
+    /// the override under the existing PATCH semantics.
+    @ViewBuilder
+    private func isolationOverrideRow(
+        label: String,
+        text: Binding<String>,
+        placeholder: String,
+        defaultValue: String?,
+        multiline: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top) {
+                Text(label)
+                    .font(.scaled(.subheadline, scale: fontScale))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 140, alignment: .trailing)
+                if multiline {
+                    ZStack(alignment: .topTrailing) {
+                        TextEditor(text: text)
+                            .font(.scaledMonospaced(.subheadline, scale: fontScale))
+                            .frame(height: 60)
+                            .border(Color(nsColor: .separatorColor), width: 1)
+                        if !text.wrappedValue.isEmpty {
+                            Button(action: { text.wrappedValue = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear override (use default)")
+                            .padding(4)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 4) {
+                        TextField(placeholder, text: text)
+                            .font(.scaledMonospaced(.subheadline, scale: fontScale))
+                            .textFieldStyle(.roundedBorder)
+                        if !text.wrappedValue.isEmpty {
+                            Button(action: { text.wrappedValue = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear override (use default)")
+                        }
+                    }
+                }
+                Spacer()
+            }
+            // Caption beneath the field communicates which resolved default
+            // would apply when the field is empty. Subtle but discoverable.
+            if text.wrappedValue.isEmpty {
+                let caption: String = {
+                    if let d = defaultValue, !d.isEmpty {
+                        return "Using default: \(d)"
+                    }
+                    return "Using default (no override set)"
+                }()
+                Text(caption)
+                    .font(.scaled(.caption2, scale: fontScale))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 148)
+            }
         }
     }
 
@@ -777,11 +984,27 @@ struct ServerDetailView: View {
         editCommand = server.command ?? ""
         editArgs = (server.args ?? []).joined(separator: "\n")
         editWorkingDir = server.workingDir ?? ""
-        editEnvVars = "" // env vars not in ServerStatus model, would need config API
+        // Pre-populate env and headers textareas from the server payload
+        // so users entering edit mode start from the existing config
+        // rather than from blank. Both maps emit one KEY=VALUE per line,
+        // sorted by key for stable rendering.
+        editEnvVars = (server.env ?? [:])
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "\n")
+        editHeaders = (server.headers ?? [:])
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "\n")
         editEnabled = server.enabled
         editQuarantined = server.quarantined
-        editDockerIsolation = false // read from config if available
+        editDockerIsolation = server.isolation?.enabled ?? false
         editSkipQuarantine = false  // read from config if available
+        let iso = server.isolation
+        editIsolationImage = iso?.image ?? ""
+        editIsolationNetworkMode = iso?.networkMode ?? ""
+        editIsolationExtraArgs = (iso?.extraArgs ?? []).joined(separator: "\n")
+        editIsolationWorkingDir = iso?.workingDir ?? ""
         editError = nil
         isEditing = true
     }
@@ -817,23 +1040,80 @@ struct ServerDetailView: View {
         let wd = editWorkingDir.trimmingCharacters(in: .whitespaces)
         if !wd.isEmpty { updates["working_dir"] = wd }
 
-        // Parse env vars
-        if !editEnvVars.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            var env: [String: String] = [:]
-            for line in editEnvVars.components(separatedBy: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
-                let parts = trimmed.components(separatedBy: "=")
-                if parts.count >= 2 {
-                    env[parts[0].trimmingCharacters(in: .whitespaces)] = parts.dropFirst().joined(separator: "=")
-                }
+        // Parse env vars. The textarea is the user's authoritative copy on
+        // save — sending an empty map clears all env vars on the backend
+        // (matches the existing add-server flow). We pass it through
+        // unconditionally so deletes round-trip.
+        updates["env"] = parseKVTextarea(editEnvVars)
+
+        // Compute JSON Merge Patch (RFC 7396) diffs for env and headers.
+        // The backend treats each value in the map as: non-null → upsert,
+        // `null` → delete, omitted key → preserve. So we emit a single
+        // dict whose entries are either real strings or `NSNull()`
+        // sentinels. JSONSerialization renders NSNull as the literal
+        // `null` token — see the SwiftEncoder unit test that pins this
+        // invariant in case a future refactor swaps the encoder.
+        if let envPatch = diffKVMap(original: server.env ?? [:], next: parseKVTextarea(editEnvVars)) {
+            updates["env"] = envPatch
+        }
+        if server.protocol == "http" || server.protocol == "sse" || server.protocol == "streamable-http" {
+            if let hdrPatch = diffKVMap(original: server.headers ?? [:], next: parseKVTextarea(editHeaders)) {
+                updates["headers"] = hdrPatch
             }
-            if !env.isEmpty { updates["env"] = env }
         }
 
         // Boolean toggles
         if editEnabled != server.enabled { updates["enabled"] = editEnabled }
         if editQuarantined != server.quarantined { updates["quarantined"] = editQuarantined }
+
+        // Docker isolation (stdio only). Send any field that changed —
+        // we always include `enabled` because the handler tracks the
+        // boolean explicitly, and sending just the sub-fields without
+        // it would leave the isolation off on a server that never had
+        // it enabled before.
+        if server.protocol == "stdio" {
+            let existing = server.isolation
+            let newExtra = editIsolationExtraArgs
+                .components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            let newImage = editIsolationImage.trimmingCharacters(in: .whitespaces)
+            let newNetwork = editIsolationNetworkMode.trimmingCharacters(in: .whitespaces)
+            let newWorkDir = editIsolationWorkingDir.trimmingCharacters(in: .whitespaces)
+
+            var iso: [String: Any] = [:]
+            var isoChanged = false
+
+            if editDockerIsolation != (existing?.enabled ?? false) {
+                iso["enabled"] = editDockerIsolation
+                isoChanged = true
+            }
+            if newImage != (existing?.image ?? "") {
+                iso["image"] = newImage
+                isoChanged = true
+            }
+            if newNetwork != (existing?.networkMode ?? "") {
+                iso["network_mode"] = newNetwork
+                isoChanged = true
+            }
+            if newExtra != (existing?.extraArgs ?? []) {
+                iso["extra_args"] = newExtra
+                isoChanged = true
+            }
+            if newWorkDir != (existing?.workingDir ?? "") {
+                iso["working_dir"] = newWorkDir
+                isoChanged = true
+            }
+
+            if isoChanged {
+                // Always include `enabled` alongside any sub-field change so
+                // the backend applies the full intended isolation state.
+                if iso["enabled"] == nil {
+                    iso["enabled"] = editDockerIsolation
+                }
+                updates["isolation"] = iso
+            }
+        }
 
         if updates.isEmpty {
             isEditing = false
@@ -845,6 +1125,9 @@ struct ServerDetailView: View {
             try await client.updateServer(server.name, updates: updates)
             isEditing = false
             actionMessage = "Server configuration updated. Restart may be required."
+            // Pull the updated config back so the Config tab shows the newly
+            // saved values instead of the pre-edit snapshot.
+            await refreshServer()
         } catch {
             editError = "Failed to save: \(error.localizedDescription)"
         }
@@ -864,6 +1147,238 @@ struct ServerDetailView: View {
     private func stopLogRefresh() {
         logRefreshTimer?.invalidate()
         logRefreshTimer = nil
+    }
+
+    // MARK: - Convert-to-secret sheet
+
+    /// Identifiable context for the SwiftUI .sheet(item:) modifier — keeps
+    /// the current convert-target alongside the sheet state. `scope` picks
+    /// between the Headers and Environment Variables maps; `key` is the
+    /// map key whose literal value we're about to move into the keyring.
+    struct ConvertToSecretContext: Identifiable {
+        let id = UUID()
+        let scope: Scope
+        let key: String
+        let value: String
+        enum Scope: String { case header, env }
+    }
+
+    /// Suggest a keyring secret name derived from server.name + key.
+    /// Lowercased, alphanumeric + hyphens, capped at 64 chars — same
+    /// convention as the Web UI / Secrets view.
+    private func suggestedSecretName(for key: String) -> String {
+        let base = "\(server.name)-\(key)"
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+        let scrubbed = base.lowercased().unicodeScalars
+            .map { allowed.contains($0) ? Character($0) : "-" }
+        var out = String(scrubbed)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        if out.count > 64 { out = String(out.prefix(64)) }
+        return out
+    }
+
+    private func openConvertSheet(scope: ConvertToSecretContext.Scope, key: String, value: String) {
+        convertSheetSecretName = suggestedSecretName(for: key)
+        convertSheetBusy = false
+        convertSheetError = nil
+        convertSheet = ConvertToSecretContext(scope: scope, key: key, value: value)
+    }
+
+    @ViewBuilder
+    private func convertToSecretSheet(_ ctx: ConvertToSecretContext) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Convert to secret")
+                .font(.scaled(.title3, scale: fontScale).bold())
+            Text("Store the value of \(Text(ctx.key).font(.scaledMonospaced(.body, scale: fontScale))) in the OS keyring and replace it with a `${keyring:NAME}` reference. The server config will then no longer contain the literal value.")
+                .font(.scaled(.subheadline, scale: fontScale))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Secret name").font(.scaled(.subheadline, scale: fontScale)).foregroundStyle(.secondary)
+                TextField("e.g. \(server.name)-token", text: $convertSheetSecretName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.scaledMonospaced(.subheadline, scale: fontScale))
+                    .disabled(convertSheetBusy)
+                Text("Will be referenced as ${keyring:\(convertSheetSecretName.isEmpty ? "NAME" : convertSheetSecretName)}")
+                    .font(.scaled(.caption, scale: fontScale))
+                    .foregroundStyle(.tertiary)
+            }
+
+            if let err = convertSheetError {
+                Text(err)
+                    .font(.scaled(.caption, scale: fontScale))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { convertSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(convertSheetBusy)
+                Button(convertSheetBusy ? "Converting…" : "Convert") {
+                    Task { await performConvertToSecret(ctx) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(convertSheetBusy || convertSheetSecretName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+    private func performConvertToSecret(_ ctx: ConvertToSecretContext) async {
+        guard let client = apiClient else { return }
+        let name = convertSheetSecretName.trimmingCharacters(in: .whitespaces)
+        if name.isEmpty { return }
+        convertSheetBusy = true
+        defer { convertSheetBusy = false }
+        do {
+            // Atomic server-side conversion: the backend reads the real
+            // value from the loaded config (so this works even when the
+            // value the user sees is a redacted mask string), stores it
+            // in the OS keyring, and rewrites the config field with the
+            // `${keyring:<name>}` reference. One round trip, one
+            // failure surface.
+            try await client.convertConfigToSecret(
+                serverName: server.name,
+                scope: ctx.scope == .header ? "header" : "env",
+                key: ctx.key,
+                secretName: name
+            )
+            await refreshServer()
+            await MainActor.run { convertSheet = nil }
+        } catch {
+            await MainActor.run {
+                convertSheetError = "Convert failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: - Headers + Env per-row view (read-only mode)
+
+    /// Render a single key/value entry with the appropriate affordances:
+    ///  - keyring/env references render as a chip with no actions.
+    ///  - literal values render masked, with a 🔒 "Convert to secret"
+    ///    button next to them.
+    ///  - the backend redaction sentinel renders verbatim so the user
+    ///    knows to flip `reveal_secret_headers` in their config.
+    @ViewBuilder
+    private func kvRow(scope: ConvertToSecretContext.Scope, key: String, value: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(key)
+                .font(.scaled(.subheadline, scale: fontScale))
+                .foregroundStyle(.secondary)
+                .frame(width: 140, alignment: .trailing)
+
+            if value.hasPrefix("${keyring:") || value.hasPrefix("${env:") {
+                Label(value, systemImage: "key.fill")
+                    .font(.scaledMonospaced(.caption, scale: fontScale))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.15))
+                    .clipShape(Capsule())
+                Spacer()
+            } else {
+                Text(maskedHeaderValue(value))
+                    .font(.scaledMonospaced(.subheadline, scale: fontScale))
+                    .textSelection(.enabled)
+
+                // Convert-to-secret is always available on non-empty
+                // values. The flow hits the backend's
+                // /api/v1/servers/{name}/config-to-secret endpoint,
+                // which atomically reads the real value from the loaded
+                // config (so it works even when the API redacts what we
+                // see), stores it in keyring, and rewrites the field.
+                if !value.isEmpty {
+                    Button {
+                        openConvertSheet(scope: scope, key: key, value: value)
+                    } label: {
+                        Label("Convert to secret", systemImage: "lock.fill")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Store this value in the OS keyring and replace it with a ${keyring:…} reference")
+                }
+                Spacer()
+            }
+        }
+    }
+
+    // MARK: - Headers + Env helpers
+
+    /// Diff a new key/value map against the original (e.g. `server.headers`
+    /// as returned by the API, which may contain backend-masked values
+    /// like `••••59 (71 chars)` for sensitive keys). Returns a single
+    /// JSON Merge Patch dict (RFC 7396): upserts map to their new string
+    /// value, deletes map to `NSNull()`, unchanged keys are omitted
+    /// entirely. Returns `nil` when the maps are identical and no patch
+    /// is needed.
+    ///
+    /// `[String: Any]` rather than `[String: Any?]` is intentional —
+    /// JSONSerialization treats absent keys as omitted, NSNull entries as
+    /// literal JSON `null`. If we used `[String: String?]` and the default
+    /// `JSONEncoder`, nil values would be silently dropped from the wire
+    /// payload and deletes would never reach the backend. The
+    /// MergePatchEncodingTests unit tests pin this contract.
+    ///
+    /// Subtle invariant: when the user leaves the textarea line for a
+    /// backend-masked key untouched, `next[k] == "••••59 (71 chars)" ==
+    /// original[k]` — the key stays out of the diff, the backend
+    /// preserves the real stored value, and the mask string never
+    /// round-trips as a "new value" to be persisted.
+    private func diffKVMap(original: [String: String], next: [String: String]) -> [String: Any]? {
+        var patch: [String: Any] = [:]
+        for (k, v) in next {
+            if original[k] != v {
+                patch[k] = v
+            }
+        }
+        for k in original.keys {
+            if next[k] == nil {
+                patch[k] = NSNull()
+            }
+        }
+        return patch.isEmpty ? nil : patch
+    }
+
+    /// Parse a "KEY=VALUE per line" textarea (used for both env and
+    /// headers) into a map. Empty lines are dropped; lines without `=`
+    /// are dropped silently — matching the existing env-parsing behaviour
+    /// on this view. Returns an empty map when the textarea is empty so
+    /// callers can treat the result as the authoritative new state.
+    private func parseKVTextarea(_ text: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            let parts = trimmed.components(separatedBy: "=")
+            guard parts.count >= 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            if key.isEmpty { continue }
+            out[key] = parts.dropFirst().joined(separator: "=")
+        }
+        return out
+    }
+
+    /// Render a header / env value safely in view mode. Keyring / env
+    /// references pass through as-is (they're already labels, not
+    /// secrets). Literal values are masked to `••••<last2> (<N> chars)`
+    /// so a casual onlooker can see the field IS set without exposing
+    /// the secret. The backend now emits this exact format for sensitive
+    /// headers it redacts on the read path (see oauth.MaskValue), so
+    /// the mask is idempotent: re-masking an already-masked string
+    /// returns it unchanged.
+    private func maskedHeaderValue(_ value: String) -> String {
+        if value.hasPrefix("${keyring:") || value.hasPrefix("${env:") { return value }
+        if value.isEmpty { return "(empty)" }
+        if value.hasPrefix("••••") { return value }
+        if value.count <= 4 { return "••••" }
+        let tail = value.suffix(2)
+        return "••••\(tail) (\(value.count) chars)"
     }
 }
 
@@ -1158,12 +1673,7 @@ struct ToolRow: View {
                         .foregroundStyle(.secondary)
 
                     if oldDesc != newDesc {
-                        if !oldDesc.isEmpty {
-                            diffLine(text: oldDesc, isOld: true)
-                        }
-                        if !newDesc.isEmpty {
-                            diffLine(text: newDesc, isOld: false)
-                        }
+                        diffBeforeAfter(previous: oldDesc, current: newDesc)
                     } else {
                         Text("No description changes")
                             .font(.scaled(.caption, scale: fontScale))
@@ -1188,12 +1698,7 @@ struct ToolRow: View {
                         .padding(.top, 4)
 
                     if oldSchema != newSchema {
-                        if !oldSchema.isEmpty {
-                            diffLine(text: oldSchema, isOld: true)
-                        }
-                        if !newSchema.isEmpty {
-                            diffLine(text: newSchema, isOld: false)
-                        }
+                        diffBeforeAfter(previous: oldSchema, current: newSchema)
                     } else {
                         Text("No schema changes")
                             .font(.scaled(.caption, scale: fontScale))
@@ -1219,20 +1724,78 @@ struct ToolRow: View {
     }
 
     @ViewBuilder
-    private func diffLine(text: String, isOld: Bool) -> some View {
-        HStack(alignment: .top, spacing: 4) {
-            Image(systemName: isOld ? "minus.circle.fill" : "plus.circle.fill")
-                .font(.scaled(.caption2, scale: fontScale))
-                .foregroundStyle(isOld ? .red : .green)
-            Text(text)
-                .font(.scaledMonospaced(.caption, scale: fontScale))
-                .foregroundStyle(isOld ? .secondary : .primary)
-                .lineLimit(isOld ? 6 : nil)
+    private func diffBeforeAfter(previous: String, current: String) -> some View {
+        let parts = computeWordDiff(previous, current)
+        VStack(alignment: .leading, spacing: 6) {
+            diffBox(
+                label: "BEFORE (APPROVED)",
+                attributed: renderDiffSide(parts, keep: .removed),
+                accent: .red,
+                isEmpty: previous.isEmpty
+            )
+            diffBox(
+                label: "AFTER (CURRENT)",
+                attributed: renderDiffSide(parts, keep: .added),
+                accent: .green,
+                isEmpty: current.isEmpty
+            )
         }
-        .padding(4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background((isOld ? Color.red : Color.green).opacity(0.08))
-        .cornerRadius(4)
+    }
+
+    @ViewBuilder
+    private func diffBox(label: String, attributed: AttributedString, accent: Color, isEmpty: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 9 * fontScale, weight: .semibold))
+                .tracking(0.5)
+                .foregroundStyle(.secondary)
+            if isEmpty {
+                Text("(empty)")
+                    .font(.scaledMonospaced(.caption, scale: fontScale))
+                    .foregroundStyle(.tertiary)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(accent.opacity(0.04))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(accent.opacity(0.25), lineWidth: 1)
+                    )
+                    .cornerRadius(4)
+            } else {
+                Text(attributed)
+                    .font(.scaledMonospaced(.caption, scale: fontScale))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                    .background(accent.opacity(0.04))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(accent.opacity(0.25), lineWidth: 1)
+                    )
+                    .cornerRadius(4)
+            }
+        }
+    }
+
+    /// Build AttributedString for one side of the diff. `keep` is the change-type
+    /// (removed or added) that belongs in this side; same-type parts render plain
+    /// in both sides; the opposite change-type is dropped.
+    private func renderDiffSide(_ parts: [ToolDiffPart], keep: ToolDiffPart.Kind) -> AttributedString {
+        var result = AttributedString()
+        for part in parts {
+            switch part.kind {
+            case .same:
+                result += AttributedString(part.text)
+            case .added, .removed:
+                if part.kind != keep { continue }
+                var span = AttributedString(part.text)
+                let accent: Color = part.kind == .removed ? .red : .green
+                span.backgroundColor = accent.opacity(0.25)
+                span.foregroundColor = accent
+                result += span
+            }
+        }
+        return result
     }
 
     private func loadDiff() {
@@ -1312,6 +1875,138 @@ struct ToolRow: View {
         .background(color.opacity(0.1))
         .cornerRadius(4)
     }
+}
+
+// MARK: - Tool Description Word Diff
+
+struct ToolDiffPart {
+    enum Kind { case same, added, removed }
+    let kind: Kind
+    let text: String
+}
+
+/// Split a string into tokens, preserving runs of whitespace as their own tokens
+/// (matches the web UI's `split(/(\s+)/)` so the LCS behaves identically).
+private func splitPreservingWhitespace(_ s: String) -> [String] {
+    var tokens: [String] = []
+    var buffer = ""
+    var bufferIsWhitespace: Bool? = nil
+    for ch in s {
+        let chIsWhitespace = ch.isWhitespace
+        if bufferIsWhitespace == nil {
+            bufferIsWhitespace = chIsWhitespace
+            buffer.append(ch)
+        } else if bufferIsWhitespace == chIsWhitespace {
+            buffer.append(ch)
+        } else {
+            tokens.append(buffer)
+            buffer = String(ch)
+            bufferIsWhitespace = chIsWhitespace
+        }
+    }
+    if !buffer.isEmpty { tokens.append(buffer) }
+    return tokens
+}
+
+/// Generic LCS diff over `Element` sequences (words or characters).
+private func lcsDiff<Element: Equatable>(_ oldElems: [Element], _ newElems: [Element]) -> [(kind: ToolDiffPart.Kind, elem: Element)] {
+    let m = oldElems.count
+    let n = newElems.count
+    if m == 0 && n == 0 { return [] }
+    if m == 0 { return newElems.map { (.added, $0) } }
+    if n == 0 { return oldElems.map { (.removed, $0) } }
+
+    var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
+    for i in 1...m {
+        for j in 1...n {
+            if oldElems[i - 1] == newElems[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            } else {
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+            }
+        }
+    }
+
+    var out: [(ToolDiffPart.Kind, Element)] = []
+    var i = m
+    var j = n
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && oldElems[i - 1] == newElems[j - 1] {
+            out.append((.same, oldElems[i - 1]))
+            i -= 1
+            j -= 1
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            out.append((.added, newElems[j - 1]))
+            j -= 1
+        } else {
+            out.append((.removed, oldElems[i - 1]))
+            i -= 1
+        }
+    }
+    out.reverse()
+    return out
+}
+
+/// Character-level diff between two strings. Falls back to the raw
+/// `removed → added` pair when either side exceeds `maxChars` to avoid
+/// quadratic blowup on very long runs.
+private func characterLevelDiff(_ oldText: String, _ newText: String, maxChars: Int = 1500) -> [ToolDiffPart] {
+    if oldText.count > maxChars || newText.count > maxChars {
+        return [
+            ToolDiffPart(kind: .removed, text: oldText),
+            ToolDiffPart(kind: .added, text: newText),
+        ]
+    }
+    let oldChars = Array(oldText)
+    let newChars = Array(newText)
+    return lcsDiff(oldChars, newChars).map { ToolDiffPart(kind: $0.kind, text: String($0.elem)) }
+}
+
+/// Merge consecutive parts of the same kind to minimize attribute spans.
+private func mergeSameKind(_ parts: [ToolDiffPart]) -> [ToolDiffPart] {
+    var merged: [ToolDiffPart] = []
+    for part in parts {
+        if let last = merged.last, last.kind == part.kind {
+            merged[merged.count - 1] = ToolDiffPart(kind: last.kind, text: last.text + part.text)
+        } else {
+            merged.append(part)
+        }
+    }
+    return merged
+}
+
+/// Word-level diff with character-level refinement inside adjacent
+/// (removed, added) pairs. This keeps whole-token highlights for large
+/// docstring expansions while narrowing substring changes like
+/// `"1 April"` → `"8 April"` down to just the `1`/`8` characters.
+func computeWordDiff(_ oldText: String, _ newText: String) -> [ToolDiffPart] {
+    let oldTokens = splitPreservingWhitespace(oldText)
+    let newTokens = splitPreservingWhitespace(newText)
+    let wordDiff = lcsDiff(oldTokens, newTokens).map { ToolDiffPart(kind: $0.kind, text: $0.elem) }
+
+    // First merge consecutive same-kind parts, then refine adjacent
+    // (removed, added) runs into character-level diffs.
+    let merged = mergeSameKind(wordDiff)
+    var refined: [ToolDiffPart] = []
+    var idx = 0
+    while idx < merged.count {
+        let current = merged[idx]
+        if idx + 1 < merged.count {
+            let next = merged[idx + 1]
+            if (current.kind == .removed && next.kind == .added) ||
+               (current.kind == .added && next.kind == .removed) {
+                let removedText = current.kind == .removed ? current.text : next.text
+                let addedText = current.kind == .added ? current.text : next.text
+                refined.append(contentsOf: characterLevelDiff(removedText, addedText))
+                idx += 2
+                continue
+            }
+        }
+        refined.append(current)
+        idx += 1
+    }
+
+    return mergeSameKind(refined)
 }
 
 // MARK: - Flow Layout (for wrapping annotation badges)

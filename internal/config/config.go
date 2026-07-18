@@ -19,6 +19,10 @@ const (
 	RoutingModeRetrieveTools = "retrieve_tools" // Default: BM25 search via retrieve_tools + call_tool_read/write/destructive
 	RoutingModeDirect        = "direct"         // All upstream tools exposed directly with serverName__toolName naming
 	RoutingModeCodeExecution = "code_execution" // JS orchestration via code_execution tool with tool catalog
+
+	// Tool response mode constants (Spec 085)
+	ToolResponseModeFull    = "full"    // Default: today's schema-bearing retrieve_tools entries
+	ToolResponseModeCompact = "compact" // Compact signatures + first-sentence descriptions
 )
 
 // Duration is a wrapper around time.Duration that can be marshaled to/from JSON.
@@ -52,6 +56,101 @@ func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
 }
 
+// Built-in defaults for the discovery/health-check loops (spec 074). They live
+// here (not in DefaultConfig) so an unset key resolves to the historical
+// behaviour and existing configs are unchanged (SC-005).
+const (
+	defaultHealthCheckInterval   = 30 * time.Second
+	defaultToolDiscoveryInterval = 5 * time.Minute
+	// defaultInitTimeout is the deadline applied to a stdio/HTTP upstream's MCP
+	// `initialize` handshake when no per-server or global override is set
+	// (MCP-3322 / GH #760). It preserves the historical ~30s behaviour.
+	defaultInitTimeout = 30 * time.Second
+)
+
+// resolveInterval applies the per-server → global → default precedence for an
+// optional *Duration. A non-nil pointer wins at each level, including a pointer
+// to 0 ("disabled"). Returns the resolved duration; a value <= 0 means the
+// caller should disable the corresponding loop.
+func resolveInterval(server, global *Duration, def time.Duration) time.Duration {
+	if server != nil {
+		return server.Duration()
+	}
+	if global != nil {
+		return global.Duration()
+	}
+	return def
+}
+
+// ResolveHealthCheckInterval resolves the effective health-check probe interval
+// for a server: per-server override → global → 30s default. A resolved value
+// <= 0 disables the periodic probe for that server (spec 074, FR-006).
+func (c *Config) ResolveHealthCheckInterval(sc *ServerConfig) time.Duration {
+	var server *Duration
+	if sc != nil {
+		server = sc.HealthCheckInterval
+	}
+	return resolveInterval(server, c.HealthCheckInterval, defaultHealthCheckInterval)
+}
+
+// ResolveToolDiscoveryInterval resolves the effective tool-discovery sweep
+// interval: per-server override → global → 5m default. A resolved value <= 0
+// disables the periodic sweep (connect-time + reactive list_changed discovery
+// still run). The periodic index rebuild is global; pass nil for the sweep.
+func (c *Config) ResolveToolDiscoveryInterval(sc *ServerConfig) time.Duration {
+	var server *Duration
+	if sc != nil {
+		server = sc.ToolDiscoveryInterval
+	}
+	return resolveInterval(server, c.ToolDiscoveryInterval, defaultToolDiscoveryInterval)
+}
+
+// ResolveInitTimeout resolves the effective MCP `initialize` handshake deadline
+// for a server: per-server override → global → 30s default (MCP-3322 / GH #760).
+// Unlike the discovery intervals, a resolved value <= 0 maps to the default
+// rather than "disabled" — a zero/negative connect deadline would let a stuck
+// upstream hang the connect path forever, so we always keep a real ceiling.
+func (c *Config) ResolveInitTimeout(sc *ServerConfig) time.Duration {
+	var server *Duration
+	if sc != nil {
+		server = sc.InitTimeout
+	}
+	resolved := resolveInterval(server, c.InitTimeout, defaultInitTimeout)
+	if resolved <= 0 {
+		return defaultInitTimeout
+	}
+	return resolved
+}
+
+// isValidToonOutput reports whether s is an acceptable toon_output value
+// (spec 084, FR-001). Empty is valid: it means "off" at the top level and
+// "inherit global" per-server. The enum is duplicated from toonenc.Mode by
+// design — internal/config must not import internal/toonenc (finding 4).
+func isValidToonOutput(s string) bool {
+	switch s {
+	case "", "off", "adaptive", "always":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolveToonOutput resolves the effective toon_output mode for a server
+// (spec 084, FR-001): per-server non-empty value > global non-empty value >
+// "off". It deliberately returns a raw string, NOT a toonenc.Mode —
+// internal/config is imported almost everywhere and must not depend on
+// internal/toonenc; callers parse the string via toonenc.ParseMode at the
+// server/bench boundary.
+func (c *Config) ResolveToonOutput(sc *ServerConfig) string {
+	if sc != nil && sc.ToonOutput != "" {
+		return sc.ToonOutput
+	}
+	if c.ToonOutput != "" {
+		return c.ToonOutput
+	}
+	return "off"
+}
+
 // Config represents the main configuration structure
 type Config struct {
 	Listen       string `json:"listen" mapstructure:"listen"`
@@ -62,6 +161,10 @@ type Config struct {
 	EnableTray  bool            `json:"enable_tray,omitempty" mapstructure:"tray"`
 	DebugSearch bool            `json:"debug_search" mapstructure:"debug-search"`
 	Servers     []*ServerConfig `json:"mcpServers" mapstructure:"servers"`
+	// Profiles are optional named, server-scoped views exposed at /mcp/p/<name>
+	// (Spec 057). Absent/empty is fully supported — /mcp is unchanged and configs
+	// without this key serialize byte-identically (SC-004).
+	Profiles []ProfileConfig `json:"profiles,omitempty" mapstructure:"profiles"`
 	// Deprecated: TopK is superseded by ToolsLimit and has no runtime effect. Kept for backward compatibility.
 	TopK               int      `json:"top_k,omitempty" mapstructure:"top-k"`
 	ToolsLimit         int      `json:"tools_limit" mapstructure:"tools-limit"`
@@ -69,8 +172,49 @@ type Config struct {
 	CallToolTimeout    Duration `json:"call_tool_timeout" mapstructure:"call-tool-timeout" swaggertype:"string"`
 	MaxResultSizeChars int      `json:"max_result_size_chars,omitempty" mapstructure:"max-result-size-chars"` // Advertised on every tool as `_meta.anthropic/maxResultSizeChars`; raises Claude Code's inline-response ceiling from 50k to up to 500k chars. Set to 0 to disable.
 
+	// ToonOutput selects the TOON encoding mode for call_tool_* result text
+	// blocks (spec 084): "off" (default — responses byte-identical to
+	// pre-feature behavior), "adaptive" (encode only tabular-uniform payloads
+	// that beat compact JSON by ToonMinSavingsPct), or "always"
+	// (benchmark/debug only — encodes every JSON-parseable block and can
+	// INCREASE token cost). Per-server override: ServerConfig.ToonOutput.
+	// Resolved by ResolveToonOutput; hot-reloadable.
+	ToonOutput string `json:"toon_output,omitempty" mapstructure:"toon-output"`
+	// ToonMinSavingsPct is the minimum byte-savings percentage (validated
+	// 1-90; 0/unset → 15) the complete TOON emission (marker + hint + body)
+	// must achieve over the exact passthrough emission for adaptive mode to
+	// encode a block. Byte savings approximate token savings for the tabular
+	// payload class; the spec-083 profiler reports true token deltas.
+	// Global-only (no per-server override, FR-001).
+	ToonMinSavingsPct int `json:"toon_min_savings_pct,omitempty" mapstructure:"toon-min-savings-pct"`
+
+	// Discovery & health-check cadence (spec 074, #608). Both are *Duration
+	// tri-state pointers: nil = inherit the built-in default; a pointer to 0s =
+	// the loop is disabled; a positive value = that interval. Defaults live only
+	// in the resolvers (ResolveHealthCheckInterval / ResolveToolDiscoveryInterval)
+	// so an unset key behaves exactly as before this feature (SC-005). Validated
+	// in Validate(): health-check ∈ {0} ∪ [5s,1h]; tool-discovery ∈ {0} ∪ [30s,24h].
+	HealthCheckInterval   *Duration `json:"health_check_interval,omitempty" mapstructure:"health-check-interval" swaggertype:"string"`
+	ToolDiscoveryInterval *Duration `json:"tool_discovery_interval,omitempty" mapstructure:"tool-discovery-interval" swaggertype:"string"`
+
+	// InitTimeout is the global default deadline for an upstream's MCP
+	// `initialize` handshake (MCP-3322 / GH #760). *Duration tri-state: nil =
+	// inherit the built-in 30s default; a positive value = that deadline. A
+	// per-server InitTimeout overrides this. Resolved by ResolveInitTimeout;
+	// validated to {0} ∪ [1s, 30m] in Validate(). Servers doing legitimate
+	// first-run warmup (cache/index build) before answering `initialize` can
+	// raise this so they are not killed mid-startup.
+	InitTimeout *Duration `json:"init_timeout,omitempty" mapstructure:"init-timeout" swaggertype:"string"`
+
 	// Environment configuration for secure variable filtering
 	Environment *secureenv.EnvConfig `json:"environment,omitempty" mapstructure:"environment"`
+
+	// ForwardProxyEnv opts in to forwarding the ambient HTTP(S)/ALL/NO/FTP proxy
+	// environment variables to spawned stdio upstream servers (MCP-2769). OFF by
+	// default: proxy URLs commonly embed credentials (http://user:pass@proxy), so
+	// forwarding them to every upstream is a credential-leak risk. When enabled,
+	// values are forwarded with their userinfo (credentials) redacted.
+	ForwardProxyEnv bool `json:"forward_proxy_env,omitempty" mapstructure:"forward-proxy-env"`
 
 	// Logging configuration
 	Logging *LogConfig `json:"logging,omitempty" mapstructure:"logging"`
@@ -85,6 +229,10 @@ type Config struct {
 
 	// Internal field to track if API key was explicitly set in config
 	apiKeyExplicitlySet bool `json:"-"`
+
+	// profileWarnings holds non-fatal Spec 057 profile diagnostics (unknown /
+	// empty servers) captured during Validate(), for the boot path to log.
+	profileWarnings []string `json:"-"`
 
 	// Prompts settings
 	EnablePrompts bool `json:"enable_prompts" mapstructure:"enable-prompts"`
@@ -101,6 +249,30 @@ type Config struct {
 	// Registries configuration for MCP server discovery
 	Registries []RegistryEntry `json:"registries,omitempty" mapstructure:"registries"`
 
+	// RegistriesLocked is an enterprise stub knob (MCP-866): when true, runtime
+	// additions of custom registries (e.g. `registry add-source`, the REST/MCP
+	// add-source surface) are rejected so an administrator can pin the discovery
+	// sources. Built-in defaults are unaffected. Documented but otherwise inert
+	// beyond the add-source rejection.
+	RegistriesLocked bool `json:"registries_locked,omitempty" mapstructure:"registries-locked"`
+
+	// AllowPrivateRegistryFetch opts out of the registry SSRF guard (MCP-1076,
+	// CWE-918). By default (false) registry fetches refuse any host that is — or
+	// resolves to — a non-routable address (loopback, RFC1918/CGNAT private,
+	// link-local incl. the 169.254.169.254 cloud-metadata endpoint), so a
+	// malicious or typo'd registry source cannot turn the daemon into a
+	// request-forgery vector against internal services.
+	//
+	// This opt-out is BLANKET (all-or-nothing): setting it true disables the
+	// guard for EVERY non-routable range at once — loopback, RFC1918/CGNAT
+	// private, link-local AND the 169.254.169.254 cloud-metadata endpoint. There
+	// is no way to allow only loopback; enabling it for a localhost dev registry
+	// also re-opens the cloud-metadata SSRF vector. Set true ONLY when you
+	// intentionally run a trusted registry mirror on an internal/private address,
+	// ideally on a host with no cloud-metadata exposure. The change takes effect
+	// only on daemon (re)start or config reload.
+	AllowPrivateRegistryFetch bool `json:"allow_private_registry_fetch,omitempty" mapstructure:"allow-private-registry-fetch"`
+
 	// Deprecated: Features flags are unused and have no runtime effect. Kept for backward compatibility.
 	Features *FeatureFlags `json:"features,omitempty" mapstructure:"features"`
 
@@ -116,12 +288,22 @@ type Config struct {
 	CodeExecutionMaxToolCalls int  `json:"code_execution_max_tool_calls,omitempty" mapstructure:"code-execution-max-tool-calls"` // Max tool calls per execution (0 = unlimited, default: 0)
 	CodeExecutionPoolSize     int  `json:"code_execution_pool_size,omitempty" mapstructure:"code-execution-pool-size"`           // JavaScript runtime pool size (default: 10)
 
+	// ToolResponseSessionRiskWarning controls whether the prose `warning` field
+	// is included in the `session_risk` object returned by `retrieve_tools`.
+	// The structured fields (level, lethal_trifecta, has_open_world_tools, etc.)
+	// are always included. Default: false (quiet for LLM clients) — see issue #406.
+	// Most tools lack annotations, so the MCP-spec defaults treat them as fully
+	// permissive across all three risk axes, which makes the prose warning fire
+	// on almost every call and wastes tokens.
+	ToolResponseSessionRiskWarning bool `json:"tool_response_session_risk_warning,omitempty" mapstructure:"tool-response-session-risk-warning"`
+
 	// Health status settings
 	OAuthExpiryWarningHours float64 `json:"oauth_expiry_warning_hours,omitempty" mapstructure:"oauth-expiry-warning-hours"` // Hours before token expiry to show degraded status (default: 1.0)
 
 	// Activity logging settings (RFC-003)
 	ActivityRetentionDays      int `json:"activity_retention_days,omitempty" mapstructure:"activity-retention-days"`             // Max age before pruning (default: 90)
 	ActivityMaxRecords         int `json:"activity_max_records,omitempty" mapstructure:"activity-max-records"`                   // Max records before pruning (default: 100000)
+	ActivityMaxSizeMB          int `json:"activity_max_size_mb,omitempty" mapstructure:"activity-max-size-mb"`                   // Max total activity-log size in MB before pruning oldest (default: 256, 0=disabled)
 	ActivityMaxResponseSize    int `json:"activity_max_response_size,omitempty" mapstructure:"activity-max-response-size"`       // Response truncation limit in bytes (default: 65536)
 	ActivityCleanupIntervalMin int `json:"activity_cleanup_interval_min,omitempty" mapstructure:"activity-cleanup-interval-min"` // Background cleanup interval in minutes (default: 60)
 
@@ -131,12 +313,38 @@ type Config struct {
 	// Sensitive data detection settings (Spec 026)
 	SensitiveDataDetection *SensitiveDataDetectionConfig `json:"sensitive_data_detection,omitempty" mapstructure:"sensitive-data-detection"`
 
+	// Output-schema validation settings (Spec 056)
+	OutputValidation *OutputValidationConfig `json:"output_validation,omitempty" mapstructure:"output-validation"`
+
+	// Output sanitisation settings (Spec 054 Track B)
+	OutputSanitisation *OutputSanitisationConfig `json:"output_sanitisation,omitempty" mapstructure:"output-sanitisation"`
+
 	// Telemetry settings (Spec 036)
 	Telemetry *TelemetryConfig `json:"telemetry,omitempty" mapstructure:"telemetry"`
+
+	// Observability settings (Spec 069): usage aggregate cache/persistence cadence.
+	Observability *ObservabilityConfig `json:"observability,omitempty" mapstructure:"observability"`
+
+	// Update-check settings (Spec 079 FR-012): config-file control of the
+	// background upgrade-awareness checker (internal/updatecheck). nil =
+	// enabled on the stable channel (existing default behavior). The existing
+	// environment switches keep working and WIN over these keys (FR-014):
+	// MCPPROXY_DISABLE_AUTO_UPDATE=true force-disables even when
+	// enabled=true, and MCPPROXY_ALLOW_PRERELEASE_UPDATES=true force-selects
+	// the rc channel even when channel=stable.
+	UpdateCheck *UpdateCheckConfig `json:"update_check,omitempty" mapstructure:"update-check"`
 
 	// Routing mode (Spec 031): how MCP tools are exposed to clients
 	// Valid values: "retrieve_tools" (default), "direct", "code_execution"
 	RoutingMode string `json:"routing_mode,omitempty" mapstructure:"routing-mode"`
+
+	// Tool response mode (Spec 085): how retrieve_tools serializes results.
+	// Valid values: "" (= full), "full" (default: today's schema-bearing
+	// entries), "compact" (signature + first-sentence entries). Orthogonal to
+	// routing_mode — routing_mode selects the tool SURFACE, this selects the
+	// SERIALIZATION within the retrieve_tools surface. Serialization-only: it
+	// never affects the query, ranking, or result set. Hot-reloadable.
+	ToolResponseMode string `json:"tool_response_mode,omitempty" mapstructure:"tool-response-mode"`
 
 	// Instructions text returned in the MCP initialize response to guide AI agents.
 	// When empty, a built-in default is used that explains retrieve_tools workflow.
@@ -158,8 +366,28 @@ type Config struct {
 	// Security scanner settings (Spec 039)
 	Security *SecurityConfig `json:"security,omitempty" mapstructure:"security"`
 
-	// Server edition multi-user configuration (only meaningful with -tags server)
-	Teams *TeamsConfig `json:"teams,omitempty" mapstructure:"teams" swaggerignore:"true"`
+	// RevealSecretHeaders, when true, disables the redaction of sensitive
+	// header values (Authorization, X-API-Key, Cookie, …) in responses
+	// from the `upstream_servers` MCP tool, the `/api/v1/servers` REST
+	// API, and the SSE event stream.
+	//
+	// Default false — sensitive header values are surfaced as
+	// `***REDACTED***` so an MCP agent cannot read Bearer tokens / API
+	// keys out of another upstream's config (PR #425).
+	//
+	// The Web UI / macOS tray edit forms work without seeing the real
+	// values: PATCH /api/v1/servers/{id} deep-merges (omitted keys are
+	// preserved, see `headers_remove` / `env_remove` for explicit
+	// deletes), so clients compute a diff and only send the keys that
+	// actually changed. Redacted-but-unchanged values never round-trip
+	// — the backend keeps the real string. Set this to true if a
+	// downstream tool genuinely needs raw values in the response.
+	RevealSecretHeaders bool `json:"reveal_secret_headers,omitempty" mapstructure:"reveal-secret-headers"`
+
+	// Server edition multi-user configuration (only meaningful with -tags server).
+	// Renamed from the legacy "teams" key (MCP-1086); an existing config that
+	// still uses "teams" is normalized onto this field on load (see loader.go).
+	ServerEdition *ServerEditionConfig `json:"server_edition,omitempty" mapstructure:"server_edition" swaggerignore:"true"`
 }
 
 // TLSConfig represents TLS configuration
@@ -193,49 +421,90 @@ type LogConfig struct {
 
 // ServerConfig represents upstream MCP server configuration
 type ServerConfig struct {
-	Name           string            `json:"name,omitempty" mapstructure:"name"`
-	URL            string            `json:"url,omitempty" mapstructure:"url"`
-	Protocol       string            `json:"protocol,omitempty" mapstructure:"protocol"` // stdio, http, sse, streamable-http, auto
-	Command        string            `json:"command,omitempty" mapstructure:"command"`
-	Args           []string          `json:"args,omitempty" mapstructure:"args"`
-	WorkingDir     string            `json:"working_dir,omitempty" mapstructure:"working_dir"` // Working directory for stdio servers
-	Env            map[string]string `json:"env,omitempty" mapstructure:"env"`
-	Headers        map[string]string `json:"headers,omitempty" mapstructure:"headers"` // For HTTP servers
-	OAuth          *OAuthConfig      `json:"oauth" mapstructure:"oauth"`               // OAuth configuration (keep even when empty to signal OAuth requirement)
-	Enabled        bool              `json:"enabled" mapstructure:"enabled"`
-	Quarantined    bool              `json:"quarantined" mapstructure:"quarantined"`                   // Security quarantine status
-	SkipQuarantine bool              `json:"skip_quarantine,omitempty" mapstructure:"skip-quarantine"` // Skip tool-level quarantine for this server
-	Shared         bool              `json:"shared,omitempty" mapstructure:"shared"`                   // Server edition: shared with all users
-	Created        time.Time         `json:"created" mapstructure:"created"`
-	Updated        time.Time         `json:"updated,omitempty" mapstructure:"updated"`
-	Isolation      *IsolationConfig  `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
-	ReconnectOnUse bool              `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
+	Name        string            `json:"name,omitempty" mapstructure:"name"`
+	URL         string            `json:"url,omitempty" mapstructure:"url"`
+	Protocol    string            `json:"protocol,omitempty" mapstructure:"protocol"` // stdio, http, sse, streamable-http, auto
+	Command     string            `json:"command,omitempty" mapstructure:"command"`
+	Args        []string          `json:"args,omitempty" mapstructure:"args"`
+	WorkingDir  string            `json:"working_dir,omitempty" mapstructure:"working_dir"` // Working directory for stdio servers
+	Env         map[string]string `json:"env,omitempty" mapstructure:"env"`
+	Headers     map[string]string `json:"headers,omitempty" mapstructure:"headers"` // For HTTP servers
+	OAuth       *OAuthConfig      `json:"oauth" mapstructure:"oauth"`               // OAuth configuration (keep even when empty to signal OAuth requirement)
+	Enabled     bool              `json:"enabled" mapstructure:"enabled"`
+	Quarantined bool              `json:"quarantined" mapstructure:"quarantined"` // Security quarantine status
+	// SkipQuarantine is DEPRECATED (MCP-2930): use AutoApproveToolChanges instead.
+	// Kept for back-compat parsing; on config load a legacy skip_quarantine:true is
+	// migrated to auto_approve_tool_changes:true only when the new field is unset
+	// (see normalizeServerQuarantineFlags).
+	SkipQuarantine bool `json:"skip_quarantine,omitempty" mapstructure:"skip-quarantine"` // Deprecated: use auto_approve_tool_changes
+	// AutoApproveToolChanges is the per-server intent to auto-approve tool
+	// changes/additions (disabling per-server rug-pull protection). Supersedes
+	// skip_quarantine. MCP-2930 only ACCEPTS, persists, and migrates this flag — it
+	// is NOT yet consulted at runtime; auto-approval is still governed by
+	// SkipQuarantine until the trust-baseline behavior change (MCP-2931) migrates the
+	// runtime consumers onto it.
+	// Tri-state pointer (mirrors QuarantineEnabled): nil = unset (inherit/migrate
+	// from legacy skip_quarantine), explicit true/false = honored as-is so an
+	// explicit auto_approve_tool_changes:false overrides a legacy skip_quarantine:true.
+	// Read via IsAutoApproveToolChanges().
+	AutoApproveToolChanges *bool            `json:"auto_approve_tool_changes,omitempty" mapstructure:"auto-approve-tool-changes"` // Per-server intent to auto-approve tool changes/additions. Accepted/persisted by MCP-2930; runtime enforcement lands in MCP-2931 (until then SkipQuarantine governs behavior)
+	Shared                 bool             `json:"shared,omitempty" mapstructure:"shared"`                                       // Server edition: shared with all users
+	Created                time.Time        `json:"created" mapstructure:"created"`
+	Updated                time.Time        `json:"updated,omitempty" mapstructure:"updated"`
+	Isolation              *IsolationConfig `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
+	ReconnectOnUse         bool             `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
 
-	// AnnotationDefaults provides fallback tool annotations for upstream servers
-	// that don't supply their own. Individual hint fields are applied only when
-	// the upstream tool has nil for that specific hint (per-field merge).
-	AnnotationDefaults *ToolAnnotations `json:"annotation_defaults,omitempty" mapstructure:"annotation-defaults"`
+	// LauncherWaitTimeout caps how long mcpproxy will wait for a locally-launched
+	// HTTP/SSE upstream's URL to become reachable after Spawn(). Only consulted
+	// when the server is configured with both Command and an HTTP/SSE URL — i.e.,
+	// mcpproxy starts the process AND connects via network. Stdio servers ignore
+	// this field. Zero or unset → 30s default.
+	LauncherWaitTimeout Duration `json:"launcher_wait_timeout,omitempty" mapstructure:"launcher_wait_timeout" swaggertype:"string"`
 
-	// SearchAliases adds keywords that boost every tool on this server when
-	// matched by a retrieve_tools query. Use for cross-language synonyms,
-	// short forms, or common misspellings (e.g. ["битрикс", "b24", "crm"]).
-	SearchAliases []string `json:"search_aliases,omitempty" mapstructure:"search-aliases"`
+	// Per-server discovery & health-check overrides (spec 074). Same *Duration
+	// tri-state as the global keys: nil = inherit the global value (or default),
+	// pointer to 0s = disabled for this server, positive = that interval.
+	// HealthCheckInterval is fully wired into the per-server health loop;
+	// ToolDiscoveryInterval is accepted/validated and round-trips for
+	// forward-compat, but the periodic index sweep is governed by the global
+	// cadence in this iteration (see spec 074 plan §C).
+	HealthCheckInterval   *Duration `json:"health_check_interval,omitempty" mapstructure:"health_check_interval" swaggertype:"string"`
+	ToolDiscoveryInterval *Duration `json:"tool_discovery_interval,omitempty" mapstructure:"tool_discovery_interval" swaggertype:"string"`
 
-	// DomainTags classifies this server into high-level domains used for
-	// catalog grouping in retrieve_tools responses (e.g. ["crm", "sales"]).
-	// First entry is the server's default tool domain when no per-tool
-	// override is known.
-	DomainTags []string `json:"domain_tags,omitempty" mapstructure:"domain-tags"`
+	// InitTimeout overrides the global init_timeout for this server's MCP
+	// `initialize` handshake deadline (MCP-3322 / GH #760). *Duration tri-state:
+	// nil = inherit the global value (or 30s default), positive = that deadline.
+	// Resolved by Config.ResolveInitTimeout; validated to {0} ∪ [1s, 30m]. Raise
+	// this for upstreams that do legitimate first-run warmup (e.g. caching many
+	// channels/users) before responding to `initialize`.
+	InitTimeout *Duration `json:"init_timeout,omitempty" mapstructure:"init_timeout" swaggertype:"string"`
 
-	// ToolAliases maps a tool's base name (without the server prefix) to
-	// extra keywords that boost only that tool. Takes precedence over
-	// SearchAliases and LLM-derived keywords at the same rank.
-	ToolAliases map[string][]string `json:"tool_aliases,omitempty" mapstructure:"tool-aliases"`
+	// ToonOutput overrides the global toon_output mode for this server's
+	// tools (spec 084, FR-001). Plain string, not a pointer: ""/absent =
+	// inherit the global value; "off"|"adaptive"|"always" = override ("off"
+	// is the explicit force-off). Resolved by Config.ResolveToonOutput.
+	ToonOutput string `json:"toon_output,omitempty" mapstructure:"toon_output"`
 
-	// DisableEnrichment skips the LLM enrichment step for this server even
-	// when enrichment is globally enabled. Useful for servers whose tool
-	// descriptions are already high quality or for air-gapped environments.
-	DisableEnrichment bool `json:"disable_enrichment,omitempty" mapstructure:"disable-enrichment"`
+	EnabledTools  []string `json:"enabled_tools,omitempty" mapstructure:"enabled_tools"`   // Allowlist: only these tools are exposed; mutually exclusive with disabled_tools
+	DisabledTools []string `json:"disabled_tools,omitempty" mapstructure:"disabled_tools"` // Denylist: these tools are hidden; mutually exclusive with enabled_tools
+
+	// SourceRegistryID records which registry this server was added from (empty
+	// for manually-configured servers). MCP-866: surfaced in the approval /
+	// quarantine view so a reviewer can see a server's origin.
+	SourceRegistryID string `json:"source_registry_id,omitempty" mapstructure:"source_registry_id"`
+	// SourceRegistryProvenance records the source registry's provenance at add
+	// time (RegistryProvenanceOfficial / RegistryProvenanceCustom). It is purely
+	// informational (MCP-1072) — surfaced so a reviewer can see a server's origin
+	// — and no longer gates quarantine or skip_quarantine.
+	SourceRegistryProvenance string `json:"source_registry_provenance,omitempty" mapstructure:"source_registry_provenance"`
+
+	// AuthBroker holds per-upstream token-brokering configuration (spec 074,
+	// server edition only). When set, the gateway exchanges the caller's IdP
+	// subject token for an upstream-scoped credential and injects it into the
+	// outbound request. The concrete type is build-tagged: a full struct in the
+	// server edition, an empty stub in the personal edition (which ignores it),
+	// so personal-edition behavior is unaffected. swaggerignore mirrors ServerEdition.
+	AuthBroker *AuthBrokerConfig `json:"auth_broker,omitempty" mapstructure:"auth_broker" swaggerignore:"true"`
 }
 
 // OAuthConfig represents OAuth configuration for a server
@@ -248,9 +517,43 @@ type OAuthConfig struct {
 	ExtraParams  map[string]string `json:"extra_params,omitempty" mapstructure:"extra_params"` // Additional OAuth parameters (e.g., RFC 8707 resource)
 }
 
+// IsolationMode selects how an stdio MCP server's process is isolated (MCP-34.2).
+//
+//   - "docker"  — run the server inside a Docker container (the original behavior).
+//   - "sandbox" — run under a native OS sandbox (Landlock LSM + rlimits on Linux;
+//     see MCP-34). No daemon required.
+//   - "none"    — no isolation; the server process runs directly on the host.
+//
+// The empty string means "unset": back-compat code falls back to the legacy
+// boolean Enabled flag (enabled:true ⇒ docker, enabled:false ⇒ none).
+type IsolationMode string
+
+const (
+	// IsolationModeDocker runs the server inside a Docker container.
+	IsolationModeDocker IsolationMode = "docker"
+	// IsolationModeSandbox runs the server under a native OS sandbox (Landlock/rlimits).
+	IsolationModeSandbox IsolationMode = "sandbox"
+	// IsolationModeNone disables isolation; the process runs directly.
+	IsolationModeNone IsolationMode = "none"
+)
+
+// IsValid reports whether the mode is a recognized value. The empty string
+// ("unset") is treated as valid because the global config falls back to the
+// legacy Enabled bool; callers that require an explicit mode should check for
+// emptiness separately.
+func (m IsolationMode) IsValid() bool {
+	switch m {
+	case IsolationModeDocker, IsolationModeSandbox, IsolationModeNone, "":
+		return true
+	default:
+		return false
+	}
+}
+
 // DockerIsolationConfig represents global Docker isolation settings
 type DockerIsolationConfig struct {
-	Enabled           bool              `json:"enabled" mapstructure:"enabled"`                                // Global enable/disable for Docker isolation
+	Enabled           bool              `json:"enabled" mapstructure:"enabled"`                                // Global enable/disable for Docker isolation (legacy; superseded by Mode)
+	Mode              IsolationMode     `json:"mode,omitempty" mapstructure:"mode"`                            // Isolation mode: "docker" | "sandbox" | "none". Empty falls back to Enabled (MCP-34.2)
 	EnableCacheVolume bool              `json:"enable_cache_volume" mapstructure:"enable_cache_volume"`        // Mount shared cache volumes for faster restarts (default: true)
 	DefaultImages     map[string]string `json:"default_images" mapstructure:"default_images"`                  // Map of runtime type to Docker image
 	Registry          string            `json:"registry,omitempty" mapstructure:"registry"`                    // Custom registry (defaults to docker.io)
@@ -266,14 +569,34 @@ type DockerIsolationConfig struct {
 
 // IsolationConfig represents per-server isolation settings
 type IsolationConfig struct {
-	Enabled     *bool    `json:"enabled,omitempty" mapstructure:"enabled"`             // Enable Docker isolation for this server (nil = inherit global)
-	Image       string   `json:"image,omitempty" mapstructure:"image"`                 // Custom Docker image (overrides default)
-	NetworkMode string   `json:"network_mode,omitempty" mapstructure:"network_mode"`   // Custom network mode for this server
-	ExtraArgs   []string `json:"extra_args,omitempty" mapstructure:"extra_args"`       // Additional docker run arguments for this server
-	WorkingDir  string   `json:"working_dir,omitempty" mapstructure:"working_dir"`     // Custom working directory in container
-	LogDriver   string   `json:"log_driver,omitempty" mapstructure:"log_driver"`       // Docker log driver override for this server
-	LogMaxSize  string   `json:"log_max_size,omitempty" mapstructure:"log_max_size"`   // Maximum size of log files override
-	LogMaxFiles string   `json:"log_max_files,omitempty" mapstructure:"log_max_files"` // Maximum number of log files override
+	Enabled     *bool          `json:"enabled,omitempty" mapstructure:"enabled"`             // Enable Docker isolation for this server (nil = inherit global; legacy, superseded by Mode)
+	Mode        *IsolationMode `json:"mode,omitempty" mapstructure:"mode"`                   // Isolation mode: "docker" | "sandbox" | "none" (MCP-34.2). Unset per-server inherits the global mode; unset globally falls back to the legacy "enabled" flag (true ⇒ docker, false ⇒ none)
+	Image       string         `json:"image,omitempty" mapstructure:"image"`                 // Custom Docker image (overrides default)
+	NetworkMode string         `json:"network_mode,omitempty" mapstructure:"network_mode"`   // Custom network mode for this server
+	ExtraArgs   []string       `json:"extra_args,omitempty" mapstructure:"extra_args"`       // Additional docker run arguments for this server
+	WorkingDir  string         `json:"working_dir,omitempty" mapstructure:"working_dir"`     // Custom working directory in container
+	LogDriver   string         `json:"log_driver,omitempty" mapstructure:"log_driver"`       // Docker log driver override for this server
+	LogMaxSize  string         `json:"log_max_size,omitempty" mapstructure:"log_max_size"`   // Maximum size of log files override
+	LogMaxFiles string         `json:"log_max_files,omitempty" mapstructure:"log_max_files"` // Maximum number of log files override
+}
+
+// ResolvedMode returns the effective global isolation mode, applying back-compat
+// mapping from the legacy Enabled bool (MCP-34.2):
+//
+//   - an explicit Mode always wins;
+//   - otherwise enabled:true ⇒ docker, enabled:false ⇒ none;
+//   - a nil config resolves to none.
+func (dic *DockerIsolationConfig) ResolvedMode() IsolationMode {
+	if dic == nil {
+		return IsolationModeNone
+	}
+	if dic.Mode != "" {
+		return dic.Mode
+	}
+	if dic.Enabled {
+		return IsolationModeDocker
+	}
+	return IsolationModeNone
 }
 
 // IsEnabled returns true if isolation is explicitly enabled, false otherwise.
@@ -461,6 +784,231 @@ func (c *SensitiveDataDetectionConfig) GetEntropyThreshold() float64 {
 	return c.EntropyThreshold
 }
 
+// OutputValidationConfig controls output-schema validation behaviour (Spec 056).
+type OutputValidationConfig struct {
+	Mode                     string `json:"mode,omitempty" mapstructure:"mode"`                                             // "off" | "warn" | "strict"; default "warn"
+	MaxBytes                 int    `json:"max_bytes,omitempty" mapstructure:"max-bytes"`                                   // structured payload byte cap; default 5<<20
+	MaxDepth                 int    `json:"max_depth,omitempty" mapstructure:"max-depth"`                                   // nesting depth cap; default 64
+	MissingStructuredContent string `json:"missing_structured_content,omitempty" mapstructure:"missing-structured-content"` // "allow" | "block"; default "allow"
+}
+
+// DefaultOutputValidationConfig returns the default configuration for output-schema validation.
+func DefaultOutputValidationConfig() *OutputValidationConfig {
+	return &OutputValidationConfig{
+		Mode:                     "warn",
+		MaxBytes:                 5 << 20,
+		MaxDepth:                 64,
+		MissingStructuredContent: "allow",
+	}
+}
+
+// IsEnabled returns true unless Mode is "off". A nil receiver defaults to true (warn).
+func (c *OutputValidationConfig) IsEnabled() bool {
+	if c == nil {
+		return true
+	}
+	return c.Mode != "off"
+}
+
+// IsStrict returns true when Mode is "strict". A nil receiver returns false.
+func (c *OutputValidationConfig) IsStrict() bool {
+	if c == nil {
+		return false
+	}
+	return c.Mode == "strict"
+}
+
+// IsWarn returns true when validation is enabled but not strict (i.e. warn mode).
+// A nil receiver returns true (default is warn).
+func (c *OutputValidationConfig) IsWarn() bool {
+	return c.IsEnabled() && !c.IsStrict()
+}
+
+// EffectiveMaxBytes returns MaxBytes, falling back to 5<<20 when zero or nil.
+func (c *OutputValidationConfig) EffectiveMaxBytes() int {
+	if c == nil || c.MaxBytes <= 0 {
+		return 5 << 20
+	}
+	return c.MaxBytes
+}
+
+// EffectiveMaxDepth returns MaxDepth, falling back to 64 when zero or nil.
+func (c *OutputValidationConfig) EffectiveMaxDepth() int {
+	if c == nil || c.MaxDepth <= 0 {
+		return 64
+	}
+	return c.MaxDepth
+}
+
+// BlockOnMissingStructured returns true when MissingStructuredContent is "block".
+// A nil receiver returns false (default is "allow").
+func (c *OutputValidationConfig) BlockOnMissingStructured() bool {
+	if c == nil {
+		return false
+	}
+	return c.MissingStructuredContent == "block"
+}
+
+// OutputSanitisationConfig controls output sanitisation behaviour for proxied
+// tool responses (Spec 054 Track B).
+type OutputSanitisationConfig struct {
+	SpotlightUntrusted bool     `json:"spotlight_untrusted,omitempty" mapstructure:"spotlight-untrusted"` // wrap untrusted output in spotlight markers; default true
+	ResponseAction     string   `json:"response_action,omitempty" mapstructure:"response-action"`         // "spotlight" | "redact" | "block"; default "spotlight"
+	StripControlChars  bool     `json:"strip_control_chars,omitempty" mapstructure:"strip-control-chars"` // strip control-character classes; default false
+	StripClasses       []string `json:"strip_classes,omitempty" mapstructure:"strip-classes"`             // classes to strip: ansi/c0c1/bidi/zero_width
+	MaxRedactions      int      `json:"max_redactions,omitempty" mapstructure:"max-redactions"`           // cap on redactions per response; default 100
+}
+
+// DefaultOutputSanitisationConfig returns the default configuration for output sanitisation.
+func DefaultOutputSanitisationConfig() *OutputSanitisationConfig {
+	return &OutputSanitisationConfig{
+		SpotlightUntrusted: false,
+		ResponseAction:     "spotlight",
+		StripControlChars:  false,
+		StripClasses:       []string{"ansi", "c0c1", "bidi", "zero_width"},
+		MaxRedactions:      100,
+	}
+}
+
+// IsEnabled returns true unless the whole config is explicitly disabled.
+// A nil receiver defaults to true.
+func (c *OutputSanitisationConfig) IsEnabled() bool {
+	if c == nil {
+		return true
+	}
+	return c.ResponseAction != "off"
+}
+
+// IsSpotlightEnabled returns SpotlightUntrusted. Track B is fully opt-in: a nil
+// receiver (no output_sanitisation block configured) means spotlighting is off.
+func (c *OutputSanitisationConfig) IsSpotlightEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.SpotlightUntrusted
+}
+
+// IsRedact returns true when ResponseAction is "redact". A nil receiver returns false.
+func (c *OutputSanitisationConfig) IsRedact() bool {
+	if c == nil {
+		return false
+	}
+	return c.ResponseAction == "redact"
+}
+
+// IsBlock returns true when ResponseAction is "block". A nil receiver returns false.
+func (c *OutputSanitisationConfig) IsBlock() bool {
+	if c == nil {
+		return false
+	}
+	return c.ResponseAction == "block"
+}
+
+// IsStripEnabled returns StripControlChars. A nil receiver returns false.
+func (c *OutputSanitisationConfig) IsStripEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.StripControlChars
+}
+
+// EnabledStripClasses returns the set of strip classes that are active. When
+// stripping is disabled the returned map is empty. Only the valid keys
+// (ansi/c0c1/zero_width/bidi) are included, lowercased.
+func (c *OutputSanitisationConfig) EnabledStripClasses() map[string]bool {
+	set := make(map[string]bool)
+	if !c.IsStripEnabled() {
+		return set
+	}
+	valid := map[string]bool{"ansi": true, "c0c1": true, "zero_width": true, "bidi": true}
+	for _, class := range c.StripClasses {
+		key := strings.ToLower(class)
+		if valid[key] {
+			set[key] = true
+		}
+	}
+	return set
+}
+
+// WouldMutate reports whether sanitisation would alter the response for the
+// given trust level. Redact and block always mutate; spotlight/strip only
+// mutate untrusted output.
+func (c *OutputSanitisationConfig) WouldMutate(trust string) bool {
+	if c.IsRedact() || c.IsBlock() {
+		return true
+	}
+	return trust == "untrusted" && (c.IsStripEnabled() || c.IsSpotlightEnabled())
+}
+
+// Registry provenance tags (MCP-866). Trust is derived, not user-asserted: a
+// registry is "trusted" only when it is one of the shipped built-in defaults.
+// Anything a user adds at runtime (e.g. via `registry add-source`) is "custom".
+// Provenance is purely informational now (MCP-1072): it no longer forces
+// quarantine — servers added from any registry follow the global quarantine
+// default. It still drives the derived "trusted" flag a few surfaces show.
+const (
+	// RegistryProvenanceOfficial marks a built-in, shipped-by-default registry.
+	RegistryProvenanceOfficial = "official"
+	// RegistryProvenanceCustom marks a user-added registry.
+	RegistryProvenanceCustom = "custom"
+)
+
+// NormalizeRegistryProvenance maps legacy provenance strings persisted by
+// earlier builds (MCP-866's "official/trusted" / "custom/unverified") onto the
+// current two-value vocabulary ("official" / "custom"). Already-current and
+// empty values pass through unchanged, so the mapping is idempotent. This lets
+// an existing config.db converge without breaking on read (MCP-1072).
+func NormalizeRegistryProvenance(p string) string {
+	switch p {
+	case "official/trusted", RegistryProvenanceOfficial:
+		return RegistryProvenanceOfficial
+	case "custom/unverified", RegistryProvenanceCustom:
+		return RegistryProvenanceCustom
+	default:
+		return p
+	}
+}
+
+// normalizeRegistryProvenanceValues rewrites legacy provenance strings on a
+// loaded config in place — both registry entries and the per-server source
+// provenance tag — so existing installs converge to the two-value vocabulary
+// (MCP-1072). Idempotent and nil-safe.
+func normalizeRegistryProvenanceValues(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for i := range cfg.Registries {
+		cfg.Registries[i].Provenance = NormalizeRegistryProvenance(cfg.Registries[i].Provenance)
+	}
+	for _, s := range cfg.Servers {
+		if s != nil {
+			s.SourceRegistryProvenance = NormalizeRegistryProvenance(s.SourceRegistryProvenance)
+		}
+	}
+}
+
+// normalizeServerQuarantineFlags migrates the deprecated per-server
+// skip_quarantine flag onto its successor auto_approve_tool_changes (MCP-2930).
+// A legacy skip_quarantine:true is mapped to auto_approve_tool_changes:true only
+// when the new field is unset (nil), so an explicit new-field value — including an
+// explicit false — always wins over the legacy flag. The legacy field is left
+// untouched for back-compat. Idempotent and nil-safe; runs on every load/hot-reload
+// via initializeRegistries.
+func normalizeServerQuarantineFlags(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for _, s := range cfg.Servers {
+		if s == nil {
+			continue
+		}
+		if s.SkipQuarantine && s.AutoApproveToolChanges == nil {
+			migrated := true
+			s.AutoApproveToolChanges = &migrated
+		}
+	}
+}
+
 // RegistryEntry represents a registry in the configuration
 type RegistryEntry struct {
 	ID          string      `json:"id"`
@@ -471,6 +1019,23 @@ type RegistryEntry struct {
 	Tags        []string    `json:"tags,omitempty"`
 	Protocol    string      `json:"protocol,omitempty"`
 	Count       interface{} `json:"count,omitempty" swaggertype:"primitive,string"` // number or string
+	// RequiresKey marks a registry that needs an API key to be queried. When
+	// true and no key is configured, the registry is skipped/marked unavailable
+	// rather than failing the whole search (FR-008).
+	RequiresKey bool `json:"requires_key,omitempty"`
+	// Provenance is the trust tag for this registry (MCP-866):
+	// RegistryProvenanceOfficial for built-in defaults, RegistryProvenanceCustom
+	// for user-added registries. It is authoritatively (re)computed by the
+	// registries merge from whether the ID is a shipped default — a user cannot
+	// claim "official" by writing it into their config.
+	Provenance string `json:"provenance,omitempty" mapstructure:"provenance"`
+}
+
+// IsTrusted reports whether the registry is an official, shipped-by-default
+// source. Trust is never granted by omission — an absent provenance tag is
+// untrusted.
+func (r *RegistryEntry) IsTrusted() bool {
+	return r != nil && r.Provenance == RegistryProvenanceOfficial
 }
 
 // CursorMCPConfig represents the structure for Cursor IDE MCP configuration
@@ -517,14 +1082,15 @@ func ConvertFromCursorFormat(cursorConfig *CursorMCPConfig) []*ServerConfig {
 
 // ToolMetadata represents tool information stored in the index
 type ToolMetadata struct {
-	Name        string           `json:"name"`
-	ServerName  string           `json:"server_name"`
-	Description string           `json:"description"`
-	ParamsJSON  string           `json:"params_json"`
-	Hash        string           `json:"hash"`
-	Created     time.Time        `json:"created"`
-	Updated     time.Time        `json:"updated"`
-	Annotations *ToolAnnotations `json:"annotations,omitempty"`
+	Name             string           `json:"name"`
+	ServerName       string           `json:"server_name"`
+	Description      string           `json:"description"`
+	ParamsJSON       string           `json:"params_json"`
+	OutputSchemaJSON string           `json:"output_schema_json,omitempty"` // declared output schema, raw JSON bytes (Spec 056)
+	Hash             string           `json:"hash"`
+	Created          time.Time        `json:"created"`
+	Updated          time.Time        `json:"updated"`
+	Annotations      *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // ToolAnnotations represents MCP tool behavior hints
@@ -557,6 +1123,127 @@ func (c *IntentDeclarationConfig) IsStrictServerValidation() bool {
 		return true // Default to strict for security
 	}
 	return c.StrictServerValidation
+}
+
+// Update-check release channels (Spec 079 FR-013). "stable" follows GitHub
+// releases/latest and never offers prereleases; "rc" additionally offers
+// prerelease tags (v*-rc.*, v*-next.*) published to the GitHub pre-release
+// channel — the config-file equivalent of MCPPROXY_ALLOW_PRERELEASE_UPDATES.
+const (
+	UpdateChannelStable = "stable"
+	UpdateChannelRC     = "rc"
+)
+
+// UpdateCheckConfig is the `update_check` config block (Spec 079 FR-012).
+// It gates the background update poll and the manual re-check
+// (/api/v1/info?refresh=true) and selects the release channel. Hot-reloadable:
+// the runtime re-applies it to the running checker on config reload.
+type UpdateCheckConfig struct {
+	// Enabled gates all update checking. Tri-state: nil/absent = enabled
+	// (default true, matching pre-079 behavior). When false, no network
+	// check is performed and no upgrade nudge appears on any surface
+	// (FR-015) — /api/v1/info omits the update object entirely.
+	Enabled *bool `json:"enabled,omitempty" mapstructure:"enabled"`
+
+	// Channel selects which releases are offered as updates: "stable"
+	// (default; prereleases never offered) or "rc" (prereleases included).
+	// Empty resolves to stable. Validated in ValidateDetailed.
+	Channel string `json:"channel,omitempty" mapstructure:"channel"`
+}
+
+// IsEnabled reports whether update checking is enabled by config. Nil-safe:
+// a missing block or missing key defaults to enabled (Spec 079 FR-012).
+func (u *UpdateCheckConfig) IsEnabled() bool {
+	if u == nil || u.Enabled == nil {
+		return true
+	}
+	return *u.Enabled
+}
+
+// ResolvedChannel returns the effective release channel, defaulting empty to
+// stable. Nil-safe.
+func (u *UpdateCheckConfig) ResolvedChannel() string {
+	if u == nil || u.Channel == "" {
+		return UpdateChannelStable
+	}
+	return u.Channel
+}
+
+// IncludePrereleases reports whether the configured channel offers
+// prereleases (channel=rc). Nil-safe.
+func (u *UpdateCheckConfig) IncludePrereleases() bool {
+	return u.ResolvedChannel() == UpdateChannelRC
+}
+
+// ObservabilityConfig controls the Spec 069 usage aggregate cadence plus the
+// MCP-32 metrics/tracing exporters.
+type ObservabilityConfig struct {
+	// UsageCacheTTL bounds the freshness of the usage endpoint's read cache for
+	// wide windows (FR-005). Default 5s.
+	UsageCacheTTL Duration `json:"usage_cache_ttl,omitempty" mapstructure:"usage-cache-ttl" swaggertype:"string"`
+	// UsagePersistInterval is how often the actor-owned usage aggregate snapshot
+	// is flushed to storage. Default 30s.
+	UsagePersistInterval Duration `json:"usage_persist_interval,omitempty" mapstructure:"usage-persist-interval" swaggertype:"string"`
+
+	// Metrics gates the Prometheus /metrics scrape endpoint (MCP-32). Disabled
+	// by default — operators opt in for k8s/enterprise deployments.
+	Metrics *MetricsExporterConfig `json:"metrics,omitempty" mapstructure:"metrics"`
+	// Tracing gates the OpenTelemetry OTLP trace exporter (MCP-32). Disabled by
+	// default.
+	Tracing *TracingExporterConfig `json:"tracing,omitempty" mapstructure:"tracing"`
+}
+
+// MetricsExporterConfig controls the Prometheus /metrics endpoint (MCP-32).
+type MetricsExporterConfig struct {
+	// Enabled exposes /metrics on the existing HTTP listener when true.
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+}
+
+// TracingExporterConfig controls the OpenTelemetry OTLP trace exporter (MCP-32).
+type TracingExporterConfig struct {
+	// Enabled turns on OTLP trace export for tool calls and upstream hops.
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+	// Protocol selects the OTLP transport: "http" or "grpc".
+	Protocol string `json:"protocol,omitempty" mapstructure:"protocol"`
+	// Endpoint is the collector address as host:port (no scheme), e.g.
+	// "localhost:4318" for http or "localhost:4317" for grpc.
+	Endpoint string `json:"endpoint,omitempty" mapstructure:"endpoint"`
+	// SampleRate is the head-based trace sampling ratio in [0,1]. Default 0.1.
+	SampleRate float64 `json:"sample_rate,omitempty" mapstructure:"sample-rate"`
+}
+
+// Default OTLP transport values shared by defaults and validation repair.
+const (
+	defaultTracingProtocol   = "http"
+	defaultTracingHTTPEnd    = "localhost:4318"
+	defaultTracingGRPCEnd    = "localhost:4317"
+	defaultTracingSampleRate = 0.1
+)
+
+// DefaultMetricsExporterConfig returns the default (disabled) metrics exporter.
+func DefaultMetricsExporterConfig() *MetricsExporterConfig {
+	return &MetricsExporterConfig{Enabled: false}
+}
+
+// DefaultTracingExporterConfig returns the default (disabled) tracing exporter
+// with sane transport defaults pre-filled.
+func DefaultTracingExporterConfig() *TracingExporterConfig {
+	return &TracingExporterConfig{
+		Enabled:    false,
+		Protocol:   defaultTracingProtocol,
+		Endpoint:   defaultTracingHTTPEnd,
+		SampleRate: defaultTracingSampleRate,
+	}
+}
+
+// DefaultObservabilityConfig returns the default observability configuration.
+func DefaultObservabilityConfig() *ObservabilityConfig {
+	return &ObservabilityConfig{
+		UsageCacheTTL:        Duration(5 * time.Second),
+		UsagePersistInterval: Duration(30 * time.Second),
+		Metrics:              DefaultMetricsExporterConfig(),
+		Tracing:              DefaultTracingExporterConfig(),
+	}
 }
 
 // ToolRegistration represents a tool registration
@@ -639,6 +1326,90 @@ func DefaultDockerIsolationConfig() *DockerIsolationConfig {
 	}
 }
 
+// DefaultRegistries returns the built-in MCP server discovery registries. It is
+// the single source of truth for the shipped defaults: DefaultConfig() seeds
+// them into a fresh config, and the registries package merges them with any
+// user-defined entries so a custom registry never drops the defaults (FR-006).
+func DefaultRegistries() []RegistryEntry {
+	return []RegistryEntry{
+		{
+			ID:          "official",
+			Name:        "Official MCP Registry",
+			Description: "The official Model Context Protocol server registry (zero-config, no key required)",
+			URL:         "https://registry.modelcontextprotocol.io/",
+			ServersURL:  "https://registry.modelcontextprotocol.io/v0.1/servers",
+			Tags:        []string{"verified", "official"},
+			Protocol:    "modelcontextprotocol/registry",
+			Provenance:  RegistryProvenanceOfficial,
+		},
+		{
+			ID:          "reference",
+			Name:        "Reference Servers",
+			Description: "Curated @modelcontextprotocol reference servers, shipped built-in for offline discovery",
+			URL:         "https://github.com/modelcontextprotocol/servers",
+			ServersURL:  "builtin://reference",
+			Tags:        []string{"verified", "official", "reference"},
+			Protocol:    "builtin/reference",
+			Provenance:  RegistryProvenanceOfficial,
+		},
+		{
+			ID:          "docker-mcp-catalog",
+			Name:        "Docker MCP Catalog",
+			Description: "A collection of secure, high-quality MCP servers as docker images",
+			URL:         "https://hub.docker.com/catalogs/mcp",
+			ServersURL:  "https://hub.docker.com/v2/repositories/mcp/",
+			Tags:        []string{"verified"},
+			Protocol:    "custom/docker",
+			Provenance:  RegistryProvenanceOfficial,
+		},
+	}
+}
+
+// deprecatedDefaultRegistryIDs are registry ids that were SHIPPED as built-in
+// defaults in earlier versions and have since been removed from
+// DefaultRegistries(). Because the registries merge (registry_data.go) keys by id
+// and never prunes, a former default persisted in a user's config would otherwise
+// resurface forever. They are pruned from the persisted config on load
+// (PruneDeprecatedRegistries) and skipped by the merge so the running app
+// converges to the trimmed default set (MCP-1049). Genuinely user-added custom
+// registries are never in this set, so they are always preserved.
+var deprecatedDefaultRegistryIDs = map[string]bool{
+	"pulse":              true,
+	"smithery":           true,
+	"fleur":              true,
+	"azure-mcp-demo":     true,
+	"remote-mcp-servers": true,
+}
+
+// IsDeprecatedDefaultRegistry reports whether id is a known former-default
+// registry that was removed from the shipped set and must not be resurrected.
+func IsDeprecatedDefaultRegistry(id string) bool {
+	return deprecatedDefaultRegistryIDs[id]
+}
+
+// PruneDeprecatedRegistries removes deprecated former-default registries
+// (IsDeprecatedDefaultRegistry) from cfg.Registries in place and returns the
+// number removed. It is idempotent and matches by the known former-default id set
+// ONLY, so a genuinely user-added custom registry is never dropped.
+func PruneDeprecatedRegistries(cfg *Config) int {
+	if cfg == nil || len(cfg.Registries) == 0 {
+		return 0
+	}
+	kept := make([]RegistryEntry, 0, len(cfg.Registries))
+	removed := 0
+	for _, r := range cfg.Registries {
+		if IsDeprecatedDefaultRegistry(r.ID) {
+			removed++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if removed > 0 {
+		cfg.Registries = kept
+	}
+	return removed
+}
+
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
@@ -651,6 +1422,11 @@ func DefaultConfig() *Config {
 		ToolResponseLimit:  20000,                     // Default 20000 characters
 		CallToolTimeout:    Duration(2 * time.Minute), // Default 2 minutes for tool calls
 		MaxResultSizeChars: 500000,                    // Claude Code's inline-response hard max
+
+		// TOON output (spec 084): off by default — responses byte-identical
+		// to pre-feature behavior (FR-002).
+		ToonOutput:        "off",
+		ToonMinSavingsPct: 15,
 
 		// Default secure environment configuration
 		Environment: secureenv.DefaultEnvConfig(),
@@ -687,54 +1463,16 @@ func DefaultConfig() *Config {
 		// Default sensitive data detection settings (enabled by default for security)
 		SensitiveDataDetection: DefaultSensitiveDataDetectionConfig(),
 
-		// Default registries for MCP server discovery
-		Registries: []RegistryEntry{
-			{
-				ID:          "pulse",
-				Name:        "Pulse MCP",
-				Description: "Browse and discover MCP use-cases, servers, clients, and news",
-				URL:         "https://www.pulsemcp.com/",
-				ServersURL:  "https://api.pulsemcp.com/v0beta/servers",
-				Tags:        []string{"verified"},
-				Protocol:    "custom/pulse",
-			},
-			{
-				ID:          "docker-mcp-catalog",
-				Name:        "Docker MCP Catalog",
-				Description: "A collection of secure, high-quality MCP servers as docker images",
-				URL:         "https://hub.docker.com/catalogs/mcp",
-				ServersURL:  "https://hub.docker.com/v2/repositories/mcp/",
-				Tags:        []string{"verified"},
-				Protocol:    "custom/docker",
-			},
-			{
-				ID:          "fleur",
-				Name:        "Fleur",
-				Description: "Fleur is the app store for Claude",
-				URL:         "https://www.fleurmcp.com/",
-				ServersURL:  "https://raw.githubusercontent.com/fleuristes/app-registry/refs/heads/main/apps.json",
-				Tags:        []string{"verified"},
-				Protocol:    "custom/fleur",
-			},
-			{
-				ID:          "azure-mcp-demo",
-				Name:        "Azure MCP Registry Demo",
-				Description: "A reference implementation of MCP registry using Azure API Center",
-				URL:         "https://demo.registry.azure-mcp.net/",
-				ServersURL:  "https://demo.registry.azure-mcp.net/v0/servers",
-				Tags:        []string{"verified", "demo", "azure", "reference"},
-				Protocol:    "mcp/v0",
-			},
-			{
-				ID:          "remote-mcp-servers",
-				Name:        "Remote MCP Servers",
-				Description: "Community-maintained list of remote Model Context Protocol servers",
-				URL:         "https://remote-mcp-servers.com/",
-				ServersURL:  "https://remote-mcp-servers.com/api/servers",
-				Tags:        []string{"verified", "community", "remote"},
-				Protocol:    "custom/remote",
-			},
-		},
+		// Default output-schema validation settings (Spec 056)
+		OutputValidation: DefaultOutputValidationConfig(),
+
+		// Default output sanitisation settings (Spec 054 Track B)
+		OutputSanitisation: DefaultOutputSanitisationConfig(),
+
+		// Default registries for MCP server discovery. Sourced from
+		// DefaultRegistries() so the built-in list has a single definition that
+		// the registries-package merge (FR-006) can reuse.
+		Registries: DefaultRegistries(),
 
 		// Default feature flags
 		Features: func() *FeatureFlags {
@@ -763,14 +1501,23 @@ func DefaultConfig() *Config {
 		CodeExecutionMaxToolCalls: 0,      // Unlimited by default (0 = no limit)
 		CodeExecutionPoolSize:     10,     // 10 JavaScript runtime instances
 
+		// Session risk warning prose disabled by default to reduce token overhead
+		// and LLM distraction in trusted setups (issue #406). Structured risk
+		// fields are still emitted; only the prose `warning` is gated.
+		ToolResponseSessionRiskWarning: false,
+
 		// Activity logging defaults (RFC-003)
 		ActivityRetentionDays:      90,     // 90 days retention
 		ActivityMaxRecords:         100000, // 100K records max
+		ActivityMaxSizeMB:          256,    // 256MB total activity-log size cap (0 = disabled)
 		ActivityMaxResponseSize:    65536,  // 64KB response truncation
 		ActivityCleanupIntervalMin: 60,     // 1 hour cleanup interval
 
 		// Intent declaration defaults (Spec 018) - strict validation by default for security
 		IntentDeclaration: DefaultIntentDeclarationConfig(),
+
+		// Observability defaults (Spec 069)
+		Observability: DefaultObservabilityConfig(),
 	}
 }
 
@@ -829,6 +1576,37 @@ func (c *Config) DefaultQuarantineForNewServer() bool {
 // IsQuarantineSkipped returns whether this server should skip tool-level quarantine.
 func (sc *ServerConfig) IsQuarantineSkipped() bool {
 	return sc.SkipQuarantine
+}
+
+// IsAutoApproveToolChanges reports the configured per-server intent to auto-approve
+// tool changes/additions (disabling per-server rug-pull protection). It is provided
+// for the runtime consumers that adopt it in MCP-2931 and is NOT yet consulted at
+// runtime — SkipQuarantine / IsQuarantineSkipped still governs behavior until then.
+// Mirrors IsQuarantineEnabled's *bool handling: an unset field (nil) is false; the
+// legacy skip_quarantine is migrated into this field at config load
+// (see normalizeServerQuarantineFlags) only when it is unset, so an explicit value
+// always wins. MCP-2930.
+func (sc *ServerConfig) IsAutoApproveToolChanges() bool {
+	return sc.AutoApproveToolChanges != nil && *sc.AutoApproveToolChanges
+}
+
+// IsToolAllowedByConfig reports whether toolName passes the server's static
+// enabled_tools / disabled_tools filter. Returns true when neither list is set.
+func (sc *ServerConfig) IsToolAllowedByConfig(toolName string) bool {
+	if len(sc.EnabledTools) > 0 {
+		for _, t := range sc.EnabledTools {
+			if t == toolName {
+				return true
+			}
+		}
+		return false
+	}
+	for _, t := range sc.DisabledTools {
+		if t == toolName {
+			return false
+		}
+	}
+	return true
 }
 
 // EnsureAPIKey ensures the API key is set, generating one if needed
@@ -903,6 +1681,17 @@ func (c *Config) ValidateDetailed() []ValidationError {
 		})
 	}
 
+	// Validate global discovery/health-check intervals (spec 074, FR-008).
+	if e := validateIntervalBound("init_timeout", c.InitTimeout, time.Second, 30*time.Minute); e != nil {
+		errors = append(errors, *e)
+	}
+	if e := validateIntervalBound("health_check_interval", c.HealthCheckInterval, 5*time.Second, time.Hour); e != nil {
+		errors = append(errors, *e)
+	}
+	if e := validateIntervalBound("tool_discovery_interval", c.ToolDiscoveryInterval, 30*time.Second, 24*time.Hour); e != nil {
+		errors = append(errors, *e)
+	}
+
 	// Validate code execution configuration (0 means use default)
 	if c.CodeExecutionTimeoutMs != 0 && (c.CodeExecutionTimeoutMs < 1 || c.CodeExecutionTimeoutMs > 600000) {
 		errors = append(errors, ValidationError{
@@ -940,10 +1729,62 @@ func (c *Config) ValidateDetailed() []ValidationError {
 		}
 	}
 
+	// Validate TOON output mode + threshold (spec 084, FR-001). Empty is
+	// allowed at the top level (treated as "off"); 0/unset threshold resolves
+	// to the default 15.
+	if !isValidToonOutput(c.ToonOutput) {
+		errors = append(errors, ValidationError{
+			Field:   "toon_output",
+			Message: fmt.Sprintf("invalid toon_output: %s (must be off, adaptive, or always)", c.ToonOutput),
+		})
+	}
+	if c.ToonMinSavingsPct != 0 && (c.ToonMinSavingsPct < 1 || c.ToonMinSavingsPct > 90) {
+		errors = append(errors, ValidationError{
+			Field:   "toon_min_savings_pct",
+			Message: "must be between 1 and 90 (or 0 for the default 15)",
+		})
+	}
+
+	// Validate tool response mode (Spec 085). Empty is allowed (= full).
+	if c.ToolResponseMode != "" &&
+		c.ToolResponseMode != ToolResponseModeFull && c.ToolResponseMode != ToolResponseModeCompact {
+		errors = append(errors, ValidationError{
+			Field:   "tool_response_mode",
+			Message: fmt.Sprintf("invalid tool response mode: %s (must be full or compact)", c.ToolResponseMode),
+		})
+	}
+
+	// Validate update-check channel (Spec 079 FR-012/FR-013). Empty is allowed
+	// (resolves to stable); only a non-empty unknown value is invalid.
+	if c.UpdateCheck != nil && c.UpdateCheck.Channel != "" &&
+		c.UpdateCheck.Channel != UpdateChannelStable && c.UpdateCheck.Channel != UpdateChannelRC {
+		errors = append(errors, ValidationError{
+			Field:   "update_check.channel",
+			Message: fmt.Sprintf("invalid channel: %s (must be %q or %q)", c.UpdateCheck.Channel, UpdateChannelStable, UpdateChannelRC),
+		})
+	}
+
+	// Validate global isolation mode (MCP-34.2). Empty is allowed (back-compat
+	// fallback to the Enabled bool); only a non-empty unknown value is invalid.
+	if c.DockerIsolation != nil && !c.DockerIsolation.Mode.IsValid() {
+		errors = append(errors, ValidationError{
+			Field:   "docker_isolation.mode",
+			Message: fmt.Sprintf("invalid isolation mode: %s (must be docker, sandbox, or none)", c.DockerIsolation.Mode),
+		})
+	}
+
 	// Validate server configurations
 	serverNames := make(map[string]bool)
 	for i, server := range c.Servers {
 		fieldPrefix := fmt.Sprintf("mcpServers[%d]", i)
+
+		// Validate per-server isolation mode override (MCP-34.2).
+		if server.Isolation != nil && server.Isolation.Mode != nil && !server.Isolation.Mode.IsValid() {
+			errors = append(errors, ValidationError{
+				Field:   fmt.Sprintf("%s.isolation.mode", fieldPrefix),
+				Message: fmt.Sprintf("invalid isolation mode: %s (must be docker, sandbox, or none)", *server.Isolation.Mode),
+			})
+		}
 
 		// Validate server name
 		if server.Name == "" {
@@ -1000,6 +1841,37 @@ func (c *Config) ValidateDetailed() []ValidationError {
 
 		// Note: OAuth configuration is optional. client_id is optional (uses Dynamic Client Registration RFC 7591 if empty).
 		// ClientSecret can be a secret reference, so we don't validate it as empty.
+
+		// enabled_tools and disabled_tools are mutually exclusive
+		if len(server.EnabledTools) > 0 && len(server.DisabledTools) > 0 {
+			errors = append(errors, ValidationError{
+				Field:   fieldPrefix + ".enabled_tools",
+				Message: "enabled_tools and disabled_tools are mutually exclusive; use one or the other",
+			})
+		}
+		// Spec 084: per-server toon_output override. Empty = inherit global.
+		if !isValidToonOutput(server.ToonOutput) {
+			errors = append(errors, ValidationError{
+				Field:   fieldPrefix + ".toon_output",
+				Message: fmt.Sprintf("invalid toon_output: %s (must be off, adaptive, or always — or empty to inherit)", server.ToonOutput),
+			})
+		}
+
+		// Spec 074: per-upstream auth_broker validation + default application.
+		// No-op in the personal edition (stub); enforced in the server edition.
+		errors = append(errors, validateServerAuthBroker(server, fieldPrefix)...)
+
+		// Spec 074: per-server discovery/health-check interval overrides.
+		if e := validateIntervalBound(fieldPrefix+".health_check_interval", server.HealthCheckInterval, 5*time.Second, time.Hour); e != nil {
+			errors = append(errors, *e)
+		}
+		if e := validateIntervalBound(fieldPrefix+".tool_discovery_interval", server.ToolDiscoveryInterval, 30*time.Second, 24*time.Hour); e != nil {
+			errors = append(errors, *e)
+		}
+		// MCP-3322: per-server MCP `initialize` handshake deadline override.
+		if e := validateIntervalBound(fieldPrefix+".init_timeout", server.InitTimeout, time.Second, 30*time.Minute); e != nil {
+			errors = append(errors, *e)
+		}
 	}
 
 	// Validate DataDir exists (if specified and not empty).
@@ -1038,6 +1910,27 @@ func (c *Config) ValidateDetailed() []ValidationError {
 	}
 
 	return errors
+}
+
+// validateIntervalBound enforces the tri-state interval contract (spec 074,
+// FR-008): nil is fine (inherit), 0s is fine (disabled), and any other value
+// must fall within [min, max]. Returns nil when valid, or a ValidationError
+// with a human-readable, actionable message.
+func validateIntervalBound(field string, d *Duration, minVal, maxVal time.Duration) *ValidationError {
+	if d == nil {
+		return nil
+	}
+	v := d.Duration()
+	if v == 0 {
+		return nil // explicit "disabled"
+	}
+	if v < minVal || v > maxVal {
+		return &ValidationError{
+			Field:   field,
+			Message: fmt.Sprintf("must be 0s (disabled) or between %s and %s, got %s", minVal, maxVal, v),
+		}
+	}
+	return nil
 }
 
 // isValidListenAddr checks if the listen address format is valid
@@ -1086,6 +1979,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("%s", errors[0].Error())
 	}
 
+	// Validate profiles (Spec 057): fatal rules (invalid/reserved/duplicate slug)
+	// fail the load; soft rules (unknown/empty servers) are stashed as warnings
+	// for the boot path to log via its logger (see ProfileWarnings).
+	profileWarnings, profileErr := ValidateProfiles(c)
+	if profileErr != nil {
+		return profileErr
+	}
+	c.profileWarnings = profileWarnings
+
 	// Handle API key generation if not configured
 	// Empty string means authentication disabled, nil means auto-generate
 	if c.APIKey == "" {
@@ -1128,6 +2030,41 @@ func (c *Config) Validate() error {
 	// Ensure IntentDeclaration config is not nil
 	if c.IntentDeclaration == nil {
 		c.IntentDeclaration = DefaultIntentDeclarationConfig()
+	}
+
+	// Ensure Observability config is not nil and has sane cadence defaults
+	// (Spec 069). The hot-reload path re-runs Validate, so zeroed fields are
+	// repaired rather than disabling persistence/caching entirely.
+	if c.Observability == nil {
+		c.Observability = DefaultObservabilityConfig()
+	}
+	if c.Observability.UsageCacheTTL.Duration() <= 0 {
+		c.Observability.UsageCacheTTL = Duration(5 * time.Second)
+	}
+	if c.Observability.UsagePersistInterval.Duration() <= 0 {
+		c.Observability.UsagePersistInterval = Duration(30 * time.Second)
+	}
+	// MCP-32 exporters: fill missing sub-configs (disabled) and repair invalid
+	// tracing transport so the OTLP exporter can always construct when enabled.
+	if c.Observability.Metrics == nil {
+		c.Observability.Metrics = DefaultMetricsExporterConfig()
+	}
+	if c.Observability.Tracing == nil {
+		c.Observability.Tracing = DefaultTracingExporterConfig()
+	}
+	tr := c.Observability.Tracing
+	if tr.Protocol != defaultTracingProtocol && tr.Protocol != "grpc" {
+		tr.Protocol = defaultTracingProtocol
+	}
+	if tr.Endpoint == "" {
+		if tr.Protocol == "grpc" {
+			tr.Endpoint = defaultTracingGRPCEnd
+		} else {
+			tr.Endpoint = defaultTracingHTTPEnd
+		}
+	}
+	if tr.SampleRate < 0 || tr.SampleRate > 1 {
+		tr.SampleRate = defaultTracingSampleRate
 	}
 
 	return nil
@@ -1241,7 +2178,6 @@ func (c *Config) GetAnonymousID() string {
 
 // SecurityConfig represents security scanner configuration (Spec 039)
 type SecurityConfig struct {
-	AutoScanQuarantined     bool     `json:"auto_scan_quarantined" mapstructure:"auto-scan-quarantined"`
 	ScanTimeoutDefault      Duration `json:"scan_timeout_default,omitempty" mapstructure:"scan-timeout-default" swaggertype:"string"`
 	IntegrityCheckInterval  Duration `json:"integrity_check_interval,omitempty" mapstructure:"integrity-check-interval" swaggertype:"string"`
 	IntegrityCheckOnRestart bool     `json:"integrity_check_on_restart" mapstructure:"integrity-check-on-restart"`
@@ -1249,6 +2185,11 @@ type SecurityConfig struct {
 	RuntimeReadOnly         bool     `json:"runtime_read_only" mapstructure:"runtime-read-only"`
 	RuntimeTmpfsSize        string   `json:"runtime_tmpfs_size,omitempty" mapstructure:"runtime-tmpfs-size"`
 
+	// Deprecated (Spec 077 US3): migrated on load into DeepScan.DisableNoNewPrivileges
+	// (see migrateDeepScanConfig). Retained only so existing configs that still carry
+	// the top-level key parse; consumers MUST read the effective value via
+	// SecurityConfig.IsDisableNoNewPrivileges. Cleared after migration.
+	//
 	// ScannerDisableNoNewPrivileges, when true, omits the
 	// `--security-opt no-new-privileges` flag from scanner container runs.
 	//
@@ -1265,4 +2206,146 @@ type SecurityConfig struct {
 	// is small. The preferred fix remains replacing snap docker with a
 	// distro-packaged docker.
 	ScannerDisableNoNewPrivileges bool `json:"scanner_disable_no_new_privileges,omitempty" mapstructure:"scanner-disable-no-new-privileges"`
+
+	// Deprecated (Spec 077 US3): migrated on load into DeepScan.FetchPackageSource
+	// (see migrateDeepScanConfig). Retained only so existing configs that still carry
+	// the top-level key parse; consumers MUST read the effective value via
+	// SecurityConfig.EffectiveFetchPackageSource. Cleared after migration.
+	//
+	// ScannerFetchPackageSource controls whether the scanner fetches the
+	// PUBLISHED source of package-runner servers (npx/uvx) — without executing
+	// it — when no local source is available (no Docker container, no local
+	// package cache, no working_dir). This is the primary quarantine/scan
+	// target: a quarantined-on-add server is never run locally, so without this
+	// the scan degrades to tool-definitions-only (no real source-level
+	// analysis). See MCP-2206.
+	//
+	// Fetching uses `npm pack --ignore-scripts` (npm) and `uv pip download` /
+	// `pip download` with `--only-binary=:all:` (Python), which only download +
+	// unpack archives and NEVER run install, build, or setup.py — a scanner must
+	// not execute the untrusted code it is scanning. The Python
+	// `--only-binary=:all:` flag is required because downloading an sdist would
+	// invoke its build backend (setup.py); packages with no wheel fall back to
+	// tool-definitions-only instead. Extraction is hardened against path
+	// traversal and decompression bombs.
+	//
+	// Default (nil) is ENABLED. Set to false on air-gapped deployments to
+	// forbid the scanner's network egress; such servers then fall back to the
+	// tool-definitions-only scan with no regression.
+	ScannerFetchPackageSource *bool `json:"scanner_fetch_package_source,omitempty" mapstructure:"scanner-fetch-package-source"`
+
+	// DeepScan is the opt-in "deep scan" layer (Spec 077 US3). It subsumes the
+	// deprecated top-level scanner_fetch_package_source / scanner_disable_no_new_privileges
+	// keys (migrated on load) and gates the heavy Docker-based scanners + source
+	// extraction. Disabled by default (FR-006): only the deterministic in-process
+	// baseline scanner runs. A deep-scan failure NEVER changes the baseline verdict
+	// (FR-007/FR-008).
+	DeepScan *DeepScanConfig `json:"deep_scan,omitempty" mapstructure:"deep-scan"`
+}
+
+// DeepScanConfig configures the opt-in "deep scan" layer (Spec 077 US3):
+// Docker-based scanner plugins plus published-package-source extraction. The
+// whole layer is off by default; when disabled only the deterministic
+// in-process baseline scanner runs and no Docker is invoked. A deep-scan
+// failure is surfaced as an informational note and never degrades the baseline
+// verdict.
+type DeepScanConfig struct {
+	// Enabled is the master opt-in for the heavy layer (FR-006). Default false.
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+
+	// FetchPackageSource controls whether the scanner fetches the PUBLISHED
+	// source of package-runner servers (npx/uvx) — without executing it — when
+	// no local source is available. Absorbs the deprecated top-level
+	// scanner_fetch_package_source. Default (nil) is ENABLED within deep scan.
+	FetchPackageSource *bool `json:"fetch_package_source,omitempty" mapstructure:"fetch-package-source" swaggertype:"boolean"`
+
+	// DisableNoNewPrivileges, when true, omits the `--security-opt
+	// no-new-privileges` flag from scanner container runs (snap-docker/AppArmor
+	// escape hatch). Absorbs the deprecated top-level
+	// scanner_disable_no_new_privileges. Default false.
+	DisableNoNewPrivileges bool `json:"disable_no_new_privileges,omitempty" mapstructure:"disable-no-new-privileges"`
+
+	// Scanners optionally restricts which deep scanners may run under the
+	// umbrella (by scanner id). Empty ⇒ all enabled deep scanners are eligible.
+	Scanners []string `json:"scanners,omitempty" mapstructure:"scanners"`
+}
+
+// IsDeepScanEnabled reports whether the opt-in deep-scan layer is turned on.
+// Nil-safe: a nil SecurityConfig or nil DeepScan means disabled (the default).
+func (sc *SecurityConfig) IsDeepScanEnabled() bool {
+	return sc != nil && sc.DeepScan != nil && sc.DeepScan.Enabled
+}
+
+// DeepScanScanners returns the optional per-scanner allow-list for the deep-scan
+// layer, or nil when unset (all enabled deep scanners are eligible).
+func (sc *SecurityConfig) DeepScanScanners() []string {
+	if sc != nil && sc.DeepScan != nil {
+		return sc.DeepScan.Scanners
+	}
+	return nil
+}
+
+// EffectiveFetchPackageSource resolves the package-source-fetch setting from the
+// deep_scan block first, falling back to the deprecated top-level key for
+// configs loaded before migration. Nil ⇒ default (enabled).
+func (sc *SecurityConfig) EffectiveFetchPackageSource() *bool {
+	if sc == nil {
+		return nil
+	}
+	if sc.DeepScan != nil && sc.DeepScan.FetchPackageSource != nil {
+		return sc.DeepScan.FetchPackageSource
+	}
+	return sc.ScannerFetchPackageSource
+}
+
+// IsDisableNoNewPrivileges resolves the no-new-privileges escape hatch from the
+// deep_scan block first, falling back to the deprecated top-level key.
+func (sc *SecurityConfig) IsDisableNoNewPrivileges() bool {
+	if sc == nil {
+		return false
+	}
+	if sc.DeepScan != nil && sc.DeepScan.DisableNoNewPrivileges {
+		return true
+	}
+	return sc.ScannerDisableNoNewPrivileges
+}
+
+// MigrateDeepScanConfig runs the Spec 077 US3 deep-scan config migration on an
+// already-parsed config. LoadFromFile applies it automatically (via
+// initializeRegistries); the /api/v1/config/apply path bypasses LoadFromFile, so
+// it calls this explicitly to normalize an API-submitted config identically to a
+// file load before diffing/saving (SC-007). Idempotent + nil-safe.
+func MigrateDeepScanConfig(cfg *Config) {
+	migrateDeepScanConfig(cfg)
+}
+
+// migrateDeepScanConfig folds the deprecated top-level scanner_fetch_package_source
+// and scanner_disable_no_new_privileges keys into the unified security.deep_scan
+// block (Spec 077 FR-017) so existing configs load unchanged and behave
+// identically after migration (SC-007). The removed auto_scan_quarantined key has
+// no struct field, so it is silently ignored on unmarshal (FR-016). Idempotent:
+// only fills deep_scan fields left unset, then clears the legacy keys so a
+// re-serialized config exposes only the new surface. Runs on every load and
+// hot-reload via initializeRegistries.
+func migrateDeepScanConfig(cfg *Config) {
+	if cfg == nil || cfg.Security == nil {
+		return
+	}
+	sc := cfg.Security
+	if sc.ScannerFetchPackageSource == nil && !sc.ScannerDisableNoNewPrivileges {
+		return // nothing legacy to migrate
+	}
+	if sc.DeepScan == nil {
+		sc.DeepScan = &DeepScanConfig{}
+	}
+	if sc.DeepScan.FetchPackageSource == nil && sc.ScannerFetchPackageSource != nil {
+		v := *sc.ScannerFetchPackageSource
+		sc.DeepScan.FetchPackageSource = &v
+	}
+	if !sc.DeepScan.DisableNoNewPrivileges && sc.ScannerDisableNoNewPrivileges {
+		sc.DeepScan.DisableNoNewPrivileges = true
+	}
+	// Clear the legacy keys so the migrated config serializes only deep_scan.*.
+	sc.ScannerFetchPackageSource = nil
+	sc.ScannerDisableNoNewPrivileges = false
 }

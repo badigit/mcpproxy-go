@@ -160,7 +160,7 @@
               </div>
 
               <!-- Action Buttons -->
-              <div class="flex flex-col gap-2 flex-shrink-0">
+              <div class="flex flex-col gap-2 shrink-0">
                 <button
                   class="btn btn-sm btn-primary"
                   @click="viewToolDetails(result)"
@@ -168,7 +168,7 @@
                   View Details
                 </button>
                 <router-link
-                  :to="`/servers/${result.tool.server_name}`"
+                  :to="serverDetailPath(result.tool.server_name)"
                   class="btn btn-sm btn-outline"
                 >
                   Server Info
@@ -251,7 +251,7 @@
 
         <div class="modal-action">
           <router-link
-            :to="`/servers/${selectedTool.tool.server_name}`"
+            :to="serverDetailPath(selectedTool.tool.server_name)"
             class="btn btn-outline"
             @click="selectedTool = null"
           >
@@ -268,6 +268,7 @@
 </template>
 
 <script setup lang="ts">
+import { serverDetailPath } from '@/utils/serverRoute'
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import type { SearchResult } from '@/types'

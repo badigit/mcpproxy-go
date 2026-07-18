@@ -47,6 +47,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	_ "github.com/smart-mcp-proxy/mcpproxy-go/oas" // Import generated swagger docs
@@ -61,6 +62,7 @@ var (
 	logLevel          string
 	debugSearch       bool
 	toolResponseLimit int
+	toolResponseMode  string
 	logToFile         bool
 	logDir            string
 
@@ -128,6 +130,7 @@ func main() {
 	serverCmd.Flags().BoolVar(&enableSocket, "enable-socket", true, "Enable Unix socket/named pipe for local IPC (default: true)")
 	serverCmd.Flags().BoolVar(&debugSearch, "debug-search", false, "Enable debug search tool for search relevancy debugging")
 	serverCmd.Flags().IntVar(&toolResponseLimit, "tool-response-limit", 0, "Tool response limit in characters (0 = disabled, default: 20000 from config)")
+	serverCmd.Flags().StringVar(&toolResponseMode, "tool-response-mode", "", "retrieve_tools serialization mode: full (default) or compact (Spec 085)")
 	serverCmd.Flags().BoolVar(&requireMCPAuth, "require-mcp-auth", false, "Require authentication on /mcp endpoint (agent tokens or API key)")
 	serverCmd.Flags().BoolVar(&readOnlyMode, "read-only", false, "Enable read-only mode")
 	serverCmd.Flags().BoolVar(&disableManagement, "disable-management", false, "Disable management features")
@@ -189,7 +192,9 @@ func main() {
 
 	// Add commands to root
 	rootCmd.AddCommand(serverCmd)
+	rootCmd.AddCommand(newSandboxExecCommand())
 	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(GetRegistryCommand())
 	rootCmd.AddCommand(toolsCmd)
 	rootCmd.AddCommand(callCmd)
 	rootCmd.AddCommand(codeCmd)
@@ -207,6 +212,9 @@ func main() {
 	rootCmd.AddCommand(securityCmd)
 	rootCmd.AddCommand(connectCmd)
 	rootCmd.AddCommand(disconnectCmd)
+
+	// Server-edition-only commands (e.g. `credential`). No-op in personal edition.
+	registerServerEditionCommands(rootCmd)
 
 	// Setup --help-json for machine-readable help discovery
 	// This must be called AFTER all commands are added
@@ -465,10 +473,12 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	// Override log directory if specified
-	if cmdLogDir != "" {
-		cfg.Logging.LogDir = cmdLogDir
-	}
+	// Resolve the log directory. An explicit --log-dir wins; otherwise a
+	// non-default data dir co-locates logs under <data-dir>/logs so that
+	// tests/e2e/harness `serve` runs do not pollute the shared OS-standard
+	// prod log (root cause of the phantom "core restarts every 10s" in
+	// MCP-2250). The default data dir keeps the OS-standard location.
+	cfg.Logging.LogDir = resolveServeLogDir(cmdLogDir, cfg.Logging.LogDir, cfg.DataDir, defaultDataDirPath())
 
 	// Setup logger with new logging system
 	logger, err := logs.SetupLogger(cfg.Logging)
@@ -496,11 +506,24 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		zap.String("log_level", cmdLogLevel),
 		zap.Bool("log_to_file", cmdLogToFile))
 
+	// MCP-2751: when launched from a macOS GUI/launchd context (Launchpad, the
+	// SMAppService login item, or the tray spawning the core), the process
+	// inherits a launchd-minimal environment and never sources the user's
+	// login shell — so it lacks Homebrew/Docker PATH entries and exported vars
+	// like DOCKER_HOST. Hydrate a curated allow-list (PATH + DOCKER_*/proxy/
+	// tool-home) once, before any manager reads os.Environ(), so every spawn
+	// path (docker, stdio servers, uvx/npx, ResolveDockerPath,
+	// secureenv.BuildSecureEnvironment) inherits a correct environment with no
+	// call-site changes. No-op on terminal launches and non-macOS.
+	shellwrap.HydrateFromLoginShell(logger)
+
 	// Pass edition and version to internal packages
 	httpapi.SetEdition(Edition)
 	server.SetMCPServerVersion(version)
 	// Spec 042: surface header for outbound CLI HTTP requests.
 	cliclient.SetClientVersion(version)
+	// Issue #566: registries (e.g. Pulse) require a versioned User-Agent.
+	registries.SetVersion(version)
 
 	// Override other settings from command line
 	cfg.DebugSearch = cmdDebugSearch
@@ -705,6 +728,7 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	if toolResponseLimit != 0 {
 		cfg.ToolResponseLimit = toolResponseLimit
 	}
+	applyToolResponseModeFlag(cfg, cmd.Flags().Changed("tool-response-mode"), toolResponseMode)
 
 	// Validate the configuration
 	if err := cfg.Validate(); err != nil {
@@ -712,6 +736,17 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// applyToolResponseModeFlag applies the --tool-response-mode serve flag onto
+// the loaded config (Spec 085 T017). Only an explicitly set flag overrides the
+// file/env value (so an unset flag never clobbers MCPPROXY_TOOL_RESPONSE_MODE
+// or the config file); cfg.Validate(), which runs right after, rejects
+// invalid values with a tool_response_mode error.
+func applyToolResponseModeFlag(cfg *config.Config, changed bool, mode string) {
+	if changed {
+		cfg.ToolResponseMode = mode
+	}
 }
 
 // classifyError categorizes errors to return appropriate exit codes

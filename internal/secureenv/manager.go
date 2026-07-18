@@ -1,10 +1,18 @@
 package secureenv
 
 import (
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 )
+
+// loginShellPATHFn captures the user's interactive login-shell $PATH.
+// Overridable in tests. Default delegates to shellwrap.LoginShellPATH which
+// caches the result for the process lifetime via sync.Once.
+var loginShellPATHFn = func() string { return shellwrap.LoginShellPATH(nil) }
 
 const (
 	osWindows = "windows"
@@ -17,6 +25,13 @@ type EnvConfig struct {
 	AllowedSystemVars []string          `json:"allowed_system_vars"`
 	CustomVars        map[string]string `json:"custom_vars"`
 	EnhancePath       bool              `json:"enhance_path"` // Enable PATH enhancement for Launchd scenarios
+	// ForwardProxyEnv opts in to forwarding the ambient HTTP(S)/ALL/NO/FTP proxy
+	// environment variables to spawned upstream servers (MCP-2769). It is OFF by
+	// default and deliberately kept out of the AllowedSystemVars default list:
+	// proxy URLs frequently carry credentials (http://user:pass@proxy), so
+	// forwarding them to every stdio upstream is a credential-leak risk. When
+	// enabled, values are forwarded with their userinfo (credentials) redacted.
+	ForwardProxyEnv bool `json:"forward_proxy_env,omitempty"`
 }
 
 // PathDiscovery contains auto-discovered paths for common tools
@@ -79,6 +94,16 @@ func DefaultEnvConfig() *EnvConfig {
 	}
 	allowedVars = append(allowedVars, localeVars...)
 
+	// Add container / tool-home passthrough variables (MCP-2751). These are NOT
+	// secrets; they mirror the curated set hydrated by shellwrap.HydrateFromLoginShell
+	// so the now-present vars survive this allow-list filter and reach upstream
+	// stdio/docker spawns. Proxy vars (HTTP_PROXY etc.) are intentionally excluded
+	// — proxy forwarding is a separate opt-in concern.
+	allowedVars = append(allowedVars,
+		"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY",
+		"NVM_DIR", "ASDF_DIR", "PYENV_ROOT", "VOLTA_HOME", "HOMEBREW_PREFIX", "COLIMA_HOME",
+	)
+
 	return &EnvConfig{
 		InheritSystemSafe: true,
 		AllowedSystemVars: allowedVars,
@@ -129,16 +154,42 @@ func (m *Manager) discoverPaths() *PathDiscovery {
 	return discovery
 }
 
-// discoverUnixPaths discovers common Unix/macOS tool paths
+// discoverUnixPaths discovers common Unix/macOS tool paths that actually exist.
 func (m *Manager) discoverUnixPaths() []string {
+	// Filter the platform candidate list to only paths that actually exist.
+	var existingPaths []string
+	for _, path := range unixCandidatePaths() {
+		if _, err := os.Stat(path); err == nil {
+			existingPaths = append(existingPaths, path)
+		}
+	}
+
+	return existingPaths
+}
+
+// unixCandidatePaths returns the ordered list of well-known Unix/macOS tool
+// directories to probe for existence. Split out (pure, no I/O) so platform-
+// specific inclusion can be unit-tested without depending on what is installed
+// on the test host.
+func unixCandidatePaths() []string {
 	commonPaths := []string{
-		"/usr/local/bin",    // Homebrew, Docker Desktop, etc.
+		"/usr/local/bin",    // Homebrew, Docker Desktop symlink, etc.
 		"/usr/bin",          // System binaries
 		"/bin",              // Core system binaries
 		"/opt/homebrew/bin", // Apple Silicon Homebrew
 		"/usr/local/sbin",   // System admin binaries
 		"/usr/sbin",         // System admin binaries
 		"/sbin",             // System admin binaries
+	}
+
+	// macOS (#696): Docker Desktop installed the default way (without the
+	// optional, admin-gated "install CLI tools" step) leaves the docker CLI
+	// only inside the app bundle, which is not on any standard PATH dir. Adding
+	// it (defense in depth for the absolute-path spawn fix) lets nested/child
+	// docker resolution work for isolated servers. Existence is filtered by the
+	// caller, so this is a no-op on hosts without Docker Desktop.
+	if runtime.GOOS == "darwin" {
+		commonPaths = append(commonPaths, "/Applications/Docker.app/Contents/Resources/bin")
 	}
 
 	// Add user-specific paths
@@ -152,15 +203,7 @@ func (m *Manager) discoverUnixPaths() []string {
 		)
 	}
 
-	// Filter to only include paths that actually exist
-	var existingPaths []string
-	for _, path := range commonPaths {
-		if _, err := os.Stat(path); err == nil {
-			existingPaths = append(existingPaths, path)
-		}
-	}
-
-	return existingPaths
+	return commonPaths
 }
 
 // discoverWindowsPaths discovers common Windows tool paths
@@ -195,11 +238,11 @@ func (m *Manager) discoverWindowsPaths() []string {
 
 	if homeDir != "" {
 		commonPaths = append(commonPaths,
-			homeDir+`\.cargo\bin`,                                    // Rust tools (cargo, uv)
-			homeDir+`\.local\bin`,                                    // Python user scripts
-			homeDir+`\go\bin`,                                        // Go binaries
-			homeDir+`\AppData\Roaming\npm`,                           // npm globals
-			homeDir+`\scoop\shims`,                                   // Scoop packages
+			homeDir+`\.cargo\bin`,          // Rust tools (cargo, uv)
+			homeDir+`\.local\bin`,          // Python user scripts
+			homeDir+`\go\bin`,              // Go binaries
+			homeDir+`\AppData\Roaming\npm`, // npm globals
+			homeDir+`\scoop\shims`,         // Scoop packages
 			homeDir+`\AppData\Local\Programs\Python\Python313\Scripts`, // Python 3.13
 			homeDir+`\AppData\Local\Programs\Python\Python312\Scripts`, // Python 3.12
 			homeDir+`\AppData\Local\Programs\Python\Python311\Scripts`, // Python 3.11
@@ -237,7 +280,95 @@ func (m *Manager) BuildSecureEnvironment() []string {
 		envVars = m.ensureComprehensivePath(envVars)
 	}
 
+	// Forward ambient proxy variables only when explicitly opted in (MCP-2769),
+	// with credentials redacted. Done last so an explicitly-configured proxy
+	// value (custom/server env) always wins over the ambient one.
+	if m.config.ForwardProxyEnv {
+		envVars = appendForwardedProxyEnv(envVars)
+	}
+
 	return envVars
+}
+
+// proxyEnvGroups lists the proxy environment variables that ForwardProxyEnv
+// forwards, grouped by logical variable. HTTP clients treat the upper- and
+// lower-case spellings as aliases, so each group is handled atomically: if
+// either spelling is already set (via custom/server env), neither is forwarded
+// from the ambient environment.
+var proxyEnvGroups = [][]string{
+	{"HTTP_PROXY", "http_proxy"},
+	{"HTTPS_PROXY", "https_proxy"},
+	{"ALL_PROXY", "all_proxy"},
+	{"NO_PROXY", "no_proxy"},
+	{"FTP_PROXY", "ftp_proxy"},
+}
+
+// appendForwardedProxyEnv appends the ambient proxy variables to envVars with
+// credentials redacted. An already-present spelling (case-insensitive within a
+// group) suppresses forwarding of the whole group so explicit configuration is
+// never overridden.
+func appendForwardedProxyEnv(envVars []string) []string {
+	present := make(map[string]struct{}, len(envVars))
+	for _, ev := range envVars {
+		if i := strings.IndexByte(ev, '='); i > 0 {
+			present[ev[:i]] = struct{}{}
+		}
+	}
+
+	for _, group := range proxyEnvGroups {
+		if anyProxyKeyPresent(present, group) {
+			continue
+		}
+		for _, key := range group {
+			if val, ok := os.LookupEnv(key); ok && val != "" {
+				envVars = append(envVars, key+"="+redactProxyCredentials(val))
+			}
+		}
+	}
+	return envVars
+}
+
+func anyProxyKeyPresent(present map[string]struct{}, group []string) bool {
+	for _, key := range group {
+		if _, ok := present[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// redactProxyCredentials strips any userinfo (user:password) from a proxy URL
+// so credentials are never forwarded to upstream servers, while preserving the
+// proxy host/port so the proxy remains functional. Non-URL values (e.g. the
+// host list in NO_PROXY) and unparseable values are returned unchanged.
+func redactProxyCredentials(value string) string {
+	// Surrounding whitespace would make url.Parse error (leading space) or
+	// otherwise fall through, forwarding a credentialed value verbatim. Trim it
+	// first; whitespace is never meaningful in a proxy URL.
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	// Scheme-qualified values (http://user:pass@host) parse with Userinfo set.
+	if u, err := url.Parse(value); err == nil && u.User != nil {
+		u.User = nil
+		return u.String()
+	}
+	// Schemeless values (user:pass@host:8080) are misread by url.Parse — it
+	// treats "user" as the scheme, leaving Userinfo nil, so the value would be
+	// forwarded with credentials intact. Re-parse with a dummy scheme so the
+	// userinfo is recognized as part of the authority, then strip the scheme we
+	// added. The "://" guard avoids touching already-schemed values, and
+	// requiring an "@" keeps non-URL values (e.g. NO_PROXY host lists) untouched.
+	// An "@" that lives in a path rather than the authority (e.g. host/path@x)
+	// leaves Userinfo nil under url.Parse, so it is correctly left intact.
+	if !strings.Contains(value, "://") && strings.Contains(value, "@") {
+		if u, err := url.Parse("http://" + value); err == nil && u.User != nil {
+			u.User = nil
+			return strings.TrimPrefix(u.String(), "http://")
+		}
+	}
+	return value
 }
 
 // ensureComprehensivePath ensures PATH includes all discovered tool paths
@@ -268,70 +399,78 @@ func (m *Manager) ensureComprehensivePath(envVars []string) []string {
 	return envVars
 }
 
-// buildEnhancedPath builds a comprehensive PATH by combining existing path with discovered paths
+// buildEnhancedPath builds a comprehensive PATH by combining (in priority
+// order) the user's interactive login-shell PATH, statically-discovered
+// well-known tool directories, and the existing PATH inherited from the
+// parent process.
+//
+// Enhancement is gated on EnvConfig.EnhancePath being explicitly opted in
+// (true today only for stdio upstream servers — see core/client.go) and on
+// the existing PATH NOT already containing a comprehensive tool directory.
+// Issue #439: the previous gate `len(pathParts) <= 2` blocked enhancement
+// for the launchd-handed `/usr/bin:/bin:/usr/sbin:/sbin` (4 entries), which
+// is exactly the bad PATH that triggers the bug. We drop that gate and
+// instead rely on login-shell capture + static discovery to enrich PATH
+// whenever it lacks /usr/local/bin or /opt/homebrew/bin.
 func (m *Manager) buildEnhancedPath(existingPath string) string {
-	// If existing path is empty, use discovered paths
+	sep := string(os.PathListSeparator)
+
 	if existingPath == "" {
-		return strings.Join(m.pathDiscovery.DiscoveredPaths, string(os.PathListSeparator))
+		return strings.Join(m.pathDiscovery.DiscoveredPaths, sep)
 	}
 
-	// Check if the existing PATH is missing common tool directories
-	// This indicates a Launchd-style minimal environment
-	pathParts := strings.Split(existingPath, string(os.PathListSeparator))
+	pathParts := strings.Split(existingPath, sep)
 
-	// Look for common tool directories that should contain Docker, etc.
+	// If PATH already contains a common tool directory the user is fine —
+	// don't pollute their carefully-set PATH with login-shell capture.
 	commonToolDirs := []string{"/usr/local/bin", "/opt/homebrew/bin"}
 	if runtime.GOOS == osWindows {
 		commonToolDirs = []string{`C:\Program Files\Docker\Docker\resources\bin`}
 	}
-
-	hasCommonToolDirs := false
 	for _, toolDir := range commonToolDirs {
 		for _, pathPart := range pathParts {
 			if pathPart == toolDir {
-				hasCommonToolDirs = true
-				break
+				return existingPath
 			}
-		}
-		if hasCommonToolDirs {
-			break
 		}
 	}
 
-	// Only enhance if explicitly enabled AND we're missing common tool directories AND the path is minimal
-	// This specifically targets Launchd scenarios while preserving normal behavior by default
-	shouldEnhance := m.config.EnhancePath && !hasCommonToolDirs && len(pathParts) <= 2
-	if shouldEnhance {
-		// Start with discovered paths for better tool discovery
-		enhancedParts := make([]string, 0, len(m.pathDiscovery.DiscoveredPaths)+len(pathParts))
-
-		// Add discovered paths first (prioritize them)
-		for _, discoveredPath := range m.pathDiscovery.DiscoveredPaths {
-			// Avoid duplicates
-			found := false
-			for _, existingPart := range pathParts {
-				if existingPart == discoveredPath {
-					found = true
-					break
-				}
-			}
-			if !found {
-				enhancedParts = append(enhancedParts, discoveredPath)
-			}
-		}
-
-		// Add existing path parts
-		for _, part := range pathParts {
-			if part != "" {
-				enhancedParts = append(enhancedParts, part)
-			}
-		}
-
-		return strings.Join(enhancedParts, string(os.PathListSeparator))
+	if !m.config.EnhancePath {
+		return existingPath
 	}
 
-	// For paths that already have common tool directories or are comprehensive, use as-is
-	return existingPath
+	// Compose: login-shell PATH first (highest priority — captures the
+	// user's actual interactive PATH including mise/asdf/Colima/custom
+	// shims), then statically-discovered well-known directories (deterministic
+	// floor when login-shell capture is empty / contaminated / unavailable),
+	// then the existing PATH (preserves anything the operator deliberately
+	// set on the daemon).
+	enhancedParts := make([]string, 0, len(m.pathDiscovery.DiscoveredPaths)+len(pathParts)+8)
+	seen := make(map[string]struct{}, len(enhancedParts))
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		enhancedParts = append(enhancedParts, p)
+	}
+
+	if loginShellPATHFn != nil {
+		for _, p := range strings.Split(loginShellPATHFn(), sep) {
+			add(p)
+		}
+	}
+	for _, p := range m.pathDiscovery.DiscoveredPaths {
+		add(p)
+	}
+	for _, p := range pathParts {
+		add(p)
+	}
+
+	return strings.Join(enhancedParts, sep)
 }
 
 // getFilteredSystemEnv retrieves allowed environment variables from the system

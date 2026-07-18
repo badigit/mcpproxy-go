@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,6 +21,8 @@ const (
 	DefaultRetentionMaxRecords = 10000
 	// DefaultRetentionCheckInterval is the default interval between retention checks (1 hour)
 	DefaultRetentionCheckInterval = 1 * time.Hour
+	// DefaultRetentionMaxSizeBytes is the default total activity-log size cap (256MB)
+	DefaultRetentionMaxSizeBytes int64 = 256 * 1024 * 1024
 )
 
 // SensitiveDataEventEmitter provides the ability to emit sensitive data detection events.
@@ -28,20 +32,75 @@ type SensitiveDataEventEmitter interface {
 	EmitSensitiveDataDetected(activityID string, detectionCount int, maxSeverity string, detectionTypes []string)
 }
 
+// SessionClientResolver maps an MCP session id to the client that opened it
+// (clientInfo.name / clientInfo.version from the initialize handshake).
+// Returns empty strings when the session is unknown.
+type SessionClientResolver func(sessionID string) (name, version string)
+
+// SessionWorkSessionResolver maps an MCP session id to the WORK session it
+// belongs to (Spec 082): one client, one project, across reconnects.
+//
+// It returns the id cached on the connection — deliberately not a fresh
+// derivation, so every record from one connection agrees on its work session.
+type SessionWorkSessionResolver func(sessionID string) string
+
 // ActivityService subscribes to activity events and persists them to storage.
 // It runs as a background goroutine and handles activity recording non-blocking.
 type ActivityService struct {
 	storage *storage.Manager
 	logger  *zap.Logger
 
+	// clientResolver stamps the MCP client onto each activity record at WRITE
+	// time. Read-time joining against the sessions API is not viable: the core
+	// retains only the 100 most recent sessions, while activity is retained for
+	// 90 days — and an IDE that reconnects every few minutes burns through 100
+	// sessions in about a day. Any name resolved by lookup therefore decays back
+	// to a bare session id. Denormalizing it here makes it permanent, and it
+	// costs nothing: the resolver reads the in-memory session store (O(1)) and
+	// the session is by definition still open when its activity is emitted.
+	//
+	// nil until wired via SetSessionClientResolver; the records simply carry no
+	// client name in that case.
+	clientResolver SessionClientResolver
+
+	// workSessionResolver returns the WORK session a record belongs to (Spec 082):
+	// one client, one project, across reconnects. Stamped at write time for the
+	// same reason the client name is — a value resolved later decays once the
+	// record it points at is evicted.
+	workSessionResolver SessionWorkSessionResolver
+
+	// workSessionReaper drops idle work sessions so the tracker cannot grow
+	// without bound. Wired alongside the resolver.
+	workSessionReaper func(time.Duration) int
+
 	// Channel for receiving events
 	eventCh chan Event
-	// Done channel for graceful shutdown
-	done chan struct{}
+
+	// Shutdown coordination (Spec 080 FR-010): Runtime.Close must be able to
+	// await every BBolt writer this service owns BEFORE the clean-shutdown
+	// marker resolves and the DB closes. done signals the main event loop's
+	// exit (the final flush-on-shutdown included); workersWG tracks the
+	// background loops (retention, usage flush) and the per-event async
+	// detection goroutines, all of which write to BBolt. startMu/started make
+	// Stop return immediately when Start never ran (done would never close).
+	// stopped is the terminal state (Spec 080, review round 5): production
+	// launches Start via `go` (lifecycle.go), so a fast shutdown can run Stop
+	// BEFORE the Start goroutine is scheduled — Stop marks stopped under
+	// startMu and a later Start becomes a no-op instead of launching BBolt
+	// writers after the shutdown-marker path began. Start's registration
+	// (subscribe + every workersWG.Add) happens entirely under startMu, so a
+	// Stop that loses the race blocks until registration is complete and its
+	// Wait cannot miss a late worker.
+	done      chan struct{}
+	workersWG sync.WaitGroup
+	startMu   sync.Mutex
+	started   bool
+	stopped   bool
 
 	// Retention configuration
 	maxAge        time.Duration
 	maxRecords    int
+	maxSizeBytes  int64 // total activity-log size cap in bytes (0 = disabled)
 	checkInterval time.Duration
 
 	// Sensitive data detector (Spec 026)
@@ -49,20 +108,82 @@ type ActivityService struct {
 
 	// Event emitter for sensitive data detection events (Spec 026)
 	eventEmitter SensitiveDataEventEmitter
+
+	// Usage aggregate (Spec 069 A2): actor-owned rollup of tool-call activity.
+	// Mutated only on this goroutine via Apply; published to readers as an
+	// immutable snapshot. usagePersistIntervalNs is the hot-reloadable flush
+	// cadence in nanoseconds.
+	usage                  *UsageStore
+	usagePersistIntervalNs atomic.Int64
 }
 
 // NewActivityService creates a new activity service.
 func NewActivityService(storage *storage.Manager, logger *zap.Logger) *ActivityService {
-	return &ActivityService{
+	s := &ActivityService{
 		storage:       storage,
 		logger:        logger,
 		eventCh:       make(chan Event, 100), // Buffer for non-blocking event delivery
 		done:          make(chan struct{}),
 		maxAge:        DefaultRetentionMaxAge,
 		maxRecords:    DefaultRetentionMaxRecords,
+		maxSizeBytes:  DefaultRetentionMaxSizeBytes,
 		checkInterval: DefaultRetentionCheckInterval,
 		detector:      nil, // Detector is optional, set via SetDetector
+		usage:         newUsageStore(),
 	}
+	s.usagePersistIntervalNs.Store(int64(DefaultUsagePersistInterval))
+	return s
+}
+
+// SetSessionClientResolver wires the session -> MCP client lookup. Safe to leave
+// unset (records then carry no client name).
+func (s *ActivityService) SetSessionClientResolver(r SessionClientResolver) {
+	s.clientResolver = r
+}
+
+// SetWorkSessionResolver wires the session -> work-session lookup (Spec 082).
+func (s *ActivityService) SetWorkSessionResolver(r SessionWorkSessionResolver) {
+	s.workSessionResolver = r
+}
+
+// SetWorkSessionReaper wires the idle-work-session sweep into the retention loop.
+func (s *ActivityService) SetWorkSessionReaper(f func(time.Duration) int) {
+	s.workSessionReaper = f
+}
+
+// resolveWorkSession returns the work session a record belongs to, or "" when it
+// cannot be attributed (an unattributed record beats one filed under a bucket
+// that means nothing).
+func (s *ActivityService) resolveWorkSession(sessionID string) string {
+	if sessionID == "" || s.workSessionResolver == nil {
+		return ""
+	}
+	return s.workSessionResolver(sessionID)
+}
+
+// withClientInfo stamps client_name / client_version onto an activity record's
+// metadata, so the Activity Log can name the client that made the call long
+// after the session record itself has been evicted.
+//
+// Returns the metadata map to assign; it allocates one only when there is
+// something to add, so records for sessionless events stay exactly as they were.
+func (s *ActivityService) withClientInfo(metadata map[string]interface{}, sessionID string) map[string]interface{} {
+	if sessionID == "" || s.clientResolver == nil {
+		return metadata
+	}
+	name, version := s.clientResolver(sessionID)
+	if name == "" {
+		return metadata // unknown session (e.g. already closed) — nothing to add
+	}
+
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
+	metadata["client_name"] = name
+	if version != "" {
+		metadata["client_version"] = version
+	}
+	return metadata
 }
 
 // SetDetector sets the sensitive data detector for async scanning (Spec 026).
@@ -81,7 +202,7 @@ func (s *ActivityService) SetEventEmitter(emitter SensitiveDataEventEmitter) {
 // maxAge: maximum age for records (0 = no age limit)
 // maxRecords: maximum number of records (0 = no count limit)
 // checkInterval: how often to run retention cleanup
-func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, checkInterval time.Duration) {
+func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, checkInterval time.Duration, maxSizeBytes int64) {
 	if maxAge > 0 {
 		s.maxAge = maxAge
 	}
@@ -91,17 +212,59 @@ func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords in
 	if checkInterval > 0 {
 		s.checkInterval = checkInterval
 	}
+	// maxSizeBytes may be explicitly set to 0 to DISABLE the size cap, so a
+	// negative sentinel (-1) means "leave unchanged"; >= 0 is applied verbatim.
+	if maxSizeBytes >= 0 {
+		s.maxSizeBytes = maxSizeBytes
+	}
 }
 
 // Start begins listening for activity events and persisting them.
 // It should be called as a goroutine: go svc.Start(ctx, runtime)
 func (s *ActivityService) Start(ctx context.Context, rt *Runtime) {
+	// Registration runs entirely under startMu (Spec 080 FR-010, review round
+	// 5). If Stop already ran (fast shutdown beat this goroutine — production
+	// launches Start via `go`), the service is terminally stopped: return
+	// without subscribing or launching any BBolt-writing worker. Otherwise
+	// mark started so Stop knows the done channel WILL close, and refuse a
+	// second Start (the done/WaitGroup bookkeeping is single-shot). Holding
+	// startMu through every workersWG.Add below means a concurrent Stop
+	// blocks until registration is complete — its Wait cannot miss a worker.
+	s.startMu.Lock()
+	if s.stopped {
+		s.startMu.Unlock()
+		s.logger.Debug("Activity service Start called after Stop; not starting")
+		return
+	}
+	if s.started {
+		s.startMu.Unlock()
+		s.logger.Warn("Activity service Start called twice; ignoring")
+		return
+	}
+	s.started = true
+
 	// Subscribe to runtime events
 	eventCh := rt.SubscribeEvents()
-	defer rt.UnsubscribeEvents(eventCh)
 
-	// Start retention loop in a separate goroutine
-	go s.runRetentionLoop(ctx)
+	// Start retention loop in a separate goroutine. Tracked in workersWG: it
+	// prunes activity records (BBolt writes), so Stop must await it.
+	s.workersWG.Add(1)
+	go func() {
+		defer s.workersWG.Done()
+		s.runRetentionLoop(ctx)
+	}()
+
+	// Spec 069 A2: load/rebuild the usage aggregate before processing events,
+	// then start the periodic snapshot flush loop (tracked: it writes BBolt).
+	s.initUsageFromStorage()
+	s.workersWG.Add(1)
+	go func() {
+		defer s.workersWG.Done()
+		s.runUsageFlushLoop(ctx)
+	}()
+	s.startMu.Unlock()
+
+	defer rt.UnsubscribeEvents(eventCh)
 
 	s.logger.Info("Activity service started")
 
@@ -109,11 +272,14 @@ func (s *ActivityService) Start(ctx context.Context, rt *Runtime) {
 		select {
 		case <-ctx.Done():
 			s.logger.Info("Activity service shutting down")
+			// Flush-on-shutdown: persist the final usage snapshot (Spec 069 A2).
+			s.persistUsage()
 			close(s.done)
 			return
 		case evt, ok := <-eventCh:
 			if !ok {
 				s.logger.Info("Activity service event channel closed")
+				s.persistUsage()
 				close(s.done)
 				return
 			}
@@ -137,7 +303,24 @@ func (s *ActivityService) runRetentionLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.runRetentionCleanup()
+			s.reapWorkSessions()
 		}
+	}
+}
+
+// workSessionReapAfter is how long a work session may sit idle before the
+// tracker forgets it. Comfortably past the 30-minute idle window, so an entry is
+// only dropped once it can no longer be continued.
+const workSessionReapAfter = 4 * time.Hour
+
+// reapWorkSessions stops the tracker growing without bound on a long-lived
+// daemon: one map entry per distinct identity, forever, is a slow leak.
+func (s *ActivityService) reapWorkSessions() {
+	if s.workSessionReaper == nil {
+		return
+	}
+	if n := s.workSessionReaper(workSessionReapAfter); n > 0 {
+		s.logger.Debug("reaped idle work sessions", zap.Int("count", n))
 	}
 }
 
@@ -170,11 +353,53 @@ func (s *ActivityService) runRetentionCleanup() {
 				zap.Int("max_records", s.maxRecords))
 		}
 	}
+
+	// Prune by total size (runs after age+count; 0 disables). Bounds config.db
+	// growth from large per-record payloads that stay under the count/age caps.
+	if s.maxSizeBytes > 0 {
+		deleted, err := s.storage.PruneActivitiesToSize(s.maxSizeBytes)
+		if err != nil {
+			s.logger.Error("Failed to prune activities to size budget", zap.Error(err))
+		} else if deleted > 0 {
+			s.logger.Info("Pruned activity records to size budget",
+				zap.Int("deleted", deleted),
+				zap.Int64("max_size_mb", s.maxSizeBytes/(1024*1024)))
+		}
+	}
 }
 
-// Stop gracefully shuts down the activity service.
+// Stop gracefully shuts down the activity service, waiting for every BBolt
+// writer it owns to finish: the main event loop (including its final
+// flush-on-shutdown of the usage snapshot), the retention and usage-flush
+// loops, and any in-flight async detection goroutines (Spec 080 FR-010: no
+// activity write may land after Runtime.Close resolves the clean-shutdown
+// marker or closes the DB).
+//
+// Callers must cancel the context passed to Start FIRST — the final usage
+// flush runs on ctx.Done inside the event loop, and Stop waits for it, so the
+// flush is captured before the marker resolves. Idempotent, and returns
+// immediately when Start never ran.
+//
+// Stop is also terminal (Spec 080, review round 5): it marks stopped under
+// startMu, so a Start that has not yet registered (production starts the
+// service via `go` in lifecycle.go) becomes a no-op instead of launching
+// retention/usage/persist loops after the shutdown-marker path began. If
+// Start is mid-registration, acquiring startMu here blocks until every
+// workersWG.Add has happened, so the Wait below cannot miss a worker.
 func (s *ActivityService) Stop() {
+	s.startMu.Lock()
+	s.stopped = true
+	started := s.started
+	s.startMu.Unlock()
+	if !started {
+		return
+	}
+	// Main loop exit (closes done AFTER the shutdown flush). All workersWG.Add
+	// calls happen before done closes — the loop goroutines are registered at
+	// the top of Start and detection goroutines are only spawned from the event
+	// loop — so Wait below cannot race an Add.
 	<-s.done
+	s.workersWG.Wait()
 }
 
 // handleEvent processes an activity event and persists it to storage.
@@ -205,13 +430,10 @@ func (s *ActivityService) handleEvent(evt Event) {
 	// Spec 032: Tool-level quarantine events
 	case EventTypeActivityToolQuarantineChange:
 		s.handleToolQuarantineChange(evt)
-	// Spec 039: Security scan events
-	case EventTypeSecurityScanStarted:
-		s.handleSecurityScanStarted(evt)
-	case EventTypeSecurityScanCompleted:
-		s.handleSecurityScanCompleted(evt)
-	case EventTypeSecurityScanFailed:
-		s.handleSecurityScanFailed(evt)
+	// Spec 077 US4: one settled activity record per server per scan replaces the
+	// former per-scanner started/completed/failed storm (Spec 039).
+	case EventTypeSecurityScanSettled:
+		s.handleSecurityScanSettled(evt)
 	default:
 		// Ignore other event types
 	}
@@ -236,6 +458,14 @@ func (s *ActivityService) handleToolCallCompleted(evt Event) {
 	intent := getMapPayload(evt.Payload, "intent")
 	// Extract content trust metadata if present (Spec 035)
 	contentTrust := getStringPayload(evt.Payload, "content_trust")
+	// Spec 057 FR-011: profile slug for tool calls from a /mcp/p/<slug> URL.
+	profileSlug := getStringPayload(evt.Payload, "profile")
+	// Spec 084 FR-010: per-block TOON encoding decisions (nil when the feature
+	// did not run, so off-mode records carry no toon_output key).
+	toonOutput := getMapPayload(evt.Payload, "toon_output")
+	// Spec 084 FR-007b: pre-encoding detection scan input; empty means "scan
+	// response as before".
+	detectionText := getStringPayload(evt.Payload, "detection_text")
 	// Default source to "mcp" if not specified (backwards compatibility)
 	activitySource := storage.ActivitySourceMCP
 	if source != "" {
@@ -244,7 +474,7 @@ func (s *ActivityService) handleToolCallCompleted(evt Event) {
 
 	// Build metadata with intent information if present
 	var metadata map[string]interface{}
-	if toolVariant != "" || intent != nil || contentTrust != "" {
+	if toolVariant != "" || intent != nil || contentTrust != "" || profileSlug != "" || toonOutput != nil {
 		metadata = make(map[string]interface{})
 		if toolVariant != "" {
 			metadata["tool_variant"] = toolVariant
@@ -256,7 +486,22 @@ func (s *ActivityService) handleToolCallCompleted(evt Event) {
 		if contentTrust != "" {
 			metadata["content_trust"] = contentTrust
 		}
+		// Spec 057 FR-011: top-level profile slug (NOT nested under intent), so
+		// operators can correlate activity to the profile it came from.
+		if profileSlug != "" {
+			metadata["profile"] = profileSlug
+		}
+		// Spec 084 FR-010: the per-text-block encoding decision record.
+		if toonOutput != nil {
+			metadata["toon_output"] = toonOutput
+		}
 	}
+	// Name the MCP client on the record itself, so it survives session eviction.
+	metadata = s.withClientInfo(metadata, sessionID)
+
+	// Spec 069 A1: byte sizes measured pre-truncation by the emitter.
+	requestBytes := int(getInt64Payload(evt.Payload, "request_bytes"))
+	responseBytes := int(getInt64Payload(evt.Payload, "response_bytes"))
 
 	record := &storage.ActivityRecord{
 		Type:              storage.ActivityTypeToolCall,
@@ -271,11 +516,14 @@ func (s *ActivityService) handleToolCallCompleted(evt Event) {
 		DurationMs:        durationMs,
 		Timestamp:         evt.Timestamp,
 		SessionID:         sessionID,
+		WorkSessionID:     s.resolveWorkSession(sessionID),
 		RequestID:         requestID,
 		Metadata:          metadata,
+		RequestBytes:      requestBytes,
+		ResponseBytes:     responseBytes,
 	}
 
-	// Extract user identity from auth metadata injected into arguments (teams edition)
+	// Extract user identity from auth metadata injected into arguments (server edition)
 	if arguments != nil {
 		if userID, ok := arguments["_auth_user_id"].(string); ok && userID != "" {
 			record.UserID = userID
@@ -297,9 +545,30 @@ func (s *ActivityService) handleToolCallCompleted(evt Event) {
 			zap.String("tool_name", toolName),
 			zap.String("status", status))
 
-		// Run async sensitive data detection (Spec 026)
+		// Fold the persisted call into the usage aggregate (Spec 069 A2). Done
+		// only on save success so the in-memory rollup stays consistent with a
+		// cold-start rebuild that re-scans persisted records.
+		if s.usage != nil {
+			s.usage.Apply(record)
+		}
+
+		// Run async sensitive data detection (Spec 026). Tracked in workersWG:
+		// it updates the record's metadata in BBolt, so Stop must await it.
+		// Spec 084 FR-007b: when the TOON seam supplied a pre-encoding
+		// detection_text, scan THAT instead of the (possibly TOON-encoded)
+		// agent-facing response — finding parity with the feature off. Empty
+		// detection_text (feature off, non-call_tool_* paths) keeps today's
+		// behavior byte-for-byte.
 		if s.detector != nil {
-			go s.runAsyncDetection(record.ID, arguments, response)
+			scanText := response
+			if detectionText != "" {
+				scanText = detectionText
+			}
+			s.workersWG.Add(1)
+			go func() {
+				defer s.workersWG.Done()
+				s.runAsyncDetection(record.ID, arguments, scanText)
+			}()
 		}
 	}
 }
@@ -317,12 +586,13 @@ func (s *ActivityService) handlePolicyDecision(evt Event) {
 		ServerName: serverName,
 		ToolName:   toolName,
 		Status:     decision,
-		Metadata: map[string]interface{}{
+		Metadata: s.withClientInfo(map[string]interface{}{
 			"decision": decision,
 			"reason":   reason,
-		},
-		Timestamp: evt.Timestamp,
-		SessionID: sessionID,
+		}, sessionID),
+		Timestamp:     evt.Timestamp,
+		SessionID:     sessionID,
+		WorkSessionID: s.resolveWorkSession(sessionID),
 	}
 
 	if err := s.storage.SaveActivity(record); err != nil {
@@ -330,6 +600,15 @@ func (s *ActivityService) handlePolicyDecision(evt Event) {
 			zap.Error(err),
 			zap.String("server_name", serverName),
 			zap.String("decision", decision))
+		return
+	}
+
+	// Fold blocked attempts into the usage aggregate (Spec 069 A2). Apply
+	// ignores non-blocked decisions, so passing every policy decision is safe.
+	// Done only on save success so the in-memory rollup stays consistent with a
+	// cold-start rebuild that re-scans persisted records.
+	if s.usage != nil {
+		s.usage.Apply(record)
 	}
 }
 
@@ -482,24 +761,29 @@ func (s *ActivityService) handleInternalToolCall(evt Event) {
 	if contentTrust != "" {
 		metadata["content_trust"] = contentTrust
 	}
+	// Name the MCP client on the record itself, so it survives session eviction.
+	// retrieve_tools calls arrive here, and they are the bulk of session-bearing
+	// activity — without this they would be the rows left showing a bare id.
+	metadata = s.withClientInfo(metadata, sessionID)
 
 	record := &storage.ActivityRecord{
-		Type:         storage.ActivityTypeInternalToolCall,
-		Source:       storage.ActivitySourceMCP,
-		ToolName:     internalToolName,
-		ServerName:   targetServer,
-		Arguments:    arguments,
-		Response:     responseStr,
-		Status:       status,
-		ErrorMessage: errorMsg,
-		DurationMs:   durationMs,
-		Metadata:     metadata,
-		Timestamp:    evt.Timestamp,
-		SessionID:    sessionID,
-		RequestID:    requestID,
+		Type:          storage.ActivityTypeInternalToolCall,
+		Source:        storage.ActivitySourceMCP,
+		ToolName:      internalToolName,
+		ServerName:    targetServer,
+		Arguments:     arguments,
+		Response:      responseStr,
+		Status:        status,
+		ErrorMessage:  errorMsg,
+		DurationMs:    durationMs,
+		Metadata:      metadata,
+		Timestamp:     evt.Timestamp,
+		SessionID:     sessionID,
+		WorkSessionID: s.resolveWorkSession(sessionID),
+		RequestID:     requestID,
 	}
 
-	// Extract user identity from auth metadata injected into arguments (teams edition)
+	// Extract user identity from auth metadata injected into arguments (server edition)
 	if arguments != nil {
 		if userID, ok := arguments["_auth_user_id"].(string); ok && userID != "" {
 			record.UserID = userID
@@ -785,82 +1069,39 @@ func (s *ActivityService) handleToolQuarantineChange(evt Event) {
 }
 
 // handleSecurityScanStarted records a security scan start event (Spec 039).
-func (s *ActivityService) handleSecurityScanStarted(evt Event) {
+// handleSecurityScanSettled records the single settled scan result per server
+// per scan (Spec 077 US4, MCP-2207). It replaces the former started/completed/
+// failed handlers so the activity log carries one entry per scan instead of a
+// per-scanner storm.
+func (s *ActivityService) handleSecurityScanSettled(evt Event) {
 	serverName := getStringPayload(evt.Payload, "server_name")
-	jobID := getStringPayload(evt.Payload, "job_id")
-
-	metadata := map[string]interface{}{
-		"job_id": jobID,
-	}
-	if scanners := evt.Payload["scanners"]; scanners != nil {
-		metadata["scanners"] = scanners
-	}
-
-	record := &storage.ActivityRecord{
-		Type:       storage.ActivityTypeSecurityScan,
-		Source:     storage.ActivitySourceInternal,
-		ServerName: serverName,
-		ToolName:   "security_scan",
-		Status:     "started",
-		Timestamp:  evt.Timestamp,
-		Metadata:   metadata,
-	}
-
-	if err := s.storage.SaveActivity(record); err != nil {
-		s.logger.Error("Failed to save security scan started activity",
-			zap.String("server", serverName),
-			zap.Error(err))
-	}
-}
-
-// handleSecurityScanCompleted records a security scan completion event (Spec 039).
-func (s *ActivityService) handleSecurityScanCompleted(evt Event) {
-	serverName := getStringPayload(evt.Payload, "server_name")
+	scanStatus := getStringPayload(evt.Payload, "status")
+	errMsg := getStringPayload(evt.Payload, "error")
 
 	metadata := map[string]interface{}{}
 	if findingsSummary := getMapPayload(evt.Payload, "findings_summary"); findingsSummary != nil {
 		metadata["findings_summary"] = findingsSummary
 	}
-	if jobID := getStringPayload(evt.Payload, "job_id"); jobID != "" {
-		metadata["job_id"] = jobID
-	}
 
-	record := &storage.ActivityRecord{
-		Type:       storage.ActivityTypeSecurityScan,
-		Source:     storage.ActivitySourceInternal,
-		ServerName: serverName,
-		ToolName:   "security_scan",
-		Status:     "success",
-		Timestamp:  evt.Timestamp,
-		Metadata:   metadata,
+	// Map the scan's terminal state onto the activity record status.
+	status := "success"
+	if scanStatus == "failed" {
+		status = "error"
 	}
-
-	if err := s.storage.SaveActivity(record); err != nil {
-		s.logger.Error("Failed to save security scan completed activity",
-			zap.String("server", serverName),
-			zap.Error(err))
-	}
-}
-
-// handleSecurityScanFailed records a security scan failure event (Spec 039).
-func (s *ActivityService) handleSecurityScanFailed(evt Event) {
-	serverName := getStringPayload(evt.Payload, "server_name")
-	scannerID := getStringPayload(evt.Payload, "scanner_id")
-	errMsg := getStringPayload(evt.Payload, "error")
 
 	record := &storage.ActivityRecord{
 		Type:         storage.ActivityTypeSecurityScan,
 		Source:       storage.ActivitySourceInternal,
 		ServerName:   serverName,
 		ToolName:     "security_scan",
-		Status:       "error",
+		Status:       status,
 		ErrorMessage: errMsg,
 		Timestamp:    evt.Timestamp,
-		Metadata:     map[string]interface{}{"scanner_id": scannerID},
+		Metadata:     metadata,
 	}
 
 	if err := s.storage.SaveActivity(record); err != nil {
-		s.logger.Error("Failed to save security scan failed activity",
+		s.logger.Error("Failed to save settled security scan activity",
 			zap.String("server", serverName),
 			zap.Error(err))
 	}

@@ -7,156 +7,79 @@ import (
 	"strings"
 
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
-	"github.com/blevesearch/bleve/v2/analysis/lang/en"
-	"github.com/blevesearch/bleve/v2/analysis/lang/ru"
-	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
-	"github.com/blevesearch/bleve/v2/analysis/tokenizer/unicode"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
 
-// enruAnalyzerName is the custom analyzer chained as
-//   unicode tokenizer → lowercase → stop_en → stop_ru → stemmer_en → stemmer_ru.
-// Applied to all text fields that may contain Russian or English content
-// (description, aliases, searchable_text, tags). This fixes BM25 ranking on
-// inflected Russian queries — "лицензий" and "лицензии" reduce to the same
-// stem and now match. English words pass through Porter/Snowball stemming
-// (-s, -ed, -ing) which keeps EN matching at parity with the previous
-// standard analyzer for typical tool descriptions.
-const enruAnalyzerName = "enru"
-
-// bleveMappingVersion identifies the current field-mapping schema. Bumped
-// when analyzers or field types change — older indexes are detected via the
-// version marker file and rebuilt from scratch on next startup. Version 1 =
-// pre-enru (standard analyzer on text fields). Version 2 = enru analyzer.
-const bleveMappingVersion = 2
-
-// mappingVersionFile is the sentinel written next to the bleve directory.
-// We deliberately do NOT put it inside index.bleve/ so wiping the index
-// directory does not also drop the marker (we want the marker to survive
-// only as long as the index it describes).
-const mappingVersionFile = "index.bleve.mapping_version"
+// defaultSearchPageSize is the page size used when paginating full-coverage
+// scans (GetToolsByServer, DeleteAll). It is a generous upper bound on the
+// number of docs in a single page; pagination loops over as many pages as
+// needed, so total coverage is never bounded by this value (MCP-3319).
+const defaultSearchPageSize = 10000
 
 // BleveIndex wraps Bleve index operations
 type BleveIndex struct {
 	index  bleve.Index
 	logger *zap.Logger
+	// searchPageSize bounds a single search page during paginated full scans.
+	// Defaults to defaultSearchPageSize; overridable in tests.
+	searchPageSize int
 }
 
 // ToolDocument represents a tool document in the index
 type ToolDocument struct {
-	ToolName       string `json:"tool_name"`      // Just the tool name (without server prefix)
-	FullToolName   string `json:"full_tool_name"` // Complete server:tool format
-	ServerName     string `json:"server_name"`
-	Description    string `json:"description"`
-	ParamsJSON     string `json:"params_json"`
-	Hash           string `json:"hash"`
-	Tags           string `json:"tags"`
-	// Aliases collects keywords from per-server SearchAliases, per-tool
-	// ToolAliases, DomainTags, and LLM enrichment (keywords +
-	// example_queries). Indexed with boost=3 via SearchTools so a match
-	// here outranks a match in Description. Stored so we can return it
-	// to debug consumers; empty when no aliases are configured.
-	Aliases        string `json:"aliases,omitempty"`
-	SearchableText string `json:"searchable_text"` // Combined searchable content
+	ToolName         string `json:"tool_name"`      // Just the tool name (without server prefix)
+	FullToolName     string `json:"full_tool_name"` // Complete server:tool format
+	ServerName       string `json:"server_name"`
+	Description      string `json:"description"`
+	ParamsJSON       string `json:"params_json"`
+	OutputSchemaJSON string `json:"output_schema_json,omitempty"`
+	Hash             string `json:"hash"`
+	Tags             string `json:"tags"`
+	SearchableText   string `json:"searchable_text"` // Combined searchable content
 }
 
-// NewBleveIndex creates a new Bleve index, rebuilding it from scratch when the
-// stored mapping version does not match bleveMappingVersion. Rebuilds are safe:
-// upstream tools are re-indexed automatically by the runtime on startup, so
-// dropping the directory only costs a few seconds of cold-start latency.
+// NewBleveIndex creates (or opens) the shared default Bleve index at
+// <dataDir>/index.bleve.
 func NewBleveIndex(dataDir string, logger *zap.Logger) (*BleveIndex, error) {
-	indexPath := filepath.Join(dataDir, "index.bleve")
-	versionPath := filepath.Join(dataDir, mappingVersionFile)
+	return newBleveIndexAt(filepath.Join(dataDir, "index.bleve"), logger)
+}
 
-	// If an index already exists, check whether its mapping version matches.
-	// A mismatch (or a missing marker on an existing index) means the schema
-	// changed since this index was built — drop it so we can recreate with
-	// the current mapping.
-	if _, err := os.Stat(indexPath); err == nil {
-		storedVersion, vErr := readMappingVersion(versionPath)
-		if vErr != nil || storedVersion != bleveMappingVersion {
-			logger.Info("Bleve mapping version mismatch — rebuilding index",
-				zap.Int("stored_version", storedVersion),
-				zap.Int("expected_version", bleveMappingVersion),
-				zap.String("path", indexPath),
-				zap.NamedError("marker_error", vErr),
-			)
-			if rmErr := os.RemoveAll(indexPath); rmErr != nil {
-				return nil, fmt.Errorf("failed to remove stale bleve index for migration: %w", rmErr)
-			}
-			// Also drop any stale marker so the rebuild path below writes a fresh one.
-			_ = os.Remove(versionPath)
-		}
-	}
-
+// newBleveIndexAt opens an existing Bleve index at indexPath, or creates one if
+// it does not yet exist. The parent directory is created as needed so callers
+// may nest a per-profile index under the shared index dir
+// (<dataDir>/index.bleve/<slug>/) without pre-creating it.
+func newBleveIndexAt(indexPath string, logger *zap.Logger) (*BleveIndex, error) {
 	// Try to open existing index
 	index, err := bleve.Open(indexPath)
 	if err != nil {
 		// If index doesn't exist, create a new one
+		if mkErr := os.MkdirAll(filepath.Dir(indexPath), 0o755); mkErr != nil {
+			return nil, fmt.Errorf("failed to create index parent dir: %w", mkErr)
+		}
 		logger.Info("Creating new Bleve index", zap.String("path", indexPath))
 		index, err = createBleveIndex(indexPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Bleve index: %w", err)
-		}
-		if wErr := writeMappingVersion(versionPath, bleveMappingVersion); wErr != nil {
-			// Non-fatal: index is usable. We'll just rebuild again on next start.
-			logger.Warn("Failed to write bleve mapping version marker — index will rebuild next start",
-				zap.String("path", versionPath), zap.Error(wErr))
 		}
 	} else {
 		logger.Info("Opened existing Bleve index", zap.String("path", indexPath))
 	}
 
 	return &BleveIndex{
-		index:  index,
-		logger: logger,
+		index:          index,
+		logger:         logger,
+		searchPageSize: defaultSearchPageSize,
 	}, nil
-}
-
-// readMappingVersion returns the integer version stored in the marker file,
-// or (0, error) when the file is missing or unparseable. We treat any error
-// as "unknown version" → triggers a rebuild, which is the safe default.
-func readMappingVersion(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	var version int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &version); err != nil {
-		return 0, fmt.Errorf("parse mapping version: %w", err)
-	}
-	return version, nil
-}
-
-func writeMappingVersion(path string, version int) error {
-	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", version)), 0o644)
 }
 
 // createBleveIndex creates a new Bleve index with proper mapping
 func createBleveIndex(indexPath string) (bleve.Index, error) {
 	// Create index mapping
 	indexMapping := bleve.NewIndexMapping()
-
-	// Register the bilingual analyzer BEFORE field mappings reference it,
-	// otherwise AddFieldMappingsAt → ValidateCustomAnalyzer would not find it.
-	if err := indexMapping.AddCustomAnalyzer(enruAnalyzerName, map[string]interface{}{
-		"type":      custom.Name,
-		"tokenizer": unicode.Name,
-		"token_filters": []string{
-			lowercase.Name,
-			en.StopName,
-			ru.StopName,
-			en.SnowballStemmerName,
-			ru.SnowballStemmerName,
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("register enru analyzer: %w", err)
-	}
 
 	// Create document mapping for tools
 	toolMapping := bleve.NewDocumentMapping()
@@ -182,16 +105,14 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	serverNameField.Index = true
 	toolMapping.AddFieldMappingsAt("server_name", serverNameField)
 
-	// Description field — bilingual analyzer for full-text search across EN/RU.
+	// Description field (standard analyzer for full-text search)
 	descriptionField := bleve.NewTextFieldMapping()
-	descriptionField.Analyzer = enruAnalyzerName
+	descriptionField.Analyzer = standard.Name
 	descriptionField.Store = true
 	descriptionField.Index = true
 	toolMapping.AddFieldMappingsAt("description", descriptionField)
 
-	// Parameters JSON field — kept on standard analyzer. These are API
-	// parameter names ("limit", "offset", etc.), always ASCII, and stemming
-	// could distort them into less-useful tokens.
+	// Parameters JSON field (standard analyzer)
 	paramsField := bleve.NewTextFieldMapping()
 	paramsField.Analyzer = standard.Name
 	paramsField.Store = true
@@ -205,28 +126,16 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	hashField.Index = false // Don't index hash for search
 	toolMapping.AddFieldMappingsAt("hash", hashField)
 
-	// Tags field — bilingual analyzer (operators may put russian domain tags).
+	// Tags field (standard analyzer)
 	tagsField := bleve.NewTextFieldMapping()
-	tagsField.Analyzer = enruAnalyzerName
+	tagsField.Analyzer = standard.Name
 	tagsField.Store = true
 	tagsField.Index = true
 	toolMapping.AddFieldMappingsAt("tags", tagsField)
 
-	// Aliases field — user-configured search aliases and LLM-enriched
-	// keywords/example_queries. Bilingual analyzer so RU aliases match
-	// inflected user queries ("лицензий" → "лицензи" matches "лицензии").
-	// Boost is applied at query time (see SearchTools), not here.
-	aliasesField := bleve.NewTextFieldMapping()
-	aliasesField.Analyzer = enruAnalyzerName
-	aliasesField.Store = true
-	aliasesField.Index = true
-	toolMapping.AddFieldMappingsAt("aliases", aliasesField)
-
-	// Searchable text field — bilingual analyzer. Combines tool name,
-	// description, params and aliases, so the analyzer choice must match
-	// what is used for the more specific fields.
+	// Searchable text field (standard analyzer) - combines all searchable content
 	searchableTextField := bleve.NewTextFieldMapping()
-	searchableTextField.Analyzer = enruAnalyzerName
+	searchableTextField.Analyzer = standard.Name
 	searchableTextField.Store = false // Don't store, just index for search
 	searchableTextField.Index = true
 	toolMapping.AddFieldMappingsAt("searchable_text", searchableTextField)
@@ -244,18 +153,8 @@ func (b *BleveIndex) Close() error {
 	return b.index.Close()
 }
 
-// IndexTool indexes a tool document with no aliases. Prefer
-// IndexToolWithAliases when the caller has per-server / per-tool aliases
-// (spec 2026-04-17). Kept for backward compatibility with existing callers.
+// IndexTool indexes a tool document
 func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
-	return b.IndexToolWithAliases(toolMeta, "")
-}
-
-// IndexToolWithAliases indexes a tool document, attaching the supplied
-// aliases string. Aliases are space-separated keywords merged from
-// ServerConfig.SearchAliases, ServerConfig.ToolAliases[<tool>], and any
-// LLM enrichment cached for this tool.
-func (b *BleveIndex) IndexToolWithAliases(toolMeta *config.ToolMetadata, aliases string) error {
 	// Extract just the tool name (remove server prefix)
 	toolName := toolMeta.Name
 	if parts := strings.SplitN(toolMeta.Name, ":", 2); len(parts) == 2 {
@@ -263,23 +162,22 @@ func (b *BleveIndex) IndexToolWithAliases(toolMeta *config.ToolMetadata, aliases
 	}
 
 	// Create combined searchable text for better full-text search
-	searchableText := fmt.Sprintf("%s %s %s %s %s",
+	searchableText := fmt.Sprintf("%s %s %s %s",
 		toolName,
 		toolMeta.Name,
 		toolMeta.Description,
-		toolMeta.ParamsJSON,
-		aliases)
+		toolMeta.ParamsJSON)
 
 	doc := &ToolDocument{
-		ToolName:       toolName,
-		FullToolName:   toolMeta.Name,
-		ServerName:     toolMeta.ServerName,
-		Description:    toolMeta.Description,
-		ParamsJSON:     toolMeta.ParamsJSON,
-		Hash:           toolMeta.Hash,
-		Tags:           "",
-		Aliases:        aliases,
-		SearchableText: searchableText,
+		ToolName:         toolName,
+		FullToolName:     toolMeta.Name,
+		ServerName:       toolMeta.ServerName,
+		Description:      toolMeta.Description,
+		ParamsJSON:       toolMeta.ParamsJSON,
+		OutputSchemaJSON: toolMeta.OutputSchemaJSON,
+		Hash:             toolMeta.Hash,
+		Tags:             "", // Can be extended later
+		SearchableText:   searchableText,
 	}
 
 	// Use server:tool format as document ID for uniqueness
@@ -371,19 +269,20 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 	searchableTextQuery.SetBoost(1.5)
 	boolQuery.AddShould(searchableTextQuery)
 
-	// 7. Aliases — user-configured search keywords (incl. cross-language)
-	// and LLM-enriched synonyms/example_queries. Boost higher than plain
-	// description so an alias hit wins over coincidental description hits.
-	aliasesQuery := bleve.NewMatchQuery(queryStr)
-	aliasesQuery.SetField("aliases")
-	aliasesQuery.SetBoost(3.0)
-	boolQuery.AddShould(aliasesQuery)
-
 	// Create search request
 	searchReq := bleve.NewSearchRequest(boolQuery)
 	searchReq.Size = limit
-	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash", "aliases"}
+	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "hash"}
 	searchReq.Highlight = bleve.NewHighlight()
+
+	// Deterministic tie-break: primary sort by score descending (bleve's
+	// default), secondary by document ID (server:tool) ascending. Without the
+	// secondary key, equally-scored hits come back in bleve's internal order,
+	// which varies between otherwise-identical searches (Spec 085 SC-002:
+	// full/compact ranked-ID identity, and the golden byte-identity fixtures).
+	// SortBy is applied before truncating to Size, so it also stabilizes which
+	// tied hits survive the limit boundary.
+	searchReq.SortBy([]string{"-_score", "_id"})
 
 	b.logger.Debug("Searching tools with enhanced query", zap.String("query", queryStr), zap.Int("limit", limit))
 
@@ -396,11 +295,12 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 	var results []*config.SearchResult
 	for _, hit := range searchResult.Hits {
 		toolMeta := &config.ToolMetadata{
-			Name:        getStringField(hit.Fields, "full_tool_name"),
-			ServerName:  getStringField(hit.Fields, "server_name"),
-			Description: getStringField(hit.Fields, "description"),
-			ParamsJSON:  getStringField(hit.Fields, "params_json"),
-			Hash:        getStringField(hit.Fields, "hash"),
+			Name:             getStringField(hit.Fields, "full_tool_name"),
+			ServerName:       getStringField(hit.Fields, "server_name"),
+			Description:      getStringField(hit.Fields, "description"),
+			ParamsJSON:       getStringField(hit.Fields, "params_json"),
+			OutputSchemaJSON: getStringField(hit.Fields, "output_schema_json"),
+			Hash:             getStringField(hit.Fields, "hash"),
 		}
 
 		results = append(results, &config.SearchResult{
@@ -418,18 +318,40 @@ func (b *BleveIndex) GetDocumentCount() (uint64, error) {
 	return b.index.DocCount()
 }
 
-// Batch operations for efficiency
+// DeleteAll removes every document from the index, leaving an empty index in
+// place. Used to rebuild a per-profile index from scratch without recreating
+// its on-disk directory.
+func (b *BleveIndex) DeleteAll() error {
+	query := bleve.NewMatchAllQuery()
+	// Delete in pages until the index is empty. Each iteration enumerates a
+	// page from offset 0 and deletes exactly those docs, so the next search
+	// surfaces the following page — no From offset bookkeeping, and coverage is
+	// not bounded by a single search page (MCP-3319).
+	for {
+		searchReq := bleve.NewSearchRequest(query)
+		searchReq.Size = b.searchPageSize
+		searchResult, err := b.index.Search(searchReq)
+		if err != nil {
+			return fmt.Errorf("failed to enumerate documents for delete-all: %w", err)
+		}
+		if len(searchResult.Hits) == 0 {
+			return nil
+		}
 
-// BatchIndex indexes multiple tools in a single batch with no aliases.
-// Kept for backward compatibility; prefer BatchIndexWithAliases.
-func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
-	return b.BatchIndexWithAliases(tools, nil)
+		batch := b.index.NewBatch()
+		for _, hit := range searchResult.Hits {
+			batch.Delete(hit.ID)
+		}
+		if err := b.index.Batch(batch); err != nil {
+			return fmt.Errorf("failed to delete documents for delete-all: %w", err)
+		}
+	}
 }
 
-// BatchIndexWithAliases indexes multiple tools in a single batch, looking
-// up each tool's aliases in aliasesByFullName (key = "<server>:<tool>").
-// Pass nil or an empty map to index without aliases.
-func (b *BleveIndex) BatchIndexWithAliases(tools []*config.ToolMetadata, aliasesByFullName map[string]string) error {
+// Batch operations for efficiency
+
+// BatchIndex indexes multiple tools in a single batch
+func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
 	batch := b.index.NewBatch()
 
 	for _, toolMeta := range tools {
@@ -439,29 +361,23 @@ func (b *BleveIndex) BatchIndexWithAliases(tools []*config.ToolMetadata, aliases
 			toolName = parts[1]
 		}
 
-		aliases := ""
-		if aliasesByFullName != nil {
-			aliases = aliasesByFullName[toolMeta.Name]
-		}
-
 		// Create combined searchable text
-		searchableText := fmt.Sprintf("%s %s %s %s %s",
+		searchableText := fmt.Sprintf("%s %s %s %s",
 			toolName,
 			toolMeta.Name,
 			toolMeta.Description,
-			toolMeta.ParamsJSON,
-			aliases)
+			toolMeta.ParamsJSON)
 
 		doc := &ToolDocument{
-			ToolName:       toolName,
-			FullToolName:   toolMeta.Name,
-			ServerName:     toolMeta.ServerName,
-			Description:    toolMeta.Description,
-			ParamsJSON:     toolMeta.ParamsJSON,
-			Hash:           toolMeta.Hash,
-			Tags:           "",
-			Aliases:        aliases,
-			SearchableText: searchableText,
+			ToolName:         toolName,
+			FullToolName:     toolMeta.Name,
+			ServerName:       toolMeta.ServerName,
+			Description:      toolMeta.Description,
+			ParamsJSON:       toolMeta.ParamsJSON,
+			OutputSchemaJSON: toolMeta.OutputSchemaJSON,
+			Hash:             toolMeta.Hash,
+			Tags:             "",
+			SearchableText:   searchableText,
 		}
 
 		docID := fmt.Sprintf("%s:%s", toolMeta.ServerName, toolName)
@@ -493,29 +409,40 @@ func (b *BleveIndex) GetToolsByServer(serverName string) ([]*config.ToolMetadata
 	query := bleve.NewTermQuery(serverName)
 	query.SetField("server_name")
 
-	// Create search request with high limit to get all tools
-	searchReq := bleve.NewSearchRequest(query)
-	searchReq.Size = 10000 // Maximum tools per server
-	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash"}
+	fields := []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "hash"}
 
 	b.logger.Debug("Querying tools by server", zap.String("server", serverName))
 
-	searchResult, err := b.index.Search(searchReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tools by server: %w", err)
-	}
-
-	// Convert results to ToolMetadata
+	// Paginate so a server exposing more than one search page of tools is fully
+	// covered — a single capped search would silently drop the overflow
+	// (MCP-3319). A short final page (fewer hits than the page size) ends the loop.
 	var tools []*config.ToolMetadata
-	for _, hit := range searchResult.Hits {
-		toolMeta := &config.ToolMetadata{
-			Name:        getStringField(hit.Fields, "full_tool_name"),
-			ServerName:  getStringField(hit.Fields, "server_name"),
-			Description: getStringField(hit.Fields, "description"),
-			ParamsJSON:  getStringField(hit.Fields, "params_json"),
-			Hash:        getStringField(hit.Fields, "hash"),
+	for from := 0; ; from += b.searchPageSize {
+		searchReq := bleve.NewSearchRequest(query)
+		searchReq.From = from
+		searchReq.Size = b.searchPageSize
+		searchReq.Fields = fields
+
+		searchResult, err := b.index.Search(searchReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query tools by server: %w", err)
 		}
-		tools = append(tools, toolMeta)
+
+		for _, hit := range searchResult.Hits {
+			toolMeta := &config.ToolMetadata{
+				Name:             getStringField(hit.Fields, "full_tool_name"),
+				ServerName:       getStringField(hit.Fields, "server_name"),
+				Description:      getStringField(hit.Fields, "description"),
+				ParamsJSON:       getStringField(hit.Fields, "params_json"),
+				OutputSchemaJSON: getStringField(hit.Fields, "output_schema_json"),
+				Hash:             getStringField(hit.Fields, "hash"),
+			}
+			tools = append(tools, toolMeta)
+		}
+
+		if len(searchResult.Hits) < b.searchPageSize {
+			break
+		}
 	}
 
 	b.logger.Debug("Found tools for server",

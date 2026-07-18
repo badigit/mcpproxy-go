@@ -1,4 +1,4 @@
-import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RepositoryServer, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo, ConnectStatusResponse, ConnectResult } from '@/types'
+import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RegistrySummary, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo, ConnectStatusResponse, ClientStatus, ConnectResult, ConnectPreview, OnboardingStateResponse, OnboardingMarkRequest, DiagnosticFixResponse, GlobalToolsResponse, UsageAggregateResponse, UsageWindow, UsageSort, UsageStatus, ListProfilesResponse, ActiveProfileResponse } from '@/types'
 
 // Event types for API service
 export interface APIAuthEvent {
@@ -8,6 +8,41 @@ export interface APIAuthEvent {
 }
 
 type APIEventListener = (event: APIAuthEvent) => void
+
+// Spec 070: result of the reference-based add-from-registry flow. Unlike the
+// generic request() helper (which collapses errors to a single message), this
+// carries the stable cross-surface error `code` and the missing-input names so
+// the Web UI can drive the required-input prompt without re-parsing strings.
+export interface AddedServerSummary {
+  name: string
+  protocol?: string
+  command?: string
+  args?: string[]
+  url?: string
+  quarantined?: boolean
+}
+
+export interface AddFromRegistryResult {
+  success: boolean
+  server?: AddedServerSummary
+  error?: string
+  // Stable cross-surface code: missing_required_input | no_install_info |
+  // duplicate_name | registry_not_found | server_not_found
+  code?: string
+  // Names of unmet required inputs; present when code === 'missing_required_input'.
+  missingInputs?: string[]
+}
+
+// MCP-866 / MCP-867: result of adding a *registry source* (POST /registries).
+// Carries the stable error `code` (invalid_registry_url | registries_locked |
+// registry_shadows_builtin | duplicate_registry) so the UI can render an
+// actionable message instead of a generic string.
+export interface AddRegistrySourceResult {
+  success: boolean
+  registry?: RegistrySummary
+  error?: string
+  code?: string
+}
 
 class APIService {
   private baseUrl = ''
@@ -211,13 +246,36 @@ class APIService {
   }
 
   // Status endpoint
-  async getStatus(): Promise<APIResponse<{ edition: string; running: boolean; routing_mode: string }>> {
-    return this.request<{ edition: string; running: boolean; routing_mode: string }>('/api/v1/status')
+  // `default_instructions` is the resolved built-in MCP instructions default
+  // (MCP-2175) — present once the backend exposes it; optional so the Web UI
+  // degrades gracefully against older cores.
+  async getStatus(): Promise<APIResponse<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string }>> {
+    return this.request<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string }>('/api/v1/status')
   }
 
   // Routing mode endpoint
   async getRouting(): Promise<APIResponse<RoutingInfo>> {
     return this.request<RoutingInfo>('/api/v1/routing')
+  }
+
+  // Profiles v2 (MCP-3243 / T4) — consume the REST surface from MCP-3241.
+  // List configured profiles with their effective servers + indexed tool count.
+  async getProfiles(): Promise<APIResponse<ListProfilesResponse>> {
+    return this.request<ListProfilesResponse>('/api/v1/profiles')
+  }
+
+  // Read the server-level default active profile (empty string = all servers).
+  async getActiveProfile(): Promise<APIResponse<ActiveProfileResponse>> {
+    return this.request<ActiveProfileResponse>('/api/v1/profiles/active')
+  }
+
+  // Set the server-level default active profile. Pass an empty string to clear
+  // (back to all servers); a non-empty slug must match a configured profile.
+  async setActiveProfile(profile: string): Promise<APIResponse<ActiveProfileResponse>> {
+    return this.request<ActiveProfileResponse>('/api/v1/profiles/active', {
+      method: 'PUT',
+      body: JSON.stringify({ profile }),
+    })
   }
 
   // Server endpoints
@@ -280,13 +338,76 @@ class APIService {
     })
   }
 
+  // patchServer issues a partial update to an existing upstream server. The
+  // backend (handlePatchServer in internal/httpapi/server.go) treats every
+  // request field as optional and preserves anything not supplied, so callers
+  // can send only what they want to change. Passing `headers: {}` clears
+  // headers; omitting the field keeps the existing value.
+  async patchServer(serverName: string, patch: Record<string, unknown>): Promise<APIResponse> {
+    return this.request(`/api/v1/servers/${encodeURIComponent(serverName)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    })
+  }
+
+  // storeSecret stashes a value in the OS keyring under the given name and
+  // returns the ${keyring:<name>} reference string callers can substitute
+  // back into the server config. Kept for legacy callers; the
+  // Headers/Environment Variables "Convert to secret" flow now uses the
+  // atomic convertConfigToSecret() instead.
+  async storeSecret(name: string, value: string): Promise<APIResponse<{ reference?: string }>> {
+    return this.request<{ reference?: string }>('/api/v1/secrets', {
+      method: 'POST',
+      body: JSON.stringify({ name, value, type: 'keyring' }),
+    })
+  }
+
+  // convertConfigToSecret asks the backend to atomically (a) read the real
+  // value of a header / env key from the server config, (b) store it in
+  // the OS keyring under `secretName`, and (c) rewrite the config field
+  // with the `${keyring:<name>}` reference. The client never has to
+  // possess the real value — which matters when the API redacts
+  // sensitive header values on the read path.
+  async convertConfigToSecret(
+    serverName: string,
+    scope: 'header' | 'env',
+    key: string,
+    secretName: string
+  ): Promise<APIResponse<{ reference?: string }>> {
+    return this.request<{ reference?: string }>(
+      `/api/v1/servers/${encodeURIComponent(serverName)}/config-to-secret`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ scope, key, secret_name: secretName }),
+      }
+    )
+  }
+
   async getServerTools(serverName: string): Promise<APIResponse<{ tools: Tool[] }>> {
     return this.request<{ tools: Tool[] }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools`)
   }
 
+  // Global tools listing (Spec 050) — all tools across all servers from a single consolidated endpoint.
+  async getGlobalTools(): Promise<APIResponse<GlobalToolsResponse>> {
+    return this.request<GlobalToolsResponse>('/api/v1/tools')
+  }
+
   // Tool-level quarantine (Spec 032)
   async getToolApprovals(serverName: string): Promise<APIResponse<{ tools: ToolApproval[], count: number }>> {
-    return this.request<{ tools: ToolApproval[], count: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/export`)
+    const response = await this.request<{ tools: ToolApproval[], count: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/export`)
+    if (response.success && response.data?.tools) {
+      response.data.tools = response.data.tools.map((tool) => {
+        const disabled = typeof tool.disabled === 'boolean'
+          ? tool.disabled
+          : (typeof tool.enabled === 'boolean' ? !tool.enabled : false)
+        return {
+          ...tool,
+          disabled,
+          enabled: !disabled,
+        }
+      })
+    }
+    return response
   }
 
   async getToolDiff(serverName: string, toolName: string): Promise<APIResponse<ToolApproval>> {
@@ -300,6 +421,45 @@ class APIService {
     return this.request<{ approved: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/approve`, {
       method: 'POST',
       body: JSON.stringify(body),
+    })
+  }
+
+  // MCP-2199: reject pending/changed quarantined tools. Mirrors approveTools
+  // against POST .../tools/block — {tools:[...]} for an explicit set,
+  // {block_all:true} otherwise. Blocking is reversible (the tool can be
+  // re-enabled later), so no destructive-confirm gate is needed.
+  async blockTools(serverName: string, tools?: string[]): Promise<APIResponse<{ blocked: number }>> {
+    const body = tools && tools.length > 0
+      ? { tools }
+      : { block_all: true }
+    return this.request<{ blocked: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/block`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  }
+
+  async setToolEnabled(serverName: string, toolName: string, enabled: boolean): Promise<APIResponse<{
+    server_name: string
+    tool_name: string
+    enabled: boolean
+  }>> {
+    return this.request<{ server_name: string; tool_name: string; enabled: boolean }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/${encodeURIComponent(toolName)}/enabled`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  // Bulk-toggle every known tool of a server. The response's `changed`
+  // field reflects only tools whose state actually changed — already-correct
+  // tools are skipped on the server side.
+  async setAllToolsEnabled(serverName: string, enabled: boolean): Promise<APIResponse<{
+    server_name: string
+    enabled: boolean
+    changed: number
+  }>> {
+    const action = enabled ? 'enable_all' : 'disable_all'
+    return this.request<{ server_name: string; enabled: boolean; changed: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/${action}`, {
+      method: 'POST',
     })
   }
 
@@ -370,6 +530,7 @@ class APIService {
   // Docker status
   async getDockerStatus(): Promise<APIResponse<{
     docker_available: boolean
+    isolation_enabled: boolean
     recovery_mode: boolean
     failure_count: number
     attempts_since_up: number
@@ -413,6 +574,33 @@ class APIService {
     last_updated: string
   }>> {
     return this.request('/api/v1/diagnostics')
+  }
+
+  // Spec 044 — per-server diagnostics.
+  async getServerDiagnostic(serverName: string): Promise<APIResponse<{
+    server: string
+    connected: boolean
+    status: string
+    health: any
+    diagnostic: any | null
+    error_code: string | null
+    catalog_size: number
+  }>> {
+    return this.request(`/api/v1/servers/${encodeURIComponent(serverName)}/diagnostics`)
+  }
+
+  // Spec 044 — invoke a registered fixer. Destructive fixers default to
+  // dry_run unless mode='execute' is supplied by the caller.
+  async invokeDiagnosticFix(params: {
+    server: string
+    code: string
+    fixer_key: string
+    mode?: 'dry_run' | 'execute'
+  }): Promise<APIResponse<DiagnosticFixResponse>> {
+    return this.request<DiagnosticFixResponse>('/api/v1/diagnostics/fix', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
   }
 
   // Tool Call History endpoints
@@ -470,6 +658,26 @@ class APIService {
     })
   }
 
+  // setDockerIsolationEnabled flips the global docker_isolation.enabled
+  // flag without resending the full config. Mirrors the PATCH endpoint
+  // added on the backend.
+  async setDockerIsolationEnabled(enabled: boolean): Promise<APIResponse<ConfigApplyResult>> {
+    return this.request<ConfigApplyResult>('/api/v1/config/docker-isolation', {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled })
+    })
+  }
+
+  // patchConfig applies a partial (deep-merged) config update — only the
+  // fields present in `partial` are changed; everything else (including masked
+  // secrets like api_key) is preserved server-side. Spec 060.
+  async patchConfig(partial: Record<string, any>): Promise<APIResponse<ConfigApplyResult>> {
+    return this.request<ConfigApplyResult>('/api/v1/config', {
+      method: 'PATCH',
+      body: JSON.stringify(partial)
+    })
+  }
+
   // Token statistics endpoints
   async getTokenStats(): Promise<APIResponse<ServerTokenMetrics>> {
     return this.request<ServerTokenMetrics>('/api/v1/stats/tokens')
@@ -508,37 +716,200 @@ class APIService {
     return this.request<SearchRegistryServersResponse>(url)
   }
 
-  async addServerFromRepository(server: RepositoryServer): Promise<APIResponse<any>> {
-    // Use the upstream_servers tool to add the server
-    const args: Record<string, any> = {
-      operation: 'add',
-      name: server.id,
-      enabled: true,
-      protocol: 'stdio'
-    }
+  // MCP-866 / MCP-867: add a user-supplied registry source. The server tags an
+  // added source as custom provenance (provenance is NOT part of the request) —
+  // informational only (MCP-1072); servers added from it follow the global
+  // quarantine default like any other. We mirror the structured-error pattern of
+  // addServerFromRegistry so the UI can branch on the stable `code`
+  // (invalid_registry_url | registries_locked | registry_shadows_builtin |
+  // duplicate_registry).
+  async addRegistrySource(
+    url: string,
+    opts?: { protocol?: string; id?: string; name?: string }
+  ): Promise<AddRegistrySourceResult> {
+    const body: Record<string, unknown> = { url }
+    if (opts?.protocol) body.protocol = opts.protocol
+    if (opts?.id) body.id = opts.id
+    if (opts?.name) body.name = opts.name
 
-    // Determine command and args from installCmd or connectUrl
-    if (server.installCmd) {
-      const parts = server.installCmd.split(' ')
-      args.command = parts[0]
-      if (parts.length > 1) {
-        args.args_json = JSON.stringify(parts.slice(1))
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (this.apiKey) headers['X-API-Key'] = this.apiKey
+
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/registries`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      })
+
+      const payload: any = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          // registries_locked is a 403 but is a policy decision, not an auth
+          // failure — only emit the auth-error path for a missing/invalid key.
+          if (payload?.code !== 'registries_locked') {
+            this.emitAuthError(payload?.error || `HTTP ${response.status}`, response.status)
+          }
+        }
+        return {
+          success: false,
+          error: payload?.error || `HTTP ${response.status}: ${response.statusText}`,
+          code: payload?.code
+        }
       }
-    } else if (server.url) {
-      // Remote server with HTTP protocol
-      args.protocol = 'http'
-      args.url = server.url
-    } else if (server.connectUrl) {
-      args.protocol = 'http'
-      args.url = server.connectUrl
-    }
 
-    return this.callTool('upstream_servers', args)
+      return { success: true, registry: payload?.data?.registry }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
+  }
+
+  // MCP-1073: edit a user-added custom registry source via
+  // PUT /api/v1/registries/{id}. Only the fields supplied are sent; empty fields
+  // are left unchanged server-side. Built-in registries are read-only and the
+  // backend refuses them with registry_shadows_builtin. Mirrors
+  // addRegistrySource's structured-error contract (registry_not_found |
+  // registry_shadows_builtin | invalid_registry_url | registries_locked).
+  async editRegistrySource(
+    id: string,
+    opts: { name?: string; url?: string; serversUrl?: string }
+  ): Promise<AddRegistrySourceResult> {
+    const body: Record<string, unknown> = {}
+    if (opts.name) body.name = opts.name
+    if (opts.url) body.url = opts.url
+    if (opts.serversUrl) body.servers_url = opts.serversUrl
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (this.apiKey) headers['X-API-Key'] = this.apiKey
+
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/registries/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(body)
+      })
+
+      const payload: any = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          if (payload?.code !== 'registries_locked') {
+            this.emitAuthError(payload?.error || `HTTP ${response.status}`, response.status)
+          }
+        }
+        return {
+          success: false,
+          error: payload?.error || `HTTP ${response.status}: ${response.statusText}`,
+          code: payload?.code
+        }
+      }
+
+      return { success: true, registry: payload?.data?.registry }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
+  }
+
+  // MCP-1073: remove a user-added custom registry source via
+  // DELETE /api/v1/registries/{id}. Servers already added from it stay; only the
+  // source is removed. Built-in registries are read-only (registry_shadows_builtin).
+  async removeRegistrySource(id: string): Promise<AddRegistrySourceResult> {
+    const headers: Record<string, string> = {}
+    if (this.apiKey) headers['X-API-Key'] = this.apiKey
+
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/registries/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers
+      })
+
+      const payload: any = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          if (payload?.code !== 'registries_locked') {
+            this.emitAuthError(payload?.error || `HTTP ${response.status}`, response.status)
+          }
+        }
+        return {
+          success: false,
+          error: payload?.error || `HTTP ${response.status}: ${response.statusText}`,
+          code: payload?.code
+        }
+      }
+
+      return { success: true, registry: payload?.data?.registry }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
+  }
+
+  // Spec 070 (CN-001): add a server to upstream by *reference* — the server
+  // re-derives and validates the config from the registry entry. The client no
+  // longer splits install_cmd / chooses protocol (that client-side parsing was
+  // the source of issue #483 and let a buggy client smuggle in arbitrary
+  // command/args). All add surfaces (REST/MCP/CLI) funnel through the same
+  // backend keystone (AddServerFromRegistry), so identical input → identical
+  // persisted, quarantined config (CN-004).
+  async addServerFromRegistry(
+    registryId: string,
+    serverId: string,
+    opts?: { name?: string; enabled?: boolean; env?: Record<string, string> }
+  ): Promise<AddFromRegistryResult> {
+    const url = `/api/v1/registries/${encodeURIComponent(registryId)}/servers/${encodeURIComponent(serverId)}/add`
+
+    const body: Record<string, unknown> = {}
+    if (opts?.name) body.name = opts.name
+    if (opts?.enabled !== undefined) body.enabled = opts.enabled
+    if (opts?.env && Object.keys(opts.env).length > 0) body.env = opts.env
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (this.apiKey) headers['X-API-Key'] = this.apiKey
+
+    try {
+      const response = await fetch(`${this.baseUrl}${url}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      })
+
+      const payload: any = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          this.emitAuthError(payload?.error || `HTTP ${response.status}`, response.status)
+        }
+        return {
+          success: false,
+          error: payload?.error || `HTTP ${response.status}: ${response.statusText}`,
+          code: payload?.code,
+          missingInputs: payload?.missing_inputs
+        }
+      }
+
+      return { success: true, server: payload?.data?.server }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
   }
 
   // Info endpoint (version and update information)
-  async getInfo(): Promise<APIResponse<InfoResponse>> {
-    return this.request<InfoResponse>('/api/v1/info')
+  async getInfo(opts?: { refresh?: boolean }): Promise<APIResponse<InfoResponse>> {
+    const url = opts?.refresh ? '/api/v1/info?refresh=true' : '/api/v1/info'
+    return this.request<InfoResponse>(url)
   }
 
   // Activity Log endpoints (RFC-003)
@@ -572,6 +943,27 @@ class APIService {
 
   async getActivitySummary(period: string = '24h'): Promise<APIResponse<ActivitySummaryResponse>> {
     return this.request<ActivitySummaryResponse>(`/api/v1/activity/summary?period=${period}`)
+  }
+
+  // Usage statistics aggregate for the Web UI usage graphs (Spec 069).
+  async getActivityUsage(params?: {
+    window?: UsageWindow
+    server?: string
+    tool?: string
+    status?: UsageStatus
+    top?: number
+    sort?: UsageSort
+  }): Promise<APIResponse<UsageAggregateResponse>> {
+    const searchParams = new URLSearchParams()
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== '') {
+          searchParams.append(key, String(value))
+        }
+      })
+    }
+    const qs = searchParams.toString()
+    return this.request<UsageAggregateResponse>(`/api/v1/activity/usage${qs ? '?' + qs : ''}`)
   }
 
   getActivityExportUrl(params: {
@@ -664,20 +1056,29 @@ class APIService {
     return this.request<CanonicalConfigPathsResponse>('/api/v1/servers/import/paths')
   }
 
-  // Import servers from a file path on the server's filesystem
+  // Import servers from a file path on the server's filesystem.
+  // Spec 046 v2: skip_quarantine=true imports as already-trusted (skips
+  // the quarantine holding state). Default false preserves the safe-by-
+  // default posture for any caller that doesn't pass the flag.
   async importServersFromPath(params: {
     path: string
     format?: string
     server_names?: string[]
     preview?: boolean
+    skip_quarantine?: boolean
+    rename?: Record<string, string>
   }): Promise<APIResponse<ImportResponse>> {
-    const url = `/api/v1/servers/import/path${params.preview ? '?preview=true' : ''}`
+    const qs: string[] = []
+    if (params.preview) qs.push('preview=true')
+    if (params.skip_quarantine) qs.push('skip_quarantine=true')
+    const url = `/api/v1/servers/import/path${qs.length ? '?' + qs.join('&') : ''}`
     return this.request<ImportResponse>(url, {
       method: 'POST',
       body: JSON.stringify({
         path: params.path,
         format: params.format,
-        server_names: params.server_names
+        server_names: params.server_names,
+        rename: params.rename,
       })
     })
   }
@@ -696,6 +1097,13 @@ class APIService {
 
   async revokeAgentToken(name: string): Promise<APIResponse<void>> {
     return this.request<void>(`/api/v1/tokens/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    })
+  }
+
+  // Permanently delete a token, freeing its name for reuse (unlike revoke, a soft delete).
+  async deleteAgentToken(name: string): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/tokens/${encodeURIComponent(name)}/permanent`, {
       method: 'DELETE',
     })
   }
@@ -760,6 +1168,26 @@ class APIService {
     return this.request<ConnectStatusResponse>('/api/v1/connect')
   }
 
+  // Spec 075: resolve a single client's status on demand. This is the only
+  // Connect call that reads a client config file's contents (to classify
+  // access_state), so on macOS it is the sole place an App-Data privacy prompt
+  // may legitimately appear — and it is always scoped to an explicit user
+  // action ("Check access"), never the passive listing. Returns 200 with the
+  // resolved access_state (accessible|absent|denied|malformed) and, when
+  // denied, the remediation text.
+  async getConnectClientStatus(clientId: string): Promise<APIResponse<ClientStatus>> {
+    return this.request<ClientStatus>(`/api/v1/connect/${encodeURIComponent(clientId)}`)
+  }
+
+  // Spec 078 US1: preview the exact entry a connect would write, WITHOUT
+  // modifying the file or creating a backup. The apikey in the returned entry is
+  // masked. Like getConnectClientStatus this reads the config on demand (to
+  // classify create-vs-overwrite), so on macOS it may raise an App-Data prompt;
+  // a denial returns 403 with remediation (surfaced as success:false + error).
+  async getConnectPreview(clientId: string): Promise<APIResponse<ConnectPreview>> {
+    return this.request<ConnectPreview>(`/api/v1/connect/${encodeURIComponent(clientId)}/preview`)
+  }
+
   async connectClient(clientId: string, serverName = 'mcpproxy', force = false): Promise<APIResponse<ConnectResult>> {
     return this.request<ConnectResult>(`/api/v1/connect/${encodeURIComponent(clientId)}`, {
       method: 'POST',
@@ -767,9 +1195,44 @@ class APIService {
     })
   }
 
-  async disconnectClient(clientId: string): Promise<APIResponse<ConnectResult>> {
+  // Spec 078 US3: one-click undo of the immediately-preceding connect.
+  // backupPath is the backup_path that connect returned (null = no prior file
+  // existed, so undo removes the file connect created). The backend refuses
+  // with 409 when the config changed since the connect (never clobbers edits).
+  //
+  // The wire payload carries only the backup's bare FILENAME (backup_name), not
+  // a path: the server resolves the full path inside the client's own config
+  // directory and never trusts a client-supplied path (defense against path
+  // injection). We strip any directory component here on both / and \ so a
+  // Windows path resolves the same way.
+  async undoConnectClient(
+    clientId: string,
+    serverName = 'mcpproxy',
+    backupPath: string | null = null
+  ): Promise<APIResponse<ConnectResult>> {
+    const backupName = backupPath ? (backupPath.split(/[/\\]/).pop() ?? '') : ''
+    return this.request<ConnectResult>(`/api/v1/connect/${encodeURIComponent(clientId)}/undo`, {
+      method: 'POST',
+      body: JSON.stringify({ server_name: serverName, backup_name: backupName }),
+    })
+  }
+
+  async disconnectClient(clientId: string, serverName = 'mcpproxy'): Promise<APIResponse<ConnectResult>> {
     return this.request<ConnectResult>(`/api/v1/connect/${encodeURIComponent(clientId)}`, {
       method: 'DELETE',
+      body: JSON.stringify({ server_name: serverName }),
+    })
+  }
+
+  // Onboarding wizard (Spec 046)
+  async getOnboardingState(): Promise<APIResponse<OnboardingStateResponse>> {
+    return this.request<OnboardingStateResponse>('/api/v1/onboarding/state')
+  }
+
+  async markOnboardingState(payload: OnboardingMarkRequest): Promise<APIResponse<OnboardingStateResponse>> {
+    return this.request<OnboardingStateResponse>('/api/v1/onboarding/mark', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     })
   }
 
@@ -818,8 +1281,22 @@ class APIService {
     return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/report`)
   }
 
-  async getScanFiles(serverName: string, limit = 100, offset = 0, pass = 1): Promise<APIResponse<any>> {
-    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/files?limit=${limit}&offset=${offset}&pass=${pass}`)
+  async getScanFiles(
+    serverName: string,
+    limit = 100,
+    offset = 0,
+    pass = 1,
+    suspiciousOnly = false,
+  ): Promise<APIResponse<any>> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      pass: String(pass),
+    })
+    if (suspiciousOnly) params.set('suspicious_only', 'true')
+    return this.request<any>(
+      `/api/v1/servers/${encodeURIComponent(serverName)}/scan/files?${params.toString()}`,
+    )
   }
 
   async cancelScan(serverName: string): Promise<APIResponse<void>> {

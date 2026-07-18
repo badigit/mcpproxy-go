@@ -16,7 +16,7 @@ jobs:
       latest_tag: ${{ steps.version.outputs.latest_tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
 
@@ -47,10 +47,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
 
@@ -66,12 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -82,7 +82,7 @@ jobs:
         run: cd frontend && npm run build
 
       - name: Upload frontend artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: frontend-dist-pr
           path: frontend/dist/
@@ -136,12 +136,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
           cache: false  # Disable built-in cache to use explicit cache step below
@@ -153,7 +153,7 @@ jobs:
           rm -rf ~/go/pkg/mod/golang.org/toolchain* || true
 
       - name: Cache Go modules and build
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: |
             ~/.cache/go-build
@@ -167,7 +167,7 @@ jobs:
         run: go mod download
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: frontend-dist-pr
           path: frontend/dist
@@ -176,8 +176,28 @@ jobs:
         shell: bash
         run: |
           rm -rf web/frontend
-          mkdir -p web/frontend
-          cp -r frontend/dist web/frontend/
+          mkdir -p web/frontend/dist
+          cp -r frontend/dist/. web/frontend/dist/
+          # Recreate the tracked .gitkeep so //go:embed all:frontend/dist
+          # always has something to embed (matches the Makefile frontend-build target).
+          touch web/frontend/dist/.gitkeep
+
+      # Spec 083: the bench/arms tscg tests spawn the committed Node shim
+      # (bench/tscg/shim.mjs) and hard-fail (never skip) under CI per FR-006, so
+      # the tscg runtime must be provisioned wherever `go test ./...` runs.
+      # Skipped for Windows ARM64, which cross-compiles and does not run tests.
+      - name: Set up Node.js (TSCG bench arm)
+        if: '!(matrix.goos == ''windows'' && matrix.goarch == ''arm64'')'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: bench/tscg/package-lock.json
+
+      - name: Install pinned TSCG shim dependencies (FR-006)
+        if: '!(matrix.goos == ''windows'' && matrix.goarch == ''arm64'')'
+        shell: bash
+        run: npm ci --prefix bench/tscg
 
       - name: Run tests (skip binary E2E tests - not compatible with cross-compilation)
         # Skip tests for Windows ARM64 (cross-compilation - can't run ARM64 binaries on AMD64 runner)
@@ -204,7 +224,7 @@ jobs:
           CGO_CFLAGS: "-mmacosx-version-min=13.0"
           CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
-          LDFLAGS="-s -w -X mcpproxy-go/cmd/mcpproxy.version=${VERSION} -X main.version=${VERSION}"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X github.com/smart-mcp-proxy/mcpproxy-go/internal/httpapi.buildVersion=${VERSION}"
 
           # Determine clean binary name
           if [ "${{ matrix.goos }}" = "windows" ]; then
@@ -354,7 +374,7 @@ jobs:
           echo "Production builds go through full notarization in release workflow"
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
           path: mcpproxy-*-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive_format }}
@@ -362,7 +382,7 @@ jobs:
 
       - name: Upload macOS installer DMG
         if: matrix.goos == 'darwin'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: installer-dmg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: mcpproxy-*-darwin-${{ matrix.goarch }}-installer.dmg

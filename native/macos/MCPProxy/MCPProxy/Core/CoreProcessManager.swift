@@ -8,6 +8,10 @@
 
 import Foundation
 
+/// How often idle mode polls the socket for a core to attach to (GH #410).
+/// Cheap: a file-exists check plus, only when that passes, one `/ready` call.
+private let attachWatchInterval: TimeInterval = 2.0
+
 // MARK: - Core Process Manager
 
 /// Actor responsible for the full lifecycle of the mcpproxy core subprocess.
@@ -43,6 +47,17 @@ actor CoreProcessManager {
     private var sseClient: SSEClient?
     private var sseTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    /// Poll for an external core while core autostart is off (GH #410).
+    private var attachWatchTask: Task<Void, Never>?
+
+    /// Set when this manager has been replaced by a newer one. A superseded
+    /// manager must never publish to the shared AppState again: the app creates a
+    /// FRESH CoreProcessManager on an explicit "Start MCPProxy Core", and the old
+    /// one may still be inside its idle attach-watch. Without this, the old
+    /// manager could observe the socket the NEW manager's core just created and
+    /// mislabel that tray-spawned core as `.externalAttached` — after which the
+    /// tray would refuse to stop it and leak it on quit.
+    private var superseded: Bool = false
     private var retryCount: Int = 0
     private let maxRetries: Int = 3
     private let notificationService: NotificationService
@@ -86,24 +101,86 @@ actor CoreProcessManager {
 
     /// Start the core process and connect to it.
     ///
-    /// Strategy: always try to launch our own core first. If the socket already
-    /// exists, probe it with an actual API call — a stale socket file from a
-    /// killed process will fail the probe, so we remove it and launch fresh.
-    func start() async {
-        // If socket file exists, check if a real core is behind it
+    /// Strategy: prefer a core that is ALREADY running — if the socket exists,
+    /// probe it with a real API call and attach on success. Otherwise (a stale
+    /// socket from a killed process fails that probe) launch our own.
+    ///
+    /// - Parameter maySpawn: whether the tray is permitted to launch a core
+    ///   (GH #410). Attaching to a running core is never gated by this — only
+    ///   spawning is. When spawning is refused and no core is running, the tray
+    ///   goes idle and watches for one to appear, so a core the user starts
+    ///   later (CLI, launchd, brew services) is picked up without a restart.
+    func start(maySpawn: Bool = true) async {
+        if await attachIfCoreIsRunning() { return }
+
+        guard maySpawn else {
+            await awaitExternalCore()
+            return
+        }
+
+        // Stale socket — remove it so our new core can create a fresh one.
         if SocketTransport.isSocketAvailable(path: socketPath) {
-            if await probeExternalCore() {
-                // Real core is running — attach to it
-                await attachToExternalCore()
-                return
-            }
-            // Stale socket — remove it so our new core can create a fresh one
             try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         // Launch our own core as a subprocess
-        await MainActor.run { appState.ownership = .trayManaged }
+        await MainActor.run {
+            appState.isStopped = false
+            appState.ownership = .trayManaged
+        }
         await launchAndConnect()
+    }
+
+    /// Retire this manager: stop watching and never touch AppState again. Called
+    /// before the app swaps in a replacement manager.
+    func supersede() {
+        superseded = true
+        cancelAttachWatch()
+    }
+
+    /// Attach to a core that is already up. Returns false when none is.
+    private func attachIfCoreIsRunning() async -> Bool {
+        guard !superseded else { return false }
+        guard SocketTransport.isSocketAvailable(path: socketPath) else { return false }
+        guard await probeExternalCore() else { return false }
+        guard !superseded else { return false } // a replacement took over while we probed
+        await attachToExternalCore()
+        return true
+    }
+
+    /// Idle mode (#410): no core, and we are not allowed to start one. Sit in the
+    /// stopped state and poll for a core to attach to.
+    private func awaitExternalCore() async {
+        NSLog("[MCPProxy] Core autostart is off — idle, watching for an external core")
+        await MainActor.run {
+            appState.isStopped = true
+            appState.coreState = .idle
+        }
+        startAttachWatch()
+    }
+
+    /// Poll the socket until a core shows up, then attach to it.
+    private func startAttachWatch() {
+        attachWatchTask?.cancel()
+        attachWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(attachWatchInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                if await self.attachIfCoreIsRunning() { return }
+            }
+        }
+    }
+
+    /// Stop watching for an external core (we are starting or shutting down).
+    ///
+    /// MUST only be called from OUTSIDE the watch task (shutdown, supersede,
+    /// spawn). Calling it from within the attach path cancels the task that is
+    /// performing the attach, so the connect it awaits fails with
+    /// CancellationError — see attachToExternalCore, which drops the reference
+    /// instead of cancelling.
+    private func cancelAttachWatch() {
+        attachWatchTask?.cancel()
+        attachWatchTask = nil
     }
 
     /// Probe an existing socket to see if a live core is behind it.
@@ -119,8 +196,13 @@ actor CoreProcessManager {
     }
 
     /// Gracefully shut down the core process and all connections.
+    ///
+    /// A core we merely ATTACHED to is left running: we disconnect from it and
+    /// stop there. That rule is now enforced by the ownership check below rather
+    /// than by the fact that `process` happens to be nil for an attached core.
     func shutdown() async {
         await transitionState(to: .shuttingDown)
+        cancelAttachWatch()
 
         // Disconnect SSE
         sseTask?.cancel()
@@ -134,6 +216,14 @@ actor CoreProcessManager {
         sseClient = nil
         apiClient = nil
         await MainActor.run { appState.apiClient = nil }
+
+        let ownsCore = await MainActor.run { appState.ownership.shouldTerminateOnShutdown }
+        guard ownsCore else {
+            NSLog("[MCPProxy] Disconnected from an externally-managed core — leaving it running")
+            self.process = nil
+            await transitionState(to: .idle)
+            return
+        }
 
         // Terminate the process if we own it
         if let process, process.isRunning {
@@ -160,7 +250,13 @@ actor CoreProcessManager {
         await transitionState(to: .idle)
     }
 
-    /// Retry launching the core after an error.
+    /// Retry after an error.
+    ///
+    /// This must not become a back door around the launch policy (#410). If the
+    /// core we lost was an EXTERNAL one and the user has core autostart off,
+    /// retrying re-attaches or returns to idle — it does not silently spawn a
+    /// tray-managed core the user asked us not to start. A core we own is
+    /// relaunched as before.
     func retry() async {
         retryCount = 0
         stderrBuffer = ""
@@ -172,14 +268,32 @@ actor CoreProcessManager {
         }
         self.process = nil
 
-        await launchAndConnect()
+        let ownership = await MainActor.run { appState.ownership }
+        let maySpawn = CoreLaunchPolicy.retryMaySpawn(
+            ownership: ownership,
+            policyAllowsSpawn: CoreLaunchPolicy().maySpawnCore
+        )
+        await start(maySpawn: maySpawn)
     }
 
     // MARK: - Private: Attach to External Core
 
     /// Attach to an already-running core process on the socket.
     private func attachToExternalCore() async {
-        await MainActor.run { appState.ownership = .externalAttached }
+        // Drop the watch WITHOUT cancelling it. This attach is usually running
+        // INSIDE the watch task (that is how the core was noticed), so cancelling
+        // here would cancel the very work we are about to await: connectToCore()
+        // would throw CancellationError and the tray would sit in
+        // "Failed to connect to external core: cancelled" while a perfectly
+        // healthy core was running. The watch loop exits on its own the moment
+        // attachIfCoreIsRunning() reports success.
+        attachWatchTask = nil
+        await MainActor.run {
+            appState.ownership = .externalAttached
+            // A core IS running, so we are not in the stopped state — even if we
+            // were forbidden from starting one ourselves (#410 idle mode).
+            appState.isStopped = false
+        }
         await transitionState(to: .waitingForCore)
 
         do {
@@ -329,6 +443,21 @@ actor CoreProcessManager {
         env.removeValue(forKey: "MCPPROXY_API_KEY")
         // Enable socket communication
         env["MCPPROXY_SOCKET"] = "true"
+        // Tray-launched core is allowed to write to macOS Keychain — user
+        // explicitly opened the GUI app, so OS prompts are expected.
+        // See issue #409 / internal/secret/keyring_provider.go.
+        env["MCPPROXY_KEYRING_WRITE"] = "1"
+        // Tell the core it was launched by the tray, so telemetry's launch_source
+        // can say so. Without this a tray-spawned core is unclassifiable: its
+        // parent is this app (not launchd, so not login_item) and it has no TTY
+        // (so not cli), leaving launch_source "unknown".
+        //
+        // The DMG installer launches this app with MCPPROXY_LAUNCHED_BY=installer
+        // (packaging/macos/postinstall.sh); that first-run attribution outranks
+        // "tray", so do not overwrite it.
+        if env["MCPPROXY_LAUNCHED_BY"] != "installer" {
+            env["MCPPROXY_LAUNCHED_BY"] = "tray"
+        }
         proc.environment = env
 
         // Capture stderr for error diagnostics
@@ -451,7 +580,7 @@ actor CoreProcessManager {
             appState.version = info.version
             appState.webUIBaseURL = webUIBase
             if let update = info.update, update.available, let latest = update.latestVersion {
-                appState.updateAvailable = latest
+                appState.updateAvailable = latest.hasPrefix("v") ? String(latest.dropFirst()) : latest
             }
         }
 
@@ -496,31 +625,38 @@ actor CoreProcessManager {
     private func handleSSEEvent(_ event: SSEEvent) async {
         switch event.event {
         case "status":
-            // Status events contain inline stats.
-            // When connected count changes, re-fetch the full server list
-            // to get accurate counts (SSE stats can lag behind actual state).
+            // Status events contain inline stats. Spec 048: any change that
+            // would also flip connected_count emits a `servers.changed`
+            // event (delivered within ~50 ms by spec 047's coalescer) which
+            // already updates the per-server appState. Stat aggregates are
+            // updated unconditionally from the inline payload — no refetch.
             if let data = event.data.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let stats = json["upstream_stats"] as? [String: Any] {
-                let connected = stats["connected_servers"] as? Int ?? 0
                 let total = stats["total_servers"] as? Int ?? 0
                 let tools = stats["total_tools"] as? Int ?? 0
-                let oldConnected = await MainActor.run { appState.connectedCount }
-                // If counts changed, do a full server refresh for accuracy
-                if connected != oldConnected {
-                    await refreshServers()
-                } else {
-                    await MainActor.run {
-                        if appState.totalServers != total { appState.totalServers = total }
-                        if appState.totalTools != tools { appState.totalTools = tools }
-                    }
+                await MainActor.run {
+                    if appState.totalServers != total { appState.totalServers = total }
+                    if appState.totalTools != tools { appState.totalTools = tools }
                 }
             }
 
         case "servers.changed":
-            // Server list actually changed; re-fetch once
+            // Spec 047: prefer the embedded server list in the event payload
+            // and skip the GET /api/v1/servers refetch entirely. Falls back to
+            // refetch when running against an older core that publishes
+            // notify-only events (no `servers` field).
             let oldQuarantined = await MainActor.run { appState.quarantinedToolsCount }
-            await refreshServers()
+            var consumedFromPayload = false
+            if let data = event.data.data(using: .utf8),
+               let envelope = try? JSONDecoder().decode(ServersChangedEnvelope.self, from: data),
+               let servers = envelope.payload.servers {
+                await appState.updateServers(servers)
+                consumedFromPayload = true
+            }
+            if !consumedFromPayload {
+                await refreshServers()
+            }
             await MainActor.run { appState.serversVersion += 1 }
             let newQuarantined = await MainActor.run { appState.quarantinedToolsCount }
             // Notify on new quarantine events
@@ -532,7 +668,12 @@ actor CoreProcessManager {
             }
 
         case "config.reloaded":
-            // Configuration reloaded; refresh everything once
+            // Configuration reloaded; refresh everything once.
+            // A re-init loop re-emits config.reloaded each cycle even when the
+            // SSE connection stays up, so treat it as an instability signal:
+            // this re-arms the settle gate and suppresses the replay-driven
+            // quarantine/sensitive notifications for the duration (MCP-2328).
+            await notificationService.markConnectionUnsettled()
             await refreshState()
             await MainActor.run {
                 appState.serversVersion += 1
@@ -557,6 +698,13 @@ actor CoreProcessManager {
                     )
                 }
             }
+
+        case "active_profile.changed":
+            // Profiles v2 T5: the server-level default active profile was switched
+            // (possibly by another client). Refetch profiles + active so the tray
+            // submenu reflects it. The payload carries active_profile, but a
+            // refetch also picks up tool-count/profile-set changes uniformly.
+            await refreshProfiles()
 
         case "ping":
             // Keepalive; no action needed
@@ -597,12 +745,15 @@ actor CoreProcessManager {
     }
 
     /// Fetch full state from the core and update appState.
+    /// Spec 048: dropped the per-tick refreshServers() call. The server list
+    /// is now SSE-driven (spec 047 servers.changed payload). MCPProxyApp
+    /// installs a separate 5-min safety-net timer for missed-event recovery.
     private func refreshState() async {
-        await refreshServers()
         await refreshActivity()
         await refreshSessions()
         await refreshTokenMetrics()
         await refreshSecurityStatus()
+        await refreshProfiles()
         // Bump activityVersion so ActivityView reloads
         // (SSE doesn't emit "activity" events, so periodic refresh is needed)
         await MainActor.run { appState.activityVersion += 1 }
@@ -619,10 +770,12 @@ actor CoreProcessManager {
                 // if docker_isolation.enabled is true in the running config, treat as available.
                 let configEnabled = await MainActor.run { appState.totalServers > 0 }
                 if configEnabled {
-                    // Servers are connected — Docker must be working if isolation is enabled
-                    // Check via the status endpoint which shows connected servers in containers
-                    let servers = try? await apiClient.servers()
-                    let hasStdioServers = servers?.contains(where: { $0.connected && $0.protocol == "stdio" }) ?? false
+                    // Servers are connected — Docker must be working if isolation is enabled.
+                    // Spec 048: appState.servers is SSE-fed, so read it directly instead
+                    // of issuing another GET /api/v1/servers on every periodic refresh.
+                    let hasStdioServers = await MainActor.run {
+                        appState.servers.contains(where: { $0.connected && $0.protocol == "stdio" })
+                    }
                     await MainActor.run {
                         appState.dockerAvailable = hasStdioServers || dockerOK
                     }
@@ -659,6 +812,32 @@ actor CoreProcessManager {
             await appState.updateServers(servers)
         } catch {
             // Non-fatal; we'll retry on the next refresh
+        }
+    }
+
+    /// Spec 048: long-cadence safety-net wrapper around `refreshServers`.
+    /// Called by a 5-minute Combine timer in `MCPProxyApp` to guard against
+    /// missed `servers.changed` SSE events. Separate name documents intent —
+    /// this is *not* the on-demand refresh path (that's been retired).
+    func refreshServersForSafetyNet() async {
+        await refreshServers()
+    }
+
+    /// Fetch the configured profiles + active profile and update appState
+    /// (Profiles v2 T5). Driven on connect, on the periodic refresh, and on the
+    /// `active_profile.changed` SSE event so a switch made by another client
+    /// (Web UI, CLI, the Go tray) is reflected in the macOS tray submenu.
+    func refreshProfiles() async {
+        guard let apiClient else { return }
+        do {
+            let profiles = try await apiClient.profiles()
+            let active = try await apiClient.activeProfile()
+            await MainActor.run {
+                if appState.profiles != profiles { appState.profiles = profiles }
+                if appState.activeProfile != active { appState.activeProfile = active }
+            }
+        } catch {
+            // Non-fatal; we'll retry on the next refresh or SSE event.
         }
     }
 
@@ -780,6 +959,19 @@ actor CoreProcessManager {
     /// Transition the core state via the main actor.
     private func transitionState(to newState: CoreState) async {
         await appState.transition(to: newState)
+
+        // Signal connection instability so replay-driven notifications
+        // (quarantine, sensitive-data) are suppressed until the connection
+        // settles. Every reconnect / relaunch / crash funnels through here,
+        // so during a backend re-init loop the gate is re-armed each cycle and
+        // never settles — breaking the notification storm (MCP-2328).
+        // `.connected` is the steady state and is intentionally NOT marked.
+        switch newState {
+        case .launching, .waitingForCore, .reconnecting, .error:
+            await notificationService.markConnectionUnsettled()
+        case .idle, .connected, .shuttingDown:
+            break
+        }
     }
 
     // MARK: - Private: API Key Generation

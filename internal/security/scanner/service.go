@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,16 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
+
+// errNoScans is returned by findLatestPassJobs when the scan-job bucket has no
+// records for the requested server. Callers (notably GetScanSummary) detect
+// this via errors.Is and cache a nil sentinel so subsequent calls for the same
+// server skip BBolt entirely. Other errors (e.g. transient I/O failures) are
+// NOT cached so the next call retries. See spec 047.
+var errNoScans = errors.New("no scan jobs found for server")
 
 // Storage defines the storage interface needed by SecurityService
 type Storage interface {
@@ -24,6 +34,7 @@ type Storage interface {
 	SaveScanJob(job *ScanJob) error
 	GetScanJob(id string) (*ScanJob, error)
 	ListScanJobs(serverName string) ([]*ScanJob, error)
+	ListScanJobMetas(serverName string) ([]*ScanJobMeta, error)
 	GetLatestScanJob(serverName string) (*ScanJob, error)
 	DeleteScanJob(id string) error
 	DeleteServerScanJobs(serverName string) error
@@ -76,6 +87,16 @@ type ServerInfoProvider interface {
 	IsConnected(serverName string) bool
 }
 
+// allServerToolsProvider is an OPTIONAL capability a ServerInfoProvider may also
+// implement: enumerate every known server's current tool definitions, keyed by
+// server name. The Service uses it to build the cross-server snapshot that lets
+// the deterministic shadowing.cross_server check (Spec 076) detect impersonation
+// across servers. Providers that don't implement it simply contribute no peers
+// (cross-server shadowing is then inert, but every other check is unaffected).
+type allServerToolsProvider interface {
+	GetAllServerTools() (map[string][]map[string]interface{}, error)
+}
+
 // ServerUnquarantiner performs the full unquarantine workflow for a server.
 // Implementations are expected to:
 //   - Clear the quarantined flag in storage and persist config
@@ -103,6 +124,13 @@ type Service struct {
 	queue          *ScanQueue
 	pulls          *pullManager
 	logger         *zap.Logger
+
+	// isolationModeResolver returns a server's resolved isolation mode
+	// ("docker"/"sandbox"/"none", or "" if unknown). Injected by the wiring
+	// layer so the scanner honours per-server isolation.mode overrides
+	// (MCP-34.4) without the scanner package depending on the isolation
+	// resolver. Nil ⇒ fall back to the engine-wide default.
+	isolationModeResolver func(serverName string) string
 
 	// In-memory scan summary cache — avoids expensive BBolt reads per server
 	summaryCache   map[string]*ScanSummary
@@ -148,8 +176,231 @@ func (s *Service) SetScannerDisableNoNewPrivileges(disable bool) {
 	s.engine.disableNoNewPrivileges = disable
 	if disable {
 		s.logger.Warn("Scanner containers will run WITHOUT --security-opt no-new-privileges " +
-			"(security.scanner_disable_no_new_privileges=true). This is a workaround for " +
+			"(security.deep_scan.disable_no_new_privileges=true). This is a workaround for " +
 			"snap-docker + AppArmor hosts; prefer replacing snap docker with a distro package.")
+	}
+}
+
+// SetIsolationMode records the engine-wide DEFAULT isolation mode ("docker",
+// "sandbox", "none", or "" == docker), used when a scan has no per-server mode
+// (no resolver wired, or the resolver returns ""). Per-server resolution via
+// SetIsolationModeResolver takes precedence. Under "sandbox"/"none" the host
+// runs no Docker for scanners, so Docker (deep) scanner plugins are cleanly
+// skipped while the in-process baseline still runs — MCP-34.4 / D3 option (b).
+// Per Spec 077 US3 such a skip is informational (surfaced via the deep-scan
+// descriptor) and NEVER degrades the baseline verdict; deep scanners only run at
+// all when security.deep_scan.enabled is set.
+func (s *Service) SetIsolationMode(mode string) {
+	if s.engine == nil {
+		return
+	}
+	s.engine.isolationMode = mode
+	if mode == "sandbox" || mode == "none" {
+		s.logger.Info("Default isolation mode runs no Docker for scanner plugins; Docker-based deep "+
+			"scanners are skipped (per-server isolation.mode:docker overrides). The deterministic "+
+			"in-process baseline still runs and the baseline verdict is unaffected (Spec 077). "+
+			"See docs/errors/MCPX_DOCKER_SNAP_APPARMOR.md.",
+			zap.String("isolation_mode", mode))
+	}
+}
+
+// SetDeepScan configures the opt-in "deep scan" layer (Spec 077 US3). When
+// enabled is false (the default), only the deterministic in-process baseline
+// scanner runs and no Docker container is ever invoked; a deep-scan failure can
+// therefore never degrade the baseline verdict. scanners optionally restricts
+// which deep scanners are eligible (empty ⇒ all enabled deep scanners). This is
+// the runtime knob for security.deep_scan.enabled / security.deep_scan.scanners.
+func (s *Service) SetDeepScan(enabled bool, scanners []string) {
+	if s.engine == nil {
+		return
+	}
+	s.engine.deepScanEnabled = enabled
+	if len(scanners) > 0 {
+		allow := make(map[string]bool, len(scanners))
+		for _, id := range scanners {
+			allow[id] = true
+		}
+		s.engine.deepScanScanners = allow
+	} else {
+		s.engine.deepScanScanners = nil
+	}
+	// Spec 077 US3: published-package-source extraction is part of the opt-in
+	// deep-scan layer, so it must never run (and never cause network egress)
+	// while deep scan is off. Force the resolver's fetch fallback off here as
+	// defense-in-depth. When deep scan is ENABLED the server layer decides the
+	// concrete value from deep_scan.fetch_package_source (default true) via
+	// SetFetchPackageSource, so we deliberately do not flip it back on here.
+	if !enabled && s.sourceResolver != nil {
+		s.sourceResolver.SetFetchPackageSource(false)
+	}
+	if enabled {
+		s.logger.Info("Deep scan enabled (security.deep_scan.enabled=true): Docker scanner " +
+			"plugins + published-package-source extraction may run as an opt-in enrichment " +
+			"layer. Failures are surfaced as an informational note and NEVER change the " +
+			"baseline verdict (Spec 077 FR-007/FR-008).")
+	}
+}
+
+// deepScanEnabled reports whether the opt-in deep-scan layer is currently on.
+func (s *Service) deepScanEnabled() bool {
+	return s.engine != nil && s.engine.deepScanEnabled
+}
+
+// DeepScanEnabled reports whether the opt-in deep-scan layer is currently on.
+// Exported so the wiring/reload path (and its tests) can observe a config
+// hot-reload taking effect without recreating the service (Spec 077 US3).
+func (s *Service) DeepScanEnabled() bool {
+	return s.deepScanEnabled()
+}
+
+// ApplySecurityConfig (re)configures the opt-in deep-scan layer from the
+// effective security config in a single call, so both the startup wiring and
+// config hot-reload gate the scanner identically (Spec 077 US3). It resolves the
+// deep-scan master switch + per-scanner allow-list (SetDeepScan), the
+// no-new-privileges escape hatch (SetScannerDisableNoNewPrivileges), and the
+// published-package-source fetch (SetFetchPackageSource) — which only runs when
+// deep scan is ON and fetch is not explicitly disabled. All accessors are
+// nil-safe, so a nil SecurityConfig forces the layer fully off (baseline-only).
+// Idempotent: safe to call on every config.reloaded event.
+func (s *Service) ApplySecurityConfig(sec *config.SecurityConfig) {
+	enabled := sec.IsDeepScanEnabled()
+	s.SetDeepScan(enabled, sec.DeepScanScanners())
+	s.SetScannerDisableNoNewPrivileges(sec.IsDisableNoNewPrivileges())
+	fetchPref := true
+	if f := sec.EffectiveFetchPackageSource(); f != nil {
+		fetchPref = *f
+	}
+	s.SetFetchPackageSource(enabled && fetchPref)
+}
+
+// isBaselineScanner reports whether a scanner id belongs to the deterministic
+// in-process baseline (Spec 077). An unknown id is treated as a deep scanner so
+// its failure is attributed to the deep-scan layer, never the baseline.
+func (s *Service) isBaselineScanner(scannerID string) bool {
+	if s.registry != nil {
+		if p, err := s.registry.Get(scannerID); err == nil {
+			return p.InProcess
+		}
+	}
+	return false
+}
+
+// buildDeepScanDescriptor assembles the informational deep-scan availability
+// descriptor (Spec 077 FR-008) from the per-scanner statuses of one or more
+// jobs. It reports the opt-in layer's state SEPARATELY from the baseline verdict
+// and MUST NOT influence ScanSummary.Status. Both passes are considered: Pass 1
+// (security scan) and Pass 2 (supply-chain audit, where the heavy trivy /
+// supply-chain scanners run), so a Pass-2 scanner failure is reflected too.
+//
+// The descriptor is ALWAYS emitted. When deep scan is disabled it reports
+// {enabled:false, ran:false} plus the ids of any enabled-but-skipped Docker
+// scanners, so quickstart scenario 1 (`deep_scan.enabled=false`) is observable
+// and a Docker scanner enabled while the layer is off is never skipped
+// silently. The invariant (Enabled=false ⇒ Ran/Available false, no failures)
+// still holds.
+func (s *Service) buildDeepScanDescriptor(jobs ...*ScanJob) *DeepScanDescriptor {
+	if !s.deepScanEnabled() {
+		return &DeepScanDescriptor{SkippedScanners: s.skippedDeepScannerIDs()}
+	}
+	haveJob := false
+	desc := &DeepScanDescriptor{Enabled: true}
+	seenFailed := make(map[string]bool)
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		haveJob = true
+		for _, ss := range job.ScannerStatuses {
+			if s.isBaselineScanner(ss.ScannerID) {
+				continue // baseline coverage drives Status, not the descriptor
+			}
+			switch ss.Status {
+			case ScanJobStatusCompleted:
+				desc.Ran = true
+				desc.Available = true
+			case ScanJobStatusFailed:
+				if seenFailed[ss.ScannerID] {
+					continue // dedupe the same deep scanner across passes
+				}
+				seenFailed[ss.ScannerID] = true
+				desc.ScannersFailed = append(desc.ScannersFailed, DeepScanScannerFailure{
+					ID:     ss.ScannerID,
+					Reason: ss.Error,
+				})
+			}
+		}
+	}
+	if !haveJob {
+		return nil
+	}
+	return desc
+}
+
+// skippedDeepScannerIDs returns the ids of Docker (non-in-process) scanners
+// that the user has enabled (installed/configured) but that will NOT run
+// because the opt-in deep-scan layer is off. Surfaced via the deep-scan
+// descriptor so the skip is visible instead of silent (audit FIX 3a).
+// Registry.List is sorted, so the result is deterministic.
+func (s *Service) skippedDeepScannerIDs() []string {
+	if s.registry == nil {
+		return nil
+	}
+	var ids []string
+	for _, p := range s.registry.List() {
+		if p.InProcess {
+			continue
+		}
+		if p.Status == ScannerStatusInstalled || p.Status == ScannerStatusConfigured {
+			ids = append(ids, p.ID)
+		}
+	}
+	return ids
+}
+
+// SetIsolationModeResolver injects a per-server isolation-mode resolver so the
+// Docker-scanner skip (MCP-34.4) follows each scanned server's RESOLVED mode —
+// a per-server isolation.mode override beats the global default. The resolver
+// returns "docker"/"sandbox"/"none", or "" to fall back to the engine-wide
+// default. Wired in the server layer from the upstream IsolationManager so the
+// scanner package stays decoupled from the resolver.
+func (s *Service) SetIsolationModeResolver(resolver func(serverName string) string) {
+	s.isolationModeResolver = resolver
+}
+
+// resolveIsolationMode returns the isolation mode to apply to a scan of
+// serverName: the per-server resolver result when it yields a concrete mode,
+// otherwise the engine-wide default. Falls back gracefully when no resolver is
+// wired (e.g. unit tests) so behaviour matches SetIsolationMode alone.
+func (s *Service) resolveIsolationMode(serverName string) string {
+	if s.isolationModeResolver != nil {
+		if mode := s.isolationModeResolver(serverName); mode != "" {
+			return mode
+		}
+	}
+	if s.engine != nil {
+		return s.engine.isolationMode
+	}
+	return ""
+}
+
+// SetFetchPackageSource toggles whether the source resolver may fetch the
+// published source of package-runner servers (npx/uvx) for scanning. This is a
+// facet of the opt-in deep-scan layer (Spec 077 US3): the server layer only
+// enables it when security.deep_scan.enabled is true AND
+// security.deep_scan.fetch_package_source is not explicitly false (the
+// deprecated top-level ScannerFetchPackageSource, MCP-2206, is still honored as
+// a fallback). With deep scan off the effective value is always false, so
+// scanning an npx/uvx server performs no published-package-source network
+// egress by default.
+func (s *Service) SetFetchPackageSource(enabled bool) {
+	if s.sourceResolver == nil {
+		return
+	}
+	s.sourceResolver.SetFetchPackageSource(enabled)
+	if !enabled {
+		s.logger.Info("Scanner published-package-source fetch disabled " +
+			"(security.deep_scan.fetch_package_source=false); npx/uvx servers " +
+			"without local source will scan tool definitions only.")
 	}
 }
 
@@ -183,6 +434,20 @@ func (s *Service) syncRegistryFromStorage() {
 		return
 	}
 	for _, inst := range installed {
+		// Heal in-process scanners (e.g. tpa-descriptions) that an older build
+		// wrongly persisted in a Docker state (error/pulling/available): they
+		// have no image, are always runnable, and must be "installed" so the
+		// engine runs them instead of prefail-skipping every scan (MCP-2396).
+		if reg, err := s.registry.Get(inst.ID); err == nil && reg.InProcess &&
+			inst.Status != ScannerStatusInstalled && inst.Status != ScannerStatusConfigured {
+			healed := targetStatusAfterPull(inst)
+			inst.Status = healed
+			inst.ErrorMsg = ""
+			_ = s.storage.SaveScanner(inst)
+			s.logger.Info("Healed in-process scanner stuck in Docker state",
+				zap.String("scanner", inst.ID), zap.String("status", healed))
+		}
+
 		_ = s.registry.UpdateStatus(inst.ID, inst.Status)
 		// Also update configured env so the engine can pass it to containers
 		if inst.ConfiguredEnv != nil {
@@ -287,6 +552,24 @@ func (s *Service) InstallScanner(ctx context.Context, id string) error {
 		if existing.ImageOverride != "" {
 			scanner.ImageOverride = existing.ImageOverride
 		}
+	}
+
+	// In-process scanners (e.g. tpa-descriptions) run in Go with no Docker
+	// image to pull, so there is nothing to install. Mark them enabled
+	// synchronously and skip the Docker image-availability path entirely —
+	// otherwise the empty EffectiveImage() falls through to the pull path and
+	// the scanner gets stuck in "error"/"pulling", prefail-skipping every scan
+	// (MCP-2396).
+	if scanner.InProcess {
+		scanner.Status = targetStatusAfterPull(scanner)
+		scanner.InstalledAt = time.Now()
+		scanner.ErrorMsg = ""
+		if err := s.storage.SaveScanner(scanner); err != nil {
+			return fmt.Errorf("failed to save scanner: %w", err)
+		}
+		_ = s.registry.UpdateStatus(id, scanner.Status)
+		s.emit().EmitSecurityScannerChanged(id, scanner.Status, "")
+		return nil
 	}
 
 	image := scanner.EffectiveImage()
@@ -573,8 +856,14 @@ func (a *scanCallbackAdapter) OnScanCompleted(job *ScanJob, reports []*ScanRepor
 		a.cleanup()
 	}
 	// Auto-start Pass 2 (supply chain audit) in background after Pass 1 completes.
+	//
+	// Spec 077 US3 (FR-006): Pass 2 is the heavy/deep pass — it calls
+	// ResolveFullSource (Docker image pull / container creation / full-source
+	// extraction) and runs Docker-based deep scanners. It belongs to the opt-in
+	// deep-scan layer, so with deep scan OFF (the default) it must NOT be
+	// scheduled at all; the scan is the Pass-1 in-process baseline only.
 	// Skip for HTTP/URL servers — they have no filesystem to do supply chain analysis on.
-	if a.scanPass == ScanPassSecurityScan && !job.DryRun {
+	if a.scanPass == ScanPassSecurityScan && !job.DryRun && a.service.deepScanEnabled() {
 		isURLServer := a.serverInfo != nil && (a.serverInfo.Protocol == "http" || a.serverInfo.Protocol == "sse" || a.serverInfo.Protocol == "streamable-http")
 		if !isURLServer {
 			go a.service.startPass2(job.ServerName, a.serverInfo)
@@ -596,11 +885,12 @@ func (a *scanCallbackAdapter) OnScanFailed(job *ScanJob, err error) {
 // After Pass 1 completes, Pass 2 (supply chain audit) is auto-started in the background.
 func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool, scannerIDs []string, sourceDir string) (*ScanJob, error) {
 	req := ScanRequest{
-		ServerName: serverName,
-		DryRun:     dryRun,
-		ScannerIDs: scannerIDs,
-		SourceDir:  sourceDir,
-		ScanPass:   ScanPassSecurityScan,
+		ServerName:    serverName,
+		DryRun:        dryRun,
+		ScannerIDs:    scannerIDs,
+		SourceDir:     sourceDir,
+		ScanPass:      ScanPassSecurityScan,
+		IsolationMode: s.resolveIsolationMode(serverName),
 	}
 
 	// Build scan context for transparency
@@ -618,9 +908,37 @@ func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool,
 		}
 	}
 
-	// Auto-resolve source if not explicitly provided
+	// Cross-server snapshot for the in-process tpa-descriptions scanner so its
+	// shadowing.cross_server check can detect impersonation across servers
+	// (Spec 076 FR-003). Best-effort: a provider without the capability, or an
+	// error, just yields no peers and leaves cross-server shadowing inert.
+	if prov, ok := s.serverInfo.(allServerToolsProvider); ok {
+		if all, err := prov.GetAllServerTools(); err == nil && len(all) > 0 {
+			peers := make(map[string][]map[string]interface{}, len(all))
+			for name, tools := range all {
+				if name != serverName && len(tools) > 0 {
+					peers[name] = tools
+				}
+			}
+			if len(peers) > 0 {
+				req.PeerTools = peers
+			}
+		}
+	}
+
+	// Auto-resolve source if not explicitly provided.
+	//
+	// Spec 077 US3 (FR-006): source resolution — Docker container lookup /
+	// extraction (source_resolver.go:findServerContainer/extractFromContainer)
+	// and the published-package-source fetch fallback — is part of the opt-in
+	// deep-scan layer. With deep scan OFF (the default) the only scanner is the
+	// deterministic in-process tpa-descriptions baseline, which scans tool
+	// DEFINITIONS (exported to a temp dir below), not source files — so any
+	// resolved source would be unused anyway. Skip Resolve entirely so no Docker
+	// invocation, network egress, or filesystem extraction ever happens by
+	// default. An explicitly supplied SourceDir (manual scan) is still honored.
 	var resolvedCleanup func()
-	if req.SourceDir == "" && serverInfo != nil {
+	if req.SourceDir == "" && serverInfo != nil && s.deepScanEnabled() {
 		resolved, err := s.sourceResolver.Resolve(ctx, *serverInfo)
 		if err != nil {
 			s.logger.Warn("Auto-source resolution failed",
@@ -636,6 +954,17 @@ func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool,
 				scanCtx.SourcePath = resolved.ServerURL
 			}
 			scanCtx.ContainerID = resolved.ContainerID
+			// Docker-image servers (`docker run mcp/fetch`): the scan target is the
+			// image itself, not a source dir. Carry the reference so image-capable
+			// scanners (Trivy) run in image mode, and surface it in the context.
+			if resolved.ContainerImage != "" {
+				req.ContainerImage = resolved.ContainerImage
+				scanCtx.ContainerImage = resolved.ContainerImage
+				scanCtx.DockerIsolation = true
+				if scanCtx.SourcePath == "" {
+					scanCtx.SourcePath = resolved.ContainerImage
+				}
+			}
 			// Determine Docker isolation status
 			if resolved.Method == "docker_extract" {
 				scanCtx.DockerIsolation = true
@@ -671,12 +1000,17 @@ func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool,
 		// If no source dir was resolved (no Docker container, no working_dir),
 		// create a temp dir so Cisco scanner can at least scan tool definitions.
 		if req.SourceDir == "" {
-			tempDir, err := os.MkdirTemp("", fmt.Sprintf("mcpproxy-scan-tools-%s-", serverName))
+			// The temp-dir name is purely cosmetic — os.MkdirTemp's random suffix
+			// already guarantees uniqueness. Keep the pattern a constant so no
+			// user-controlled server name flows into the path (go/path-injection,
+			// MCP-2155) and slash-named servers are trivially safe (MCP-2123).
+			tempDir, err := os.MkdirTemp("", "mcpproxy-scan-tools-")
 			if err == nil {
 				req.SourceDir = tempDir
-				// For HTTP/URL servers, preserve the "url" source method and path
-				// (the temp dir is only for tool definitions, not the real source)
-				if scanCtx.SourceMethod != "url" {
+				// For HTTP/URL and Docker-image servers, preserve the real source
+				// method and path — the temp dir is only for tool definitions, not
+				// the real scan target (the URL / the image).
+				if scanCtx.SourceMethod != "url" && scanCtx.SourceMethod != "container_image" {
 					scanCtx.SourceMethod = "tool_definitions_only"
 					scanCtx.SourcePath = tempDir
 				}
@@ -773,9 +1107,10 @@ func (s *Service) startPass2(serverName string, serverInfo *ServerInfo) {
 	ctx := context.Background()
 
 	req := ScanRequest{
-		ServerName: serverName,
-		DryRun:     false,
-		ScanPass:   ScanPassSupplyChainAudit,
+		ServerName:    serverName,
+		DryRun:        false,
+		ScanPass:      ScanPassSupplyChainAudit,
+		IsolationMode: s.resolveIsolationMode(serverName),
 	}
 
 	// Build scan context
@@ -807,6 +1142,14 @@ func (s *Service) startPass2(serverName string, serverInfo *ServerInfo) {
 			scanCtx.SourcePath = resolved.ServerURL
 		}
 		scanCtx.ContainerID = resolved.ContainerID
+		// Docker-image servers: scan the image (Trivy image mode reports OS-package
+		// and bundled-dependency CVEs). No source dir to enrich or export tools into.
+		if resolved.ContainerImage != "" {
+			req.ContainerImage = resolved.ContainerImage
+			scanCtx.ContainerImage = resolved.ContainerImage
+			scanCtx.SourcePath = resolved.ContainerImage
+			scanCtx.DockerIsolation = true
+		}
 		if resolved.Method == "docker_extract" {
 			scanCtx.DockerIsolation = true
 		}
@@ -815,8 +1158,9 @@ func (s *Service) startPass2(serverName string, serverInfo *ServerInfo) {
 		scanCtx.TotalFiles = resolved.TotalFiles
 		scanCtx.TotalSizeBytes = resolved.TotalSize
 
-		// Export tool definitions for Cisco scanner
-		if s.serverInfo != nil {
+		// Export tool definitions for Cisco scanner (only when there is a real
+		// source dir to write tools.json into — image-only servers have none).
+		if s.serverInfo != nil && req.SourceDir != "" {
 			s.exportToolDefinitions(serverName, req.SourceDir)
 		}
 	} else {
@@ -978,6 +1322,12 @@ func (s *Service) GetScanReport(ctx context.Context, serverName string) (*Aggreg
 	agg.ScanContext = primaryJob.ScanContext
 	agg.ScannerStatuses = primaryJob.ScannerStatuses
 
+	// Spec 077 US3 (FR-008): mirror the opt-in deep-scan availability descriptor
+	// onto the report so the report page renders the informational banner. Both
+	// passes are considered. Informational only — never changes the verdict;
+	// reports enabled=false (+ skipped scanners) while the layer is off.
+	agg.DeepScan = s.buildDeepScanDescriptor(pass1Job, pass2Job)
+
 	return agg, nil
 }
 
@@ -1071,25 +1421,30 @@ func (s *Service) GetScanReportByJobID(ctx context.Context, jobID string) (*Aggr
 	agg.Pass1Complete = job.ScanPass == ScanPassSecurityScan && job.Status == ScanJobStatusCompleted
 	agg.Pass2Complete = job.ScanPass == ScanPassSupplyChainAudit && job.Status == ScanJobStatusCompleted
 
-	// If this is a Pass 1 job, try to find and merge companion Pass 2 results
+	// If this is a Pass 1 job, try to find and merge companion Pass 2 results.
+	// The companion is resolved via the lightweight scan-job index, so this does
+	// NOT deserialize the full per-server scan history (MCP-2205).
+	var companionPass2 *ScanJob
 	if job.ScanPass == ScanPassSecurityScan || job.ScanPass == 0 {
-		allJobs, _ := s.storage.ListScanJobs(job.ServerName)
-		for _, j := range allJobs {
-			if j.ScanPass == ScanPassSupplyChainAudit && j.Status == ScanJobStatusCompleted && j.StartedAt.After(job.StartedAt) {
-				pass2Reports, err := s.storage.ListScanReportsByJob(j.ID)
-				if err == nil {
-					for _, r := range pass2Reports {
-						for i := range r.Findings {
-							r.Findings[i].ScanPass = ScanPassSupplyChainAudit
-						}
+		if companionID := s.findCompanionPass2JobID(job); companionID != "" {
+			pass2Reports, err := s.storage.ListScanReportsByJob(companionID)
+			if err == nil {
+				for _, r := range pass2Reports {
+					for i := range r.Findings {
+						r.Findings[i].ScanPass = ScanPassSupplyChainAudit
 					}
-					allMerged := append(reports, pass2Reports...)
-					allMerged = deduplicatePass2Findings(allMerged)
-					agg = AggregateReportsWithJobStatus(job.ID, job.ServerName, allMerged, job)
-					agg.Pass1Complete = true
-					agg.Pass2Complete = true
 				}
-				break
+				allMerged := append(reports, pass2Reports...)
+				allMerged = deduplicatePass2Findings(allMerged)
+				agg = AggregateReportsWithJobStatus(job.ID, job.ServerName, allMerged, job)
+				agg.Pass1Complete = true
+				agg.Pass2Complete = true
+			}
+			// Load the companion Pass-2 job so its per-scanner statuses feed the
+			// deep-scan descriptor (Spec 077 FR-008) — the heavy trivy /
+			// supply-chain scanners run in Pass 2.
+			if cj, cerr := s.storage.GetScanJob(companionID); cerr == nil {
+				companionPass2 = cj
 			}
 		}
 
@@ -1103,7 +1458,48 @@ func (s *Service) GetScanReportByJobID(ctx context.Context, jobID string) (*Aggr
 	agg.ScanContext = job.ScanContext
 	agg.ScannerStatuses = job.ScannerStatuses
 
+	// Spec 077 US3 (FR-008): mirror the opt-in deep-scan availability descriptor
+	// so the report page renders the informational banner. Considers this job and
+	// its companion Pass-2 job (when the requested job is a Pass-1 job).
+	// Informational only — never changes the verdict; nil (omitted) when deep
+	// scan is off.
+	agg.DeepScan = s.buildDeepScanDescriptor(job, companionPass2)
+
 	return agg, nil
+}
+
+// findCompanionPass2JobID returns the ID of the Pass-2 (supply-chain audit) job
+// that companions the given Pass-1 job: the earliest completed Pass-2 job that
+// started after it. It reads the lightweight scan-job metadata index rather than
+// the full job records, so its cost is independent of scan-output size and the
+// report path no longer slows down as a server accrues scan history (MCP-2205).
+// Returns "" when no companion exists.
+func (s *Service) findCompanionPass2JobID(pass1 *ScanJob) string {
+	metas, err := s.storage.ListScanJobMetas(pass1.ServerName)
+	if err != nil {
+		s.logger.Warn("failed to list scan job metadata for companion lookup",
+			zap.String("server", pass1.ServerName),
+			zap.Error(err),
+		)
+		return ""
+	}
+
+	var best *ScanJobMeta
+	for _, m := range metas {
+		if m.ScanPass != ScanPassSupplyChainAudit || m.Status != ScanJobStatusCompleted {
+			continue
+		}
+		if !m.StartedAt.After(pass1.StartedAt) {
+			continue
+		}
+		if best == nil || m.StartedAt.Before(best.StartedAt) {
+			best = m
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.ID
 }
 
 // deduplicatePass2Findings removes Pass 2 findings that duplicate Pass 1 findings.
@@ -1146,31 +1542,49 @@ func deduplicatePass2Findings(reports []*ScanReport) []*ScanReport {
 // findLatestPassJobs finds the latest Pass 1 and Pass 2 jobs for a server.
 // Returns (pass1Job, pass2Job, error). At least one must be non-nil on success.
 func (s *Service) findLatestPassJobs(serverName string) (*ScanJob, *ScanJob, error) {
-	jobs, err := s.storage.ListScanJobs(serverName)
-	if err != nil || len(jobs) == 0 {
-		return nil, nil, fmt.Errorf("no scan jobs found for server: %s", serverName)
+	// Read lightweight metadata rather than full job records so this scales with
+	// neither scan-output size nor history depth: we deserialize at most the two
+	// jobs we actually return (MCP-2205).
+	metas, err := s.storage.ListScanJobMetas(serverName)
+	if err != nil {
+		// Surface the underlying I/O error so the caller can distinguish
+		// transient failures from "no records found".
+		return nil, nil, fmt.Errorf("list scan job metadata for %s: %w", serverName, err)
+	}
+	if len(metas) == 0 {
+		return nil, nil, fmt.Errorf("%w: %s", errNoScans, serverName)
 	}
 
-	// Sort by start time descending (newest first)
-	sort.Slice(jobs, func(i, j int) bool {
-		return jobs[i].StartedAt.After(jobs[j].StartedAt)
-	})
+	// Pick the newest Pass-1 and Pass-2 job IDs by start time.
+	var pass1Meta, pass2Meta *ScanJobMeta
+	for _, m := range metas {
+		switch m.ScanPass {
+		case ScanPassSupplyChainAudit:
+			if pass2Meta == nil || m.StartedAt.After(pass2Meta.StartedAt) {
+				pass2Meta = m
+			}
+		case ScanPassSecurityScan, 0:
+			// ScanPass == 0 handles legacy jobs (before two-pass was added)
+			if pass1Meta == nil || m.StartedAt.After(pass1Meta.StartedAt) {
+				pass1Meta = m
+			}
+		}
+	}
+
+	if pass1Meta == nil && pass2Meta == nil {
+		return nil, nil, fmt.Errorf("%w: %s", errNoScans, serverName)
+	}
 
 	var pass1Job, pass2Job *ScanJob
-	for _, j := range jobs {
-		if j.ScanPass == ScanPassSupplyChainAudit && pass2Job == nil {
-			pass2Job = j
-		} else if (j.ScanPass == ScanPassSecurityScan || j.ScanPass == 0) && pass1Job == nil {
-			// ScanPass == 0 handles legacy jobs (before two-pass was added)
-			pass1Job = j
-		}
-		if pass1Job != nil && pass2Job != nil {
-			break
+	if pass1Meta != nil {
+		if pass1Job, err = s.storage.GetScanJob(pass1Meta.ID); err != nil {
+			return nil, nil, fmt.Errorf("load latest pass-1 job %s: %w", pass1Meta.ID, err)
 		}
 	}
-
-	if pass1Job == nil && pass2Job == nil {
-		return nil, nil, fmt.Errorf("no scan jobs found for server: %s", serverName)
+	if pass2Meta != nil {
+		if pass2Job, err = s.storage.GetScanJob(pass2Meta.ID); err != nil {
+			return nil, nil, fmt.Errorf("load latest pass-2 job %s: %w", pass2Meta.ID, err)
+		}
 	}
 
 	return pass1Job, pass2Job, nil
@@ -1193,9 +1607,35 @@ func (s *Service) ApproveServer(ctx context.Context, serverName string, force bo
 		}
 	}
 
-	// Check for critical findings (block unless force)
-	if aggReport != nil && aggReport.Summary.Critical > 0 && !force {
-		return fmt.Errorf("server has %d critical findings; resolve them or use --force to approve anyway", aggReport.Summary.Critical)
+	// Block approval on blocking findings unless forced. Spec 077 FR-021: the
+	// approval gate is PURELY tier-driven, mirroring the server verdict
+	// (GetScanSummary) and the Approve modal exactly. isBlockingFinding is the SAME
+	// predicate that drives the "dangerous" summary status, so the gate and the
+	// verdict can never disagree: a server blocks the gate if and only if its
+	// summary reads "dangerous".
+	//
+	// The former extra `Summary.Critical > 0` guard is intentionally gone (Codex
+	// round-4 finding #3). It could reject an unforced approval on a Critical-
+	// severity but NON-dangerous finding — e.g. a critical CVE, which the classifier
+	// maps to threat_level "warnings" (supply-chain findings inform, they do not
+	// gate), or a deep-scan/external finding — even though the very same summary and
+	// verdict showed the server as non-dangerous. Gate and verdict then disagreed.
+	// Under Spec 077's baseline-only, tier-driven model (FR-021, US3 FR-021 —
+	// deep-scan/external findings inform but never gate) ONLY a HARD-tier baseline
+	// finding blocks. Legacy/external/deep-scan findings carry no tier and never
+	// gate, even at threat_level "dangerous"; they still surface in the summary as
+	// warnings/info. isBlockingFinding is that single tier-driven predicate, so
+	// the gate and the "dangerous" summary status stay consistent.
+	if aggReport != nil && !force {
+		blocking := 0
+		for _, f := range aggReport.Findings {
+			if isBlockingFinding(f) {
+				blocking++
+			}
+		}
+		if blocking > 0 {
+			return fmt.Errorf("server has %d dangerous (hard-tier) finding(s); resolve them or use --force to approve anyway", blocking)
+		}
 	}
 
 	// Create integrity baseline
@@ -1440,7 +1880,14 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 	// Find latest Pass 1 and Pass 2 jobs
 	pass1Job, pass2Job, err := s.findLatestPassJobs(serverName)
 	if err != nil {
-		return nil // No scans run
+		// Spec 047: cache the negative result so untouched servers don't
+		// re-trigger the full BoltDB.ListScanJobs scan on every poll.
+		// Only cache the explicit "no scans found" sentinel — transient
+		// I/O errors must retry on the next call.
+		if errors.Is(err, errNoScans) {
+			s.cacheScanSummary(serverName, nil)
+		}
+		return nil
 	}
 
 	// Use Pass 1 job as primary for timestamp
@@ -1454,6 +1901,13 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 		Status:     "clean",
 	}
 
+	// Spec 077 US3 (FR-008): surface the opt-in deep-scan layer as a SEPARATE
+	// informational dimension. This never influences Status — a failed or
+	// unavailable deep scanner leaves the baseline verdict untouched. Always
+	// present; reports enabled=false (+ any enabled-but-skipped Docker
+	// scanners) while the layer is off.
+	summary.DeepScan = s.buildDeepScanDescriptor(pass1Job, pass2Job)
+
 	// Check if the primary job failed
 	if primaryJob.Status == ScanJobStatusFailed {
 		summary.Status = "failed"
@@ -1461,16 +1915,21 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 		return summary
 	}
 
-	// Check scanner statuses on primary job
+	// Compute scanner coverage for the primary (security) scan pass. This drives
+	// the "degraded" verdict below: a clean/low risk score is not trustworthy
+	// when some scanners never ran (MCP-2401). If no scanner completed at all the
+	// scan is a flat failure, not merely degraded.
 	if len(primaryJob.ScannerStatuses) > 0 {
-		allFailed := true
 		for _, ss := range primaryJob.ScannerStatuses {
-			if ss.Status == ScanJobStatusCompleted {
-				allFailed = false
-				break
+			summary.ScannersTotal++
+			switch ss.Status {
+			case ScanJobStatusCompleted:
+				summary.ScannersRun++
+			case ScanJobStatusFailed:
+				summary.ScannersFailed++
 			}
 		}
-		if allFailed {
+		if summary.ScannersRun == 0 {
 			summary.Status = "failed"
 			s.cacheScanSummary(serverName, summary)
 			return summary
@@ -1524,32 +1983,84 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 
 	summary.RiskScore = CalculateRiskScore(allFindings)
 
-	// Count by threat level
-	counts := FindingCounts{Total: len(allFindings)}
-	for _, f := range allFindings {
-		switch f.ThreatLevel {
-		case ThreatLevelDangerous:
-			counts.Dangerous++
-		case ThreatLevelWarning:
-			counts.Warning++
-		default:
-			counts.Info++
-		}
-	}
+	// Tier-driven, baseline-only bucketing + verdict (Spec 077 FR-014/FR-021).
+	// deriveBaselineVerdict is SHARED with AggregateReports so the server-list
+	// status and the report-page verdict can never disagree.
+	verdict, counts := deriveBaselineVerdict(allFindings)
 	summary.FindingCounts = &counts
-
-	// Determine status
-	if counts.Dangerous > 0 {
-		summary.Status = "dangerous"
-	} else if counts.Warning > 0 {
-		summary.Status = "warnings"
-	} else if counts.Total > 0 {
-		summary.Status = "clean" // Only informational findings
-	}
+	summary.Status = verdict
 
 	// Cache for fast subsequent reads
 	s.cacheScanSummary(serverName, summary)
 	return summary
+}
+
+// isBlockingFinding reports whether a finding gates approval / drives a
+// "dangerous" verdict under the Spec 077 two-tier model (FR-021, US3 FR-021).
+// Blocking is PURELY tier-driven: a finding blocks if and only if it is a
+// HARD-tier baseline finding. Only the in-process detect engine (the baseline
+// scanner) sets Tier, and it emits Tier=="hard" exactly for the hard-tier
+// checks. Every other producer carries no tier:
+//
+//   - Baseline SOFT findings carry Tier=="soft" — review-only, never block.
+//   - Deep-scan / external / legacy findings (Docker scanners, imported SARIF,
+//     supply-chain audits) carry no tier. Per US3 FR-021 these INFORM but do
+//     NOT gate approval, so they never block regardless of threat_level. This
+//     keeps the gate consistent with the baseline-only, tier-driven verdict:
+//     a no-tier "dangerous" finding must not silently unquarantine-block a
+//     server when the baseline itself is clean.
+//
+// This is the SAME predicate that drives the "dangerous" summary status
+// (GetScanSummary) and the ApproveServer gate, so the two can never disagree.
+func isBlockingFinding(f ScanFinding) bool {
+	return f.Tier == TierHard
+}
+
+// deriveBaselineVerdict buckets findings by the Spec 077 tier-driven model and
+// derives the baseline-only verdict (FR-014/FR-021). It is the SINGLE source of
+// truth shared by GetScanSummary (server-list status) and AggregateReports
+// (report-page verdict), so the two surfaces can never disagree.
+//
+// Bucketing: only a HARD baseline finding counts as dangerous
+// (isBlockingFinding). A baseline soft finding (detect emits ThreatLevelWarning
+// for soft-only) counts as a warning. Legacy/external/deep-scan findings carry
+// no tier and therefore never count as dangerous (US3 FR-021 — they inform but
+// do not gate); they surface at warning/info prominence by threat_level. A
+// tierless finding at threat_level "dangerous" is bucketed as a WARNING: it
+// informs without gating, and it must not rank BELOW a warning-level finding
+// (the old bucketing dropped it into Info — an inversion).
+//
+// Verdict: derives SOLELY from baseline findings at every level — "dangerous"
+// requires ≥1 hard-tier baseline finding, "warnings" requires ≥1 warning-level
+// baseline (soft) finding, else "clean". Deep-scan/external/legacy findings are
+// reported via FindingCounts and the DeepScan descriptor but never move it.
+// Only the in-process detect engine sets Tier, so a non-empty Tier identifies a
+// baseline finding.
+func deriveBaselineVerdict(findings []ScanFinding) (string, FindingCounts) {
+	counts := FindingCounts{Total: len(findings)}
+	baselineWarnings := 0
+	for _, f := range findings {
+		switch {
+		case isBlockingFinding(f):
+			counts.Dangerous++
+		case f.ThreatLevel == ThreatLevelWarning,
+			f.Tier == "" && f.ThreatLevel == ThreatLevelDangerous:
+			counts.Warning++
+		default:
+			counts.Info++
+		}
+		if f.Tier != "" && !isBlockingFinding(f) && f.ThreatLevel == ThreatLevelWarning {
+			baselineWarnings++
+		}
+	}
+	switch {
+	case counts.Dangerous > 0:
+		return "dangerous", counts
+	case baselineWarnings > 0:
+		return "warnings", counts
+	default:
+		return "clean", counts // baseline produced nothing above info level
+	}
 }
 
 // ScanSummary is a compact representation of scan status for the server list.
@@ -1558,6 +2069,51 @@ type ScanSummary struct {
 	RiskScore     int            `json:"risk_score"`
 	Status        string         `json:"status"` // clean, warnings, dangerous, failed, not_scanned, scanning
 	FindingCounts *FindingCounts `json:"finding_counts,omitempty"`
+	// Scanner coverage for the primary (security) scan pass. Informational only.
+	// Spec 077 US3 (FR-008/FR-014): Status is derived SOLELY from baseline
+	// findings — a failed Docker deep scanner no longer downgrades a clean
+	// verdict to "degraded"; that failure is surfaced via DeepScan instead.
+	ScannersRun    int `json:"scanners_run"`
+	ScannersFailed int `json:"scanners_failed"`
+	ScannersTotal  int `json:"scanners_total"`
+	// DeepScan is the opt-in heavy-layer availability descriptor (Spec 077
+	// FR-008). It is a SEPARATE informational dimension and MUST NOT influence
+	// Status. Always emitted on a computed summary: when deep scan is off (the
+	// default) it reports enabled=false plus any enabled-but-skipped Docker
+	// scanners, so the skip is observable (audit FIX 3a).
+	DeepScan *DeepScanDescriptor `json:"deep_scan,omitempty"`
+}
+
+// DeepScanDescriptor reports the informational status of the opt-in "deep scan"
+// layer (Docker-based scanners + source extraction) separately from the
+// baseline verdict (Spec 077 FR-008, US3). A disabled, unavailable, or failed
+// deep scan is surfaced here as a quiet note — it never downgrades an otherwise
+// clean baseline to "degraded" and never gates approval (FR-007/FR-021).
+//
+// Invariant: when Enabled is false, Ran and Available are false and
+// ScannersFailed is empty; SkippedScanners is only populated in that disabled
+// state. The descriptor itself is ALWAYS emitted (audit FIX 3a), so a
+// deep-scan-off scan observably reports enabled=false rather than omitting the
+// field.
+type DeepScanDescriptor struct {
+	// Enabled reflects security.deep_scan.enabled (default false).
+	Enabled bool `json:"enabled"`
+	// Ran is true when at least one deep scanner executed this scan.
+	Ran bool `json:"ran"`
+	// Available is false when Docker/source-extraction/prereqs are unavailable.
+	Available bool `json:"available"`
+	// ScannersFailed lists per-scanner best-effort failures (informational).
+	ScannersFailed []DeepScanScannerFailure `json:"scanners_failed,omitempty"`
+	// SkippedScanners lists Docker scanners the user enabled that are being
+	// skipped because deep scan is off (informational; disabled state only).
+	SkippedScanners []string `json:"skipped_scanners,omitempty"`
+}
+
+// DeepScanScannerFailure names a single deep scanner that could not run and why.
+// It is informational only and never affects the baseline verdict.
+type DeepScanScannerFailure struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // FindingCounts groups findings by user-facing threat level.
@@ -1576,11 +2132,11 @@ func (s *Service) invalidateScanSummaryCache(serverName string) {
 	s.summaryCacheMu.Unlock()
 }
 
-// cacheScanSummary stores a computed scan summary in the cache.
+// cacheScanSummary stores a computed scan summary in the cache. A nil summary
+// is stored as a sentinel meaning "we already checked, this server has no
+// scans" — used by spec 047 to avoid re-scanning the BBolt scan-job bucket on
+// every poll for untouched servers.
 func (s *Service) cacheScanSummary(serverName string, summary *ScanSummary) {
-	if summary == nil {
-		return
-	}
 	s.summaryCacheMu.Lock()
 	s.summaryCache[serverName] = summary
 	s.summaryCacheMu.Unlock()

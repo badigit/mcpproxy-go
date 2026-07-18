@@ -24,6 +24,7 @@ type mockTokenStore struct {
 	tokens     map[string]auth.AgentToken
 	createErr  error
 	revokeErr  error
+	deleteErr  error
 	regenToken *auth.AgentToken
 	regenErr   error
 }
@@ -75,6 +76,17 @@ func (m *mockTokenStore) RevokeAgentToken(name string) error {
 	return nil
 }
 
+func (m *mockTokenStore) DeleteAgentToken(name string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	if _, ok := m.tokens[name]; !ok {
+		return fmt.Errorf("agent token %q not found", name)
+	}
+	delete(m.tokens, name)
+	return nil
+}
+
 func (m *mockTokenStore) ValidateAgentToken(rawToken string, _ []byte) (*auth.AgentToken, error) {
 	// Return a valid agent token for any mcp_agt_ prefixed token
 	if auth.ValidateTokenFormat(rawToken) {
@@ -115,14 +127,23 @@ func (m *mockTokenStore) RegenerateAgentToken(name string, _ string, _ []byte) (
 
 type mockTokenController struct {
 	baseController
-	apiKey  string
-	servers []string
+	apiKey   string
+	servers  []string
+	profiles []string
 }
 
 func (m *mockTokenController) GetCurrentConfig() interface{} {
 	return &config.Config{
 		APIKey: m.apiKey,
 	}
+}
+
+func (m *mockTokenController) GetConfig() (*config.Config, error) {
+	cfg := &config.Config{APIKey: m.apiKey}
+	for _, name := range m.profiles {
+		cfg.Profiles = append(cfg.Profiles, config.ProfileConfig{Name: name})
+	}
+	return cfg, nil
 }
 
 func (m *mockTokenController) GetAllServers() ([]map[string]interface{}, error) {
@@ -150,6 +171,21 @@ func newTestTokenServer(t *testing.T, store *mockTokenStore, servers []string) *
 	// Use a temp dir for HMAC key
 	dataDir := t.TempDir()
 	srv.SetTokenStore(store, dataDir)
+	return srv
+}
+
+// newTestTokenServerWithProfiles is like newTestTokenServer but also configures
+// the controller's known profiles (for profile_pin validation tests).
+func newTestTokenServerWithProfiles(t *testing.T, store *mockTokenStore, servers, profiles []string) *Server {
+	t.Helper()
+	logger := zap.NewNop().Sugar()
+	ctrl := &mockTokenController{
+		apiKey:   "test-api-key",
+		servers:  servers,
+		profiles: profiles,
+	}
+	srv := NewServer(ctrl, logger, nil)
+	srv.SetTokenStore(store, t.TempDir())
 	return srv
 }
 
@@ -218,6 +254,55 @@ func TestCreateToken_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, "my-agent", stored.Name)
+}
+
+func TestCreateToken_ProfilePin(t *testing.T) {
+	store := newMockTokenStore()
+	srv := newTestTokenServerWithProfiles(t, store, []string{"server1"}, []string{"research", "deploy"})
+
+	body := createTokenRequest{
+		Name:           "pinned-agent",
+		AllowedServers: []string{"server1"},
+		Permissions:    []string{"read"},
+		ProfilePin:     "research",
+	}
+
+	w := doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	require.Equal(t, http.StatusCreated, w.Code, "expected 201; body=%s", w.Body.String())
+
+	var resp createTokenResponse
+	decodeSuccess(t, w, &resp)
+	assert.Equal(t, "research", resp.ProfilePin, "profile_pin must be echoed on create")
+
+	// Stored record carries the pin.
+	stored, err := store.GetAgentTokenByName("pinned-agent")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "research", stored.ProfilePin)
+
+	// GET surfaces the pin.
+	g := doRequest(t, srv, http.MethodGet, "/api/v1/tokens/pinned-agent", nil)
+	require.Equal(t, http.StatusOK, g.Code)
+	var info tokenInfoResponse
+	decodeSuccess(t, g, &info)
+	assert.Equal(t, "research", info.ProfilePin, "profile_pin must be surfaced on read")
+}
+
+func TestCreateToken_ProfilePinUnknownRejected(t *testing.T) {
+	store := newMockTokenStore()
+	srv := newTestTokenServerWithProfiles(t, store, []string{"server1"}, []string{"research"})
+
+	body := createTokenRequest{
+		Name:        "bad-pin",
+		Permissions: []string{"read"},
+		ProfilePin:  "ghost",
+	}
+
+	w := doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "unknown profile_pin must be rejected at creation")
+
+	_, err := store.GetAgentTokenByName("bad-pin")
+	require.NoError(t, err)
 }
 
 func TestCreateToken_DefaultPermissions(t *testing.T) {
@@ -553,6 +638,59 @@ func TestRevokeToken_NotFound(t *testing.T) {
 
 	w := doRequest(t, srv, http.MethodDelete, "/api/v1/tokens/nonexistent", nil)
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestDeleteToken(t *testing.T) {
+	store := newMockTokenStore()
+	srv := newTestTokenServer(t, store, nil)
+
+	// Create a token
+	body := createTokenRequest{
+		Name:        "delete-me",
+		Permissions: []string{"read"},
+	}
+	w := doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	// Permanently delete it
+	w = doRequest(t, srv, http.MethodDelete, "/api/v1/tokens/delete-me/permanent", nil)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+
+	// Verify it's gone
+	stored, err := store.GetAgentTokenByName("delete-me")
+	require.NoError(t, err)
+	assert.Nil(t, stored)
+}
+
+func TestDeleteToken_NotFound(t *testing.T) {
+	store := newMockTokenStore()
+	srv := newTestTokenServer(t, store, nil)
+
+	w := doRequest(t, srv, http.MethodDelete, "/api/v1/tokens/nonexistent/permanent", nil)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestDeleteToken_FreesNameForReuse verifies the issue #820 flow end-to-end at
+// the API layer: revoke reserves the name, delete frees it for reuse.
+func TestDeleteToken_FreesNameForReuse(t *testing.T) {
+	store := newMockTokenStore()
+	srv := newTestTokenServer(t, store, nil)
+
+	body := createTokenRequest{Name: "reusable", Permissions: []string{"read"}}
+	w := doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	// Revoke keeps the name reserved -> re-create conflicts.
+	w = doRequest(t, srv, http.MethodDelete, "/api/v1/tokens/reusable", nil)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	w = doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	// Permanent delete frees the name -> re-create succeeds.
+	w = doRequest(t, srv, http.MethodDelete, "/api/v1/tokens/reusable/permanent", nil)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	w = doRequest(t, srv, http.MethodPost, "/api/v1/tokens", body)
+	assert.Equal(t, http.StatusCreated, w.Code)
 }
 
 func TestRegenerateToken(t *testing.T) {

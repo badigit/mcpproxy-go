@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -366,6 +367,204 @@ func TestDirectModeHandler_DestructiveToolNeedsDestructivePermission(t *testing.
 	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "destructive")
 }
 
+func TestRequiredPermissionForDirectTool_MapsAnnotationsToAuthPermissions(t *testing.T) {
+	readOnly := true
+	write := false
+	destructive := true
+
+	tests := []struct {
+		name        string
+		annotations *config.ToolAnnotations
+		want        string
+	}{
+		{
+			name: "nil annotations default to read",
+			want: auth.PermRead,
+		},
+		{
+			name: "read only hint maps to read",
+			annotations: &config.ToolAnnotations{
+				ReadOnlyHint: &readOnly,
+			},
+			want: auth.PermRead,
+		},
+		{
+			name: "read only false maps to write",
+			annotations: &config.ToolAnnotations{
+				ReadOnlyHint: &write,
+			},
+			want: auth.PermWrite,
+		},
+		{
+			name: "destructive hint maps to destructive",
+			annotations: &config.ToolAnnotations{
+				DestructiveHint: &destructive,
+			},
+			want: auth.PermDestructive,
+		},
+		{
+			name: "destructive hint takes precedence over read only hint",
+			annotations: &config.ToolAnnotations{
+				ReadOnlyHint:    &readOnly,
+				DestructiveHint: &destructive,
+			},
+			want: auth.PermDestructive,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, requiredPermissionForDirectTool(tt.annotations))
+		})
+	}
+}
+
+func TestSetDirectToolPermissions_DefensivelyCopiesMap(t *testing.T) {
+	proxy := &MCPProxyServer{}
+	toolName := FormatDirectToolName("github", "get_issue")
+	perms := map[string]string{
+		toolName: auth.PermRead,
+	}
+
+	proxy.setDirectToolPermissions(perms)
+	perms[toolName] = auth.PermDestructive
+
+	got, ok := proxy.lookupDirectToolPermission(toolName)
+	require.True(t, ok)
+	assert.Equal(t, auth.PermRead, got)
+}
+
+func TestFilterDirectModeToolsForAuth_DoesNotMutateInputSlice(t *testing.T) {
+	proxy := &MCPProxyServer{}
+	allowed := FormatDirectToolName("github", "get_issue")
+	denied := FormatDirectToolName("gitlab", "get_issue")
+	tools := []mcp.Tool{
+		{Name: allowed},
+		{Name: denied},
+	}
+	original := append([]mcp.Tool(nil), tools...)
+
+	proxy.setDirectToolPermissions(map[string]string{
+		allowed: auth.PermRead,
+		denied:  auth.PermRead,
+	})
+
+	ctx := auth.WithAuthContext(context.Background(), &auth.AuthContext{
+		Type:           auth.AuthTypeAgent,
+		AgentName:      "test-agent",
+		AllowedServers: []string{"github"},
+		Permissions:    []string{auth.PermRead},
+	})
+
+	filtered := proxy.filterDirectModeToolsForAuth(ctx, tools)
+
+	assert.Equal(t, []string{allowed}, directToolNamesForTest(filtered))
+	assert.Equal(t, original, tools)
+}
+
+func TestFilterDirectModeToolsForAuth_AgentServerAndPermissionScope(t *testing.T) {
+	proxy := &MCPProxyServer{}
+
+	githubRead := FormatDirectToolName("github", "get_issue")
+	githubWrite := FormatDirectToolName("github", "create_issue")
+	githubDestroy := FormatDirectToolName("github", "delete_repo")
+	gitlabRead := FormatDirectToolName("gitlab", "get_issue")
+
+	proxy.setDirectToolPermissions(map[string]string{
+		githubRead:    auth.PermRead,
+		githubWrite:   auth.PermWrite,
+		githubDestroy: auth.PermDestructive,
+		gitlabRead:    auth.PermRead,
+	})
+
+	tools := []mcp.Tool{
+		{Name: githubRead},
+		{Name: githubWrite},
+		{Name: githubDestroy},
+		{Name: gitlabRead},
+	}
+
+	agentCtx := auth.WithAuthContext(context.Background(), &auth.AuthContext{
+		Type:           auth.AuthTypeAgent,
+		AgentName:      "test-agent",
+		AllowedServers: []string{"github"},
+		Permissions:    []string{auth.PermRead, auth.PermWrite},
+	})
+
+	filtered := proxy.filterDirectModeToolsForAuth(agentCtx, tools)
+
+	assert.Equal(t, []string{githubRead, githubWrite}, directToolNamesForTest(filtered))
+}
+
+func TestFilterDirectModeToolsForAuth_NonAgentUnchanged(t *testing.T) {
+	proxy := &MCPProxyServer{}
+	tools := []mcp.Tool{
+		{Name: FormatDirectToolName("github", "get_issue")},
+		{Name: FormatDirectToolName("gitlab", "get_issue")},
+	}
+
+	assert.Equal(t, tools, proxy.filterDirectModeToolsForAuth(context.Background(), tools))
+
+	adminCtx := auth.WithAuthContext(context.Background(), auth.AdminContext())
+	assert.Equal(t, tools, proxy.filterDirectModeToolsForAuth(adminCtx, tools))
+}
+
+func TestFilterDirectModeToolsForAuth_FailsClosedOnMissingPermissionMetadata(t *testing.T) {
+	proxy := &MCPProxyServer{}
+
+	visible := FormatDirectToolName("github", "get_issue")
+	missing := FormatDirectToolName("github", "unknown")
+	proxy.setDirectToolPermissions(map[string]string{
+		visible: auth.PermRead,
+	})
+
+	ctx := auth.WithAuthContext(context.Background(), &auth.AuthContext{
+		Type:           auth.AuthTypeAgent,
+		AgentName:      "test-agent",
+		AllowedServers: []string{"github"},
+		Permissions:    []string{auth.PermRead},
+	})
+
+	filtered := proxy.filterDirectModeToolsForAuth(ctx, []mcp.Tool{
+		{Name: visible},
+		{Name: missing},
+	})
+
+	assert.Equal(t, []string{visible}, directToolNamesForTest(filtered))
+}
+
+func TestFilterDirectModeToolsForAuth_KeepsNonDirectTools(t *testing.T) {
+	proxy := &MCPProxyServer{}
+
+	direct := FormatDirectToolName("github", "get_issue")
+	nonDirect := "retrieve_tools"
+	proxy.setDirectToolPermissions(map[string]string{
+		direct: auth.PermRead,
+	})
+
+	ctx := auth.WithAuthContext(context.Background(), &auth.AuthContext{
+		Type:           auth.AuthTypeAgent,
+		AgentName:      "test-agent",
+		AllowedServers: []string{"github"},
+		Permissions:    []string{auth.PermRead},
+	})
+
+	filtered := proxy.filterDirectModeToolsForAuth(ctx, []mcp.Tool{
+		{Name: direct},
+		{Name: nonDirect},
+	})
+
+	assert.Equal(t, []string{direct, nonDirect}, directToolNamesForTest(filtered))
+}
+
+func directToolNamesForTest(tools []mcp.Tool) []string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
 func TestDirectModeHandler_NoAuthContext(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	proxy := &MCPProxyServer{
@@ -543,4 +742,38 @@ func TestHandleRetrieveToolsForMode_ClosureReturnsDifferentInstructions(t *testi
 	// Code exec should mention code_execution, retrieve should mention call_tool_read
 	assert.Contains(t, codeExecInstructions, "code_execution")
 	assert.Contains(t, retrieveInstructions, "call_tool_read")
+}
+
+func TestSafeTruncateBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		s     string
+		limit int
+		want  int
+	}{
+		{"ascii cut mid-string", "hello world", 5, 5},
+		{"limit beyond length", "hi", 10, 2},
+		{"limit equals length", "hello", 5, 5},
+		{"zero limit", "hello", 0, 0},
+		{"negative limit", "hello", -1, 0},
+		// "héllo": 'é' is 2 bytes (0xC3 0xA9) at indices 1-2. A raw cut at 2
+		// would split it; safeTruncateBytes backs up to 1.
+		{"cut inside 2-byte rune backs up", "héllo", 2, 1},
+		{"cut at 2-byte rune end is kept", "héllo", 3, 3},
+		// "😀x": emoji is 4 bytes (indices 0-3). Cuts inside it back up to 0.
+		{"cut inside 4-byte rune backs up to 0", "😀x", 2, 0},
+		{"cut at emoji boundary kept", "😀x", 4, 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := safeTruncateBytes(tt.s, tt.limit)
+			if got != tt.want {
+				t.Fatalf("safeTruncateBytes(%q, %d) = %d, want %d", tt.s, tt.limit, got, tt.want)
+			}
+			// The truncated prefix must always be valid UTF-8.
+			if !utf8.ValidString(tt.s[:got]) {
+				t.Errorf("prefix %q is not valid UTF-8", tt.s[:got])
+			}
+		})
+	}
 }

@@ -14,9 +14,18 @@ package scanner
 //
 // Keep this slice sorted alphabetically by ID so the list order is
 // deterministic across API, CLI, and UI.
+//
+// Default enablement (Spec 077 FR-018): the deterministic in-process scanner
+// (tpa-descriptions, InProcess:true) loads as "installed" and runs for every
+// server with zero setup — it is the always-on baseline. Every Docker-backed
+// scanner loads as "available" (see registry.go loadBundledRegistry), which the
+// engine's resolveScanners treats as NOT enabled: a Docker scanner only runs
+// once its image is pulled/configured. So the heavy "deep scan" layer is
+// off-by-default here without a separate Enabled flag; the deep-scan config gate
+// (US3) governs when those Docker scanners may be turned on at all.
 var bundledScanners = []*ScannerPlugin{
 	{
-		ID:          "cisco-mcp-scanner",
+		ID:          ciscoScannerID,
 		Name:        "Cisco MCP Scanner",
 		Vendor:      "Cisco AI Defense",
 		Description: "YARA rules + readiness analysis. Detects tool poisoning, prompt injection, credential harvesting, and data exfiltration. No API key needed for offline mode.",
@@ -92,7 +101,7 @@ var bundledScanners = []*ScannerPlugin{
 		ID:          "ramparts",
 		Name:        "Ramparts MCP Scanner",
 		Vendor:      "Javelin (getjavelin.com)",
-		Description: "Rust-based MCP security scanner with YARA rules. Detects tool poisoning, SQL injection, command injection, path traversal, secrets leakage, and prompt injection.",
+		Description: "Rust-based MCP security scanner with YARA rules. Detects tool poisoning, SQL injection, command injection, path traversal, secrets leakage, and prompt injection. Runs fully offline: v0.8.x scans a live MCP endpoint, so MCPProxy replays the captured tool definitions to it over stdio (the upstream is never re-executed).",
 		License:     "Proprietary",
 		Homepage:    "https://github.com/getjavelin/ramparts",
 		DockerImage: "ghcr.io/smart-mcp-proxy/scanner-ramparts:latest",
@@ -100,9 +109,15 @@ var bundledScanners = []*ScannerPlugin{
 		Outputs:     []string{"sarif"},
 		RequiredEnv: nil,
 		OptionalEnv: nil,
-		Command:     nil, // Uses entrypoint.sh
-		Timeout:     "120s",
-		NetworkReq:  true, // Stub MCP server runs inside container
+		// Uses entrypoint.sh. v0.8.x dropped directory scanning: the entrypoint
+		// runs `ramparts scan stdio:python3:/usr/local/bin/mcp-replay.py` against
+		// a static shim that replays /scan/source/tools.json over MCP. See
+		// docker/scanners/ramparts/entrypoint.sh + mcp-replay.py.
+		Command: nil,
+		Timeout: "120s",
+		// YARA analysis is fully offline and the replay shim is local-only, so no
+		// container network is required (LLM-backed analysis remains out of scope).
+		NetworkReq: false,
 	},
 	{
 		ID:          "semgrep-mcp",
@@ -123,19 +138,44 @@ var bundledScanners = []*ScannerPlugin{
 		NetworkReq: true,   // Downloads rules from registry
 	},
 	{
+		ID:          inProcessTPAScannerID,
+		Name:        "Tool Description Analyzer (built-in)",
+		Vendor:      "MCPProxy",
+		Description: "Built-in, Docker-less analyzer for a connected server's tool descriptions and schemas. Detects Tool-Poisoning-Attack (TPA) indicators — hidden instructions, prompt-injection phrasing, data-exfiltration hints — and embedded secrets. Runs for ANY connected server, including remote http/sse servers with no source files or Docker container.",
+		License:     "Apache-2.0",
+		Homepage:    "https://github.com/smart-mcp-proxy/mcpproxy-go",
+		DockerImage: "",                 // in-process; no image to pull
+		Inputs:      []string{"source"}, // reads the exported tools.json
+		Outputs:     []string{"sarif"},
+		RequiredEnv: nil,
+		OptionalEnv: nil,
+		Command:     nil,
+		Timeout:     "30s",
+		NetworkReq:  false,
+		InProcess:   true,
+	},
+	{
 		ID:          "trivy-mcp",
 		Name:        "Trivy Vulnerability Scanner",
 		Vendor:      "Aqua Security",
 		Description: "Comprehensive vulnerability scanner for filesystem, dependencies, and container images. Detects known CVEs and misconfigurations.",
 		License:     "Apache-2.0",
 		Homepage:    "https://trivy.dev",
-		DockerImage: "ghcr.io/aquasecurity/trivy:latest",
+		// Our wrapper pre-caches the vuln DB at image build time (MCP-2150),
+		// eliminating the ~96 MiB first-run download that raced the timeout.
+		// Rebuilt weekly via scanner-images.yml to keep the DB current.
+		DockerImage: "ghcr.io/smart-mcp-proxy/scanner-trivy:latest",
 		Inputs:      []string{"source", "container_image"},
 		Outputs:     []string{"sarif"},
 		RequiredEnv: nil,
 		OptionalEnv: nil,
 		Command:     []string{"fs", "--format", "sarif", "/scan/source"},
-		Timeout:     "300s", // First run downloads vuln DB (~90MB)
-		NetworkReq:  true,   // Needs to download vulnerability database
+		// For Docker-image servers (`docker run mcp/fetch`) scan the image itself
+		// instead of an empty source dir. Trivy resolves the image via the local
+		// daemon/containerd/podman and falls back to pulling from the remote
+		// registry (network is enabled), so no docker socket mount is required.
+		ImageCommand: []string{"image", "--format", "sarif", "{{IMAGE}}"},
+		Timeout:      "120s", // DB is pre-cached; network only needed for image pulls
+		NetworkReq:   true,   // Required for `trivy image` pulling remote container images
 	},
 }

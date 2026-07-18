@@ -43,7 +43,26 @@ func NewManager(dataDir string, logger *zap.SugaredLogger) (*Manager, error) {
 	}, nil
 }
 
-// Close closes the storage manager
+// StopAsync stops the async operation manager, draining any queued
+// operations to the database. It is idempotent: a second call (including
+// the one inside Close) is a no-op, so callers may StopAsync then Close.
+//
+// Use this when a final DB write must happen strictly AFTER all queued
+// async operations have flushed but BEFORE the DB handle closes — e.g.
+// the telemetry shutdown marker (Spec 080 FR-010): StopAsync, write the
+// marker, then Close, which then closes the DB with no intervening work.
+func (m *Manager) StopAsync() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.asyncMgr != nil {
+		m.asyncMgr.Stop()
+	}
+}
+
+// Close closes the storage manager: it stops the async manager (draining
+// queued operations to the DB — a no-op if StopAsync already ran), then
+// closes the underlying BBolt database.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -85,22 +104,33 @@ func (m *Manager) SaveUpstreamServer(serverConfig *config.ServerConfig) error {
 	defer m.mu.Unlock()
 
 	record := &UpstreamRecord{
-		ID:             serverConfig.Name, // Use name as ID for simplicity
-		Name:           serverConfig.Name,
-		URL:            serverConfig.URL,
-		Protocol:       serverConfig.Protocol,
-		Command:        serverConfig.Command,
-		Args:           serverConfig.Args,
-		WorkingDir:     serverConfig.WorkingDir,
-		Env:            serverConfig.Env,
-		Headers:        serverConfig.Headers,
-		OAuth:          serverConfig.OAuth,
-		Enabled:        serverConfig.Enabled,
-		Quarantined:    serverConfig.Quarantined,
-		Created:        serverConfig.Created,
-		Updated:        time.Now(),
-		Isolation:      serverConfig.Isolation,
-		ReconnectOnUse: serverConfig.ReconnectOnUse,
+		ID:                     serverConfig.Name, // Use name as ID for simplicity
+		Name:                   serverConfig.Name,
+		URL:                    serverConfig.URL,
+		Protocol:               serverConfig.Protocol,
+		Command:                serverConfig.Command,
+		Args:                   serverConfig.Args,
+		WorkingDir:             serverConfig.WorkingDir,
+		Env:                    serverConfig.Env,
+		Headers:                serverConfig.Headers,
+		OAuth:                  serverConfig.OAuth,
+		Enabled:                serverConfig.Enabled,
+		Quarantined:            serverConfig.Quarantined,
+		Created:                serverConfig.Created,
+		Updated:                time.Now(),
+		Isolation:              serverConfig.Isolation,
+		ReconnectOnUse:         serverConfig.ReconnectOnUse,
+		AutoApproveToolChanges: serverConfig.AutoApproveToolChanges,
+		LauncherWaitTimeout:    serverConfig.LauncherWaitTimeout,
+		EnabledTools:           serverConfig.EnabledTools,
+		DisabledTools:          serverConfig.DisabledTools,
+
+		SourceRegistryID:         serverConfig.SourceRegistryID,
+		SourceRegistryProvenance: serverConfig.SourceRegistryProvenance,
+		HealthCheckInterval:      serverConfig.HealthCheckInterval,
+		ToolDiscoveryInterval:    serverConfig.ToolDiscoveryInterval,
+		InitTimeout:              serverConfig.InitTimeout,
+		ToonOutput:               serverConfig.ToonOutput,
 	}
 
 	return m.db.SaveUpstream(record)
@@ -117,21 +147,32 @@ func (m *Manager) GetUpstreamServer(name string) (*config.ServerConfig, error) {
 	}
 
 	return &config.ServerConfig{
-		Name:           record.Name,
-		URL:            record.URL,
-		Protocol:       record.Protocol,
-		Command:        record.Command,
-		Args:           record.Args,
-		WorkingDir:     record.WorkingDir,
-		Env:            record.Env,
-		Headers:        record.Headers,
-		OAuth:          record.OAuth,
-		Enabled:        record.Enabled,
-		Quarantined:    record.Quarantined,
-		Created:        record.Created,
-		Updated:        record.Updated,
-		Isolation:      record.Isolation,
-		ReconnectOnUse: record.ReconnectOnUse,
+		Name:                   record.Name,
+		URL:                    record.URL,
+		Protocol:               record.Protocol,
+		Command:                record.Command,
+		Args:                   record.Args,
+		WorkingDir:             record.WorkingDir,
+		Env:                    record.Env,
+		Headers:                record.Headers,
+		OAuth:                  record.OAuth,
+		Enabled:                record.Enabled,
+		Quarantined:            record.Quarantined,
+		Created:                record.Created,
+		Updated:                record.Updated,
+		Isolation:              record.Isolation,
+		ReconnectOnUse:         record.ReconnectOnUse,
+		AutoApproveToolChanges: record.AutoApproveToolChanges,
+		LauncherWaitTimeout:    record.LauncherWaitTimeout,
+		EnabledTools:           record.EnabledTools,
+		DisabledTools:          record.DisabledTools,
+
+		SourceRegistryID:         record.SourceRegistryID,
+		SourceRegistryProvenance: record.SourceRegistryProvenance,
+		HealthCheckInterval:      record.HealthCheckInterval,
+		ToolDiscoveryInterval:    record.ToolDiscoveryInterval,
+		InitTimeout:              record.InitTimeout,
+		ToonOutput:               record.ToonOutput,
 	}, nil
 }
 
@@ -148,21 +189,32 @@ func (m *Manager) ListUpstreamServers() ([]*config.ServerConfig, error) {
 	var servers []*config.ServerConfig
 	for _, record := range records {
 		servers = append(servers, &config.ServerConfig{
-			Name:           record.Name,
-			URL:            record.URL,
-			Protocol:       record.Protocol,
-			Command:        record.Command,
-			Args:           record.Args,
-			WorkingDir:     record.WorkingDir,
-			Env:            record.Env,
-			Headers:        record.Headers,
-			OAuth:          record.OAuth,
-			Enabled:        record.Enabled,
-			Quarantined:    record.Quarantined,
-			Created:        record.Created,
-			Updated:        record.Updated,
-			Isolation:      record.Isolation,
-			ReconnectOnUse: record.ReconnectOnUse,
+			Name:                   record.Name,
+			URL:                    record.URL,
+			Protocol:               record.Protocol,
+			Command:                record.Command,
+			Args:                   record.Args,
+			WorkingDir:             record.WorkingDir,
+			Env:                    record.Env,
+			Headers:                record.Headers,
+			OAuth:                  record.OAuth,
+			Enabled:                record.Enabled,
+			Quarantined:            record.Quarantined,
+			Created:                record.Created,
+			Updated:                record.Updated,
+			Isolation:              record.Isolation,
+			ReconnectOnUse:         record.ReconnectOnUse,
+			AutoApproveToolChanges: record.AutoApproveToolChanges,
+			LauncherWaitTimeout:    record.LauncherWaitTimeout,
+			EnabledTools:           record.EnabledTools,
+			DisabledTools:          record.DisabledTools,
+
+			SourceRegistryID:         record.SourceRegistryID,
+			SourceRegistryProvenance: record.SourceRegistryProvenance,
+			HealthCheckInterval:      record.HealthCheckInterval,
+			ToolDiscoveryInterval:    record.ToolDiscoveryInterval,
+			InitTimeout:              record.InitTimeout,
+			ToonOutput:               record.ToonOutput,
 		})
 	}
 
@@ -195,20 +247,25 @@ func (m *Manager) ListQuarantinedUpstreamServers() ([]*config.ServerConfig, erro
 
 		if record.Quarantined {
 			quarantinedServers = append(quarantinedServers, &config.ServerConfig{
-				Name:        record.Name,
-				URL:         record.URL,
-				Protocol:    record.Protocol,
-				Command:     record.Command,
-				Args:        record.Args,
-				WorkingDir:  record.WorkingDir,
-				Env:         record.Env,
-				Headers:     record.Headers,
-				OAuth:       record.OAuth,
-				Enabled:     record.Enabled,
-				Quarantined: record.Quarantined,
-				Created:     record.Created,
-				Updated:     record.Updated,
-				Isolation:   record.Isolation,
+				Name:          record.Name,
+				URL:           record.URL,
+				Protocol:      record.Protocol,
+				Command:       record.Command,
+				Args:          record.Args,
+				WorkingDir:    record.WorkingDir,
+				Env:           record.Env,
+				Headers:       record.Headers,
+				OAuth:         record.OAuth,
+				Enabled:       record.Enabled,
+				Quarantined:   record.Quarantined,
+				Created:       record.Created,
+				Updated:       record.Updated,
+				Isolation:     record.Isolation,
+				EnabledTools:  record.EnabledTools,
+				DisabledTools: record.DisabledTools,
+
+				SourceRegistryID:         record.SourceRegistryID,
+				SourceRegistryProvenance: record.SourceRegistryProvenance,
 			})
 
 			m.logger.Debugw("Added server to quarantined list",
@@ -430,49 +487,19 @@ func (m *Manager) DeleteServerToolApprovals(serverName string) error {
 	return m.db.DeleteServerToolApprovals(serverName)
 }
 
-// Tool enrichment operations (LLM-derived search metadata cache)
-
-// SaveToolEnrichment persists an enrichment result. Overwrites any prior
-// entry for the same (server, tool) pair.
-func (m *Manager) SaveToolEnrichment(record *EnrichedToolMeta) error {
+// PruneOrphanToolApprovals removes tool-approval records for servers that are
+// no longer in the configured set, returning the number removed. Configured
+// servers (even disabled ones) are preserved so re-enabling never re-quarantines
+// previously-approved tools (MCP-1002).
+func (m *Manager) PruneOrphanToolApprovals(configuredServers []string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.SaveToolEnrichment(record)
-}
-
-// GetToolEnrichment returns a cached enrichment if the stored description
-// hash and prompt version match. A mismatch is reported as a cache miss.
-func (m *Manager) GetToolEnrichment(serverName, toolName, descriptionHash string, promptVersion int) (*EnrichedToolMeta, bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.db.GetToolEnrichment(serverName, toolName, descriptionHash, promptVersion)
-}
-
-// ListToolEnrichments returns every stored enrichment, optionally scoped
-// to a single server.
-func (m *Manager) ListToolEnrichments(serverName string) ([]*EnrichedToolMeta, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.db.ListToolEnrichments(serverName)
-}
-
-// DeleteToolEnrichment removes a single enrichment record.
-func (m *Manager) DeleteToolEnrichment(serverName, toolName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return m.db.DeleteToolEnrichment(serverName, toolName)
-}
-
-// DeleteServerToolEnrichments removes every enrichment record for a server.
-func (m *Manager) DeleteServerToolEnrichments(serverName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return m.db.DeleteServerToolEnrichments(serverName)
+	keep := make(map[string]bool, len(configuredServers))
+	for _, name := range configuredServers {
+		keep[name] = true
+	}
+	return m.db.PruneToolApprovalsNotIn(keep)
 }
 
 // Security Scanner methods (Spec 039)
@@ -531,6 +558,15 @@ func (m *Manager) ListScanJobs(serverName string) ([]*scanner.ScanJob, error) {
 	defer m.mu.RUnlock()
 
 	return m.db.ListScanJobs(serverName)
+}
+
+// ListScanJobMetas returns lightweight scan-job metadata, optionally filtered by
+// server name (MCP-2205).
+func (m *Manager) ListScanJobMetas(serverName string) ([]*scanner.ScanJobMeta, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListScanJobMetas(serverName)
 }
 
 // GetLatestScanJob returns the most recent scan job for a server
@@ -723,6 +759,14 @@ func (m *Manager) GetSchemaVersion() (uint64, error) {
 	defer m.mu.RUnlock()
 
 	return m.db.GetSchemaVersion()
+}
+
+// SetSchemaVersion stores the current migration schema version.
+func (m *Manager) SetSchemaVersion(version uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SetSchemaVersion(version)
 }
 
 // GetStats returns storage statistics
@@ -1154,6 +1198,21 @@ type SessionRecord struct {
 	HasRoots     bool     `json:"has_roots,omitempty"`    // Whether client supports roots
 	HasSampling  bool     `json:"has_sampling,omitempty"` // Whether client supports sampling
 	Experimental []string `json:"experimental,omitempty"` // Experimental capability names
+
+	// Workspace / work session (Spec 082).
+	//
+	// WorkspaceRoot is the project the client is working in, fetched once from
+	// the client's MCP roots. It is a LOCAL FILESYSTEM PATH: it stays on this
+	// machine and is never sent to telemetry. WorkspaceName is its basename, and
+	// is what the UI shows.
+	//
+	// WorkSessionID groups this connection with the other connections that make
+	// up the same stretch of user work (see internal/runtime/worksession.go).
+	// A client reconnecting every few minutes produces many session records that
+	// all share one WorkSessionID.
+	WorkspaceRoot string `json:"workspace_root,omitempty"`
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	WorkSessionID string `json:"work_session_id,omitempty"`
 }
 
 // CreateSession creates a new session record
@@ -1391,6 +1450,63 @@ func (m *Manager) CloseAllActiveSessions() error {
 
 		return nil
 	})
+}
+
+// SetSessionWorkspace backfills the workspace on an already-persisted session.
+//
+// Needed because the workspace is discovered asynchronously (the client is asked
+// for its roots only after the handshake completes — asking during it deadlocks),
+// so a busy session can be persisted before the answer arrives.
+func (m *Manager) SetSessionWorkspace(sessionID, workspaceRoot string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(SessionsBucket))
+		if bucket == nil {
+			return fmt.Errorf("sessions bucket not found")
+		}
+
+		var sessionKey []byte
+		var session SessionRecord
+		c := bucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if strings.HasSuffix(string(k), "_"+sessionID) {
+				sessionKey = k
+				if err := json.Unmarshal(v, &session); err != nil {
+					return fmt.Errorf("failed to unmarshal session: %w", err)
+				}
+				break
+			}
+		}
+		if sessionKey == nil {
+			return fmt.Errorf("session not found: %s", sessionID)
+		}
+
+		session.WorkspaceRoot = workspaceRoot
+		session.WorkspaceName = workspaceDisplayName(workspaceRoot)
+
+		data, err := json.Marshal(session)
+		if err != nil {
+			return fmt.Errorf("failed to marshal session: %w", err)
+		}
+		return bucket.Put(sessionKey, data)
+	})
+}
+
+// workspaceDisplayName is the basename of a workspace root. Only the basename is
+// ever displayed or exported — the full path is local and private.
+func workspaceDisplayName(root string) string {
+	root = strings.TrimSpace(root)
+	root = strings.TrimPrefix(root, "file://")
+	root = strings.TrimRight(root, "/")
+	if root == "" {
+		return ""
+	}
+	if i := strings.LastIndex(root, "/"); i >= 0 {
+		return root[i+1:]
+	}
+	return root
 }
 
 // UpdateSessionStats increments tool call count and adds tokens
@@ -1772,4 +1888,22 @@ func extractServerNameFromKey(key string) string {
 	}
 
 	return key[:lastUnderscore]
+}
+
+// Onboarding wizard operations (Spec 046)
+
+// GetOnboardingState returns the current wizard engagement state.
+func (m *Manager) GetOnboardingState() (*OnboardingState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetOnboardingState()
+}
+
+// SaveOnboardingState persists the wizard engagement state.
+func (m *Manager) SaveOnboardingState(state *OnboardingState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveOnboardingState(state)
 }

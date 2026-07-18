@@ -4,7 +4,7 @@ title: Installation
 sidebar_label: Installation
 sidebar_position: 1
 description: Install MCPProxy on macOS, Windows, or Linux
-keywords: [install, setup, homebrew, dmg, windows, linux, deb, rpm, apt, dnf]
+keywords: [install, setup, homebrew, dmg, windows, linux, deb, rpm, apt, dnf, arch, aur]
 ---
 
 # Installation
@@ -21,9 +21,16 @@ The DMG installers are signed and notarized by Apple.
 
 ### Homebrew
 
+Install the full macOS tray app (signed & notarized, bundles the core server):
+
 ```bash
-brew tap smart-mcp-proxy/mcpproxy
-brew install mcpproxy
+brew install --cask smart-mcp-proxy/mcpproxy/mcpproxy
+```
+
+Or install just the headless core CLI (no tray app):
+
+```bash
+brew install smart-mcp-proxy/mcpproxy/mcpproxy
 ```
 
 
@@ -46,9 +53,59 @@ The installer will:
 
 ## Linux
 
-### Debian / Ubuntu (.deb)
+### Debian / Ubuntu — apt repository (recommended)
 
-Download the latest `.deb` from the [releases page](https://github.com/smart-mcp-proxy/mcpproxy-go/releases) and install it with `apt`.
+Add the MCPProxy apt repository once; `apt upgrade` handles updates from then on, like any other system package.
+
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://apt.mcpproxy.app/mcpproxy.gpg \
+  | sudo tee /etc/apt/keyrings/mcpproxy.gpg > /dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/mcpproxy.gpg] https://apt.mcpproxy.app stable main" \
+  | sudo tee /etc/apt/sources.list.d/mcpproxy.list > /dev/null
+sudo apt update
+sudo apt install mcpproxy
+```
+
+Supported architectures: `amd64`, `arm64`. See [Linux Package Repositories](../features/linux-package-repos.md) for details on retention, pinning older versions, mirroring, and troubleshooting.
+
+Repository signing key fingerprint: `3B6F A1AD 5D53 59DA 51F1  8DDC E1B5 9B9B A1CB 8A3B`. You can verify it with `gpg --show-keys` against the public key URL above.
+
+### Fedora / RHEL / Rocky / AlmaLinux — dnf repository (recommended)
+
+```bash
+sudo dnf config-manager --add-repo https://rpm.mcpproxy.app/mcpproxy.repo
+sudo dnf install -y mcpproxy
+```
+
+Supported architectures: `x86_64`, `aarch64`.
+
+### Arch Linux — AUR (community-maintained)
+
+MCPProxy is available on the [Arch User Repository](https://aur.archlinux.org/) as [`mcpproxy-bin`](https://aur.archlinux.org/packages/mcpproxy-bin), which installs the official upstream binary plus a hardened systemd unit.
+
+```bash
+# With an AUR helper (recommended)
+yay -S mcpproxy-bin
+
+# Or manually with makepkg
+git clone https://aur.archlinux.org/mcpproxy-bin.git
+cd mcpproxy-bin
+makepkg -si
+```
+
+The package installs `mcpproxy` to `/usr/bin` and ships a systemd user unit at `/usr/lib/systemd/user/mcpproxy.service`.
+
+Enable it with:
+:::note Update cadence
+
+Unlike the apt/dnf repositories above, AUR is community-driven: new versions land via the `mcpproxy-bin` PKGBUILD being bumped, not via a project-controlled mirror. The package is currently kept current by automation in the maintainer's [updater repo](https://github.com/JasonLandbridge/Arch-Linux-AUR-Packages-Updater), so bumps usually appear within a day of a GitHub release. If `yay` reports an old version after a recent release, you can flag the package "out-of-date" on AUR or fall back to the [Tarball install](#tarball-any-distro) below.
+
+:::
+
+### Debian / Ubuntu — direct `.deb` download (fallback)
+
+If the apt repository isn't reachable (air-gapped installs, behind corporate proxies blocking `mcpproxy.app`, etc.), download the `.deb` from the [releases page](https://github.com/smart-mcp-proxy/mcpproxy-go/releases) and install it locally.
 
 **One-liner (auto-detects latest version):**
 
@@ -82,6 +139,58 @@ sudo journalctl -u mcpproxy -f      # tail logs
 sudo nano /etc/mcpproxy/mcp_config.json   # edit config (then restart)
 sudo systemctl restart mcpproxy
 ```
+
+### Migrating from a manually-installed mcpproxy
+
+If you've been running an older mcpproxy from a binary you dropped into `/usr/local/bin/` with a hand-rolled systemd unit (typically running as your own user, with config under `~/.mcpproxy/`), the apt/dnf install is a different layout. The deb/rpm runs as a dedicated `mcpproxy` system user with config in `/etc/mcpproxy/` and state in `/var/lib/mcpproxy/`. Migration takes a couple of minutes; the only tricky bit is preserving paths your existing config references.
+
+```bash
+# 0. Stop and back up everything
+sudo systemctl stop mcpproxy
+sudo cp -a ~/.mcpproxy ~/mcpproxy-backup-$(date +%Y%m%d)
+sudo cp ~/.mcpproxy/mcp_config.json ~/mcpproxy-config-backup-$(date +%Y%m%d).json
+
+# 1. Remove the old service + binaries
+sudo systemctl disable mcpproxy
+sudo rm /etc/systemd/system/mcpproxy.service \
+        /etc/systemd/system/multi-user.target.wants/mcpproxy.service
+sudo systemctl daemon-reload
+sudo mv /usr/local/bin/mcpproxy /usr/local/bin/mcpproxy.pre-deb.bak  # keep one rollback
+
+# 2. Install the deb (follow the "apt repository (recommended)" section above)
+#    The service starts immediately on a fresh config — stop it before migrating state.
+sudo systemctl stop mcpproxy
+
+# 3. Carry state across. config.db preserves quarantine + tool-approval state;
+#    skip this copy if you'd rather start clean and re-approve every tool.
+sudo cp ~/.mcpproxy/config.db          /var/lib/mcpproxy/config.db
+sudo cp ~/.mcpproxy/mcp_config.json    /etc/mcpproxy/mcp_config.json
+sudo chown -R mcpproxy:mcpproxy /var/lib/mcpproxy
+sudo chown root:mcpproxy /etc/mcpproxy/mcp_config.json
+sudo chmod 0640 /etc/mcpproxy/mcp_config.json
+
+# 4. Rewrite any home-relative paths inside the migrated config.
+#    The new service can't read /home/<you>/ because the unit sets ProtectHome=true.
+sudo sed -i.bak \
+    -e "s|\"data_dir\": \"$HOME/.mcpproxy\"|\"data_dir\": \"/var/lib/mcpproxy\"|g" \
+    /etc/mcpproxy/mcp_config.json
+sudo grep -nE "$HOME" /etc/mcpproxy/mcp_config.json   # should print nothing
+
+# 5. If any stdio server uses `docker run`, give the mcpproxy user docker access:
+sudo usermod -aG docker mcpproxy
+
+# 6. Start it
+sudo systemctl start mcpproxy
+sudo systemctl status mcpproxy --no-pager
+```
+
+Things to watch for after step 6:
+
+- **Secrets files referenced from the config**: if any of your stdio servers `source` an env file from your home directory (e.g. `set -a; source ~/.mcpproxy/foo.env; ...`), copy that file to `/etc/mcpproxy/` with `root:mcpproxy 0640` ownership and update the path inside `mcp_config.json`. `ProtectHome=true` will otherwise make the file invisible to the service.
+- **Custom data_dir or cache paths**: the same `sed` pattern as step 4 — anything under `$HOME` becomes invisible.
+- **Snap-installed Docker**: on Ubuntu hosts where Docker came from snap (the default on 24.04), `mcpproxy doctor` will warn about additional one-time host setup (`loginctl enable-linger mcpproxy`, `snap set system homedirs=/var/lib`, and a systemd drop-in). Follow the snippet `doctor` prints, then `sudo systemctl restart mcpproxy`. The error you'd see otherwise is `cannot create XDG_RUNTIME_DIR folder "/run/user/<uid>/snap.docker"`.
+
+Once you've confirmed the new service is healthy (`mcpproxy doctor` reports no issues), you can delete the backups under `~/mcpproxy-backup-*` — but the deb keeps your config intact across future upgrades regardless.
 
 ### Network exposure: localhost by default
 
@@ -141,7 +250,9 @@ curl -H "X-API-Key: ${API_KEY}" http://<server-ip>:8080/api/v1/status
 
 For a deeper dive on auth, agent tokens, and the security model, see the [Configuration Reference](/configuration/config-file) and the [REST API reference](/api/rest-api).
 
-### Fedora / RHEL / CentOS / openSUSE (.rpm)
+### Fedora / RHEL / CentOS / openSUSE — direct `.rpm` download (fallback)
+
+For air-gapped or offline installs where the dnf repository isn't reachable.
 
 **One-liner (auto-detects latest version):**
 

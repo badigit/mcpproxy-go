@@ -99,6 +99,41 @@ func DetectConfigChanges(oldCfg, newCfg *config.Config) *ConfigApplyResult {
 		result.ChangedFields = append(result.ChangedFields, "call_tool_timeout")
 	}
 
+	// TOON output (spec 084, FR-001 — hot-reloadable). The call_tool_* encoder
+	// seam reads ToonOutput/ToonMinSavingsPct fresh on every call (same pattern
+	// as output sanitisation), so applying the change is free; these entries
+	// exist so a lone toon edit is acknowledged instead of being reported as
+	// "no changes detected". Per-server toon_output overrides are already
+	// covered by the Servers DeepEqual above.
+	if oldCfg.ToonOutput != newCfg.ToonOutput {
+		result.ChangedFields = append(result.ChangedFields, "toon_output")
+	}
+	if oldCfg.ToonMinSavingsPct != newCfg.ToonMinSavingsPct {
+		result.ChangedFields = append(result.ChangedFields, "toon_min_savings_pct")
+	}
+
+	// Tool response mode (Spec 085 FR-015 — hot-reloadable, serialization
+	// only). Without this clause an API apply that changes only this field
+	// computes empty ChangedFields and is swallowed as "no changes detected".
+	// The retrieve path reads the live snapshot (p.currentConfig()), so
+	// reporting the change is all the propagation needed.
+	if oldCfg.ToolResponseMode != newCfg.ToolResponseMode {
+		result.ChangedFields = append(result.ChangedFields, "tool_response_mode")
+	}
+
+	// Discovery & health-check cadence (spec 074 — hot-reloadable). The health
+	// loop (managed client) and indexing loop (runtime) re-resolve their interval
+	// each cycle, and ApplyConfig propagates the new global config to the upstream
+	// manager + managed clients, so a global edit takes effect without a restart
+	// (FR-012/SC-002). Tracking these keeps a lone interval edit from being
+	// reported as "no changes detected".
+	if !reflect.DeepEqual(oldCfg.HealthCheckInterval, newCfg.HealthCheckInterval) {
+		result.ChangedFields = append(result.ChangedFields, "health_check_interval")
+	}
+	if !reflect.DeepEqual(oldCfg.ToolDiscoveryInterval, newCfg.ToolDiscoveryInterval) {
+		result.ChangedFields = append(result.ChangedFields, "tool_discovery_interval")
+	}
+
 	// Logging configuration (can be hot-reloaded)
 	if !reflect.DeepEqual(oldCfg.Logging, newCfg.Logging) {
 		result.ChangedFields = append(result.ChangedFields, "logging")
@@ -131,6 +166,32 @@ func DetectConfigChanges(oldCfg, newCfg *config.Config) *ConfigApplyResult {
 	// Environment configuration (can be hot-reloaded)
 	if !reflect.DeepEqual(oldCfg.Environment, newCfg.Environment) {
 		result.ChangedFields = append(result.ChangedFields, "environment")
+	}
+
+	// Observability cadence (Spec 069 A2 — can be hot-reloaded; the usage flush
+	// loop re-reads the interval each cycle, so applying it is just a setter).
+	if !reflect.DeepEqual(oldCfg.Observability, newCfg.Observability) {
+		result.ChangedFields = append(result.ChangedFields, "observability")
+	}
+
+	// Security scanner settings, incl. the opt-in deep-scan layer (Spec 077 US3
+	// — hot-reloadable). The scanner service is (re)configured from cfg.Security
+	// on the config.reloaded event, so a lone security.deep_scan.* edit MUST be
+	// reported as a change (not "No configuration changes detected") and drive
+	// that re-apply — otherwise toggling deep scan via config edit / API apply
+	// only takes effect on restart. Deep compare covers deep_scan.{enabled,
+	// fetch_package_source,disable_no_new_privileges,scanners} plus the deprecated
+	// top-level scanner_* keys.
+	if !reflect.DeepEqual(oldCfg.Security, newCfg.Security) {
+		result.ChangedFields = append(result.ChangedFields, "security")
+	}
+
+	// Update-check settings (Spec 079 FR-012 — hot-reloadable). ApplyConfig
+	// re-gates the running updatecheck.Checker when this field is reported,
+	// so an update_check.{enabled,channel} edit takes effect without a
+	// restart (and is not swallowed as "No configuration changes detected").
+	if !reflect.DeepEqual(oldCfg.UpdateCheck, newCfg.UpdateCheck) {
+		result.ChangedFields = append(result.ChangedFields, "update_check")
 	}
 
 	// If no changes detected

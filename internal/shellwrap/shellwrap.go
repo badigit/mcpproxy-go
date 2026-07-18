@@ -106,11 +106,13 @@ func WrapWithUserShell(logger *zap.Logger, command string, args []string) (shell
 	commandString := strings.Join(parts, " ")
 
 	if logger != nil {
+		// Redact secret env values (`-e KEY=VALUE`) before logging — docker-command
+		// upstreams inject Slack/Jira tokens here and debug logs are written to disk.
 		logger.Debug("shellwrap: wrapping command with user login shell",
 			zap.String("original_command", command),
-			zap.Strings("original_args", args),
+			zap.Strings("original_args", RedactDockerArgs(args)),
 			zap.String("shell", shell),
-			zap.String("wrapped_command", commandString))
+			zap.String("wrapped_command", RedactDockerCommandString(commandString)))
 	}
 
 	isBash := isBashLikeShell(shell)
@@ -124,84 +126,252 @@ func WrapWithUserShell(logger *zap.Logger, command string, args []string) (shell
 
 // --- Docker path resolution ---------------------------------------------
 
+// dockerPathNegativeTTL bounds how long a failed lookup is cached. We retry
+// after this window so a transient failure (e.g. mcpproxy started from a
+// PKInstallSandbox where /bin/sh -l is restricted, then later able to find
+// docker once the install context drains) self-heals instead of poisoning
+// the process for its entire lifetime. Successes are cached forever.
+//
+// var (not const) so tests can drop it to zero for retry-behavior coverage.
+var dockerPathNegativeTTL = 60 * time.Second
+
 var (
-	dockerPathOnce sync.Once
-	dockerPath     string
-	dockerPathErr  error
+	dockerPathMu        sync.Mutex
+	dockerPath          string
+	dockerPathSource    string // which branch resolved docker (see DockerSource* enum)
+	dockerPathErr       error
+	dockerPathHasResult bool
+	dockerPathExpires   time.Time // zero for cached success (never expires)
 )
 
-// ResolveDockerPath returns the absolute path to the `docker` binary. The
-// result is cached for the process lifetime so that repeated calls from hot
-// paths (health checks, connection diagnostics) do not re-spawn a login shell
-// on every invocation.
+// DockerSource* are the coarse, fixed-enum labels describing HOW the docker
+// CLI was resolved (or that it is absent). They are emitted in telemetry as the
+// #696 fleet signal (docker-installed-but-not-on-PATH). They deliberately carry
+// no path, host, or user information — only the resolution branch.
+const (
+	DockerSourcePath       = "path"        // found via exec.LookPath (ambient PATH)
+	DockerSourceBundled    = "bundled"     // found at a well-known install location (e.g. Docker Desktop bundle)
+	DockerSourceLoginShell = "login_shell" // recovered via the user's login-shell PATH
+	DockerSourceAbsent     = "absent"      // not resolvable anywhere (#696 worst case)
+)
+
+// wellKnownDockerPathsFn returns docker install locations to probe directly
+// when neither $PATH nor the user's login shell exposes a docker binary.
+// Exposed as a package variable so tests can stub the list.
+var wellKnownDockerPathsFn = defaultWellKnownDockerPaths
+
+func defaultWellKnownDockerPaths() []string {
+	switch runtime.GOOS {
+	case "darwin":
+		// Order matters: prefer the bundle binary (always present when
+		// Docker Desktop is installed) over /usr/local/bin/docker which is
+		// merely a symlink Docker Desktop creates and may be missing when
+		// /usr/local/bin is not writable (Docker falls back to ~/.docker/bin
+		// in that case — see docker/for-mac#6168).
+		paths := []string{
+			"/Applications/Docker.app/Contents/Resources/bin/docker", // canonical bundle binary
+			"/usr/local/bin/docker",                                  // Docker Desktop symlink (when present)
+			"/opt/homebrew/bin/docker",                               // Apple Silicon Homebrew
+			"/opt/podman/bin/docker",                                 // Podman shim
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			paths = append(paths,
+				home+"/.docker/bin/docker",   // Docker Desktop fallback when /usr/local/bin not writable
+				home+"/.orbstack/bin/docker", // OrbStack
+			)
+		}
+		return paths
+	case "linux":
+		return []string{
+			"/usr/bin/docker",
+			"/usr/local/bin/docker",
+			"/snap/bin/docker",
+		}
+	}
+	return nil
+}
+
+// probeWellKnownDocker returns the first existing executable from the
+// well-known docker install locations, or "" if none qualify.
+func probeWellKnownDocker(logger *zap.Logger) string {
+	for _, candidate := range wellKnownDockerPathsFn() {
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.Mode()&0o111 == 0 {
+			continue
+		}
+		if logger != nil {
+			logger.Debug("shellwrap: resolved docker via well-known path",
+				zap.String("path", candidate))
+		}
+		return candidate
+	}
+	return ""
+}
+
+// ResolveDockerPath returns the absolute path to the `docker` binary.
+// Successful resolutions are cached for the process lifetime; failed
+// resolutions are cached only for dockerPathNegativeTTL so a transient
+// failure (e.g. PKInstallSandbox at process start) does not permanently
+// disable docker discovery for the daemon.
 //
 // Resolution order:
 //  1. exec.LookPath("docker") — cheap, works when mcpproxy was started from
-//     a terminal or when the LaunchAgent PATH already contains docker.
-//  2. Fallback: ask the user's login shell `command -v docker` so we pick up
-//     Homebrew / Colima / Docker Desktop installs that only exist in the
-//     interactive PATH. This fallback is only run once.
+//     a terminal or when launchd's PATH already contains docker.
+//  2. Probe well-known install locations directly (Docker Desktop's bundle
+//     binary, /usr/local/bin/docker symlink, Apple Silicon Homebrew,
+//     ~/.docker/bin, OrbStack, snap, etc.). Avoids the fragile login-shell
+//     dance when the binary is at a predictable path.
+//  3. Last resort: ask the user's login shell `command -v docker` so we pick
+//     up Colima or other non-standard installs only present in the
+//     interactive PATH. Skipped on Windows.
 func ResolveDockerPath(logger *zap.Logger) (string, error) {
-	dockerPathOnce.Do(func() {
-		// Fast path: ask Go's standard PATH lookup first.
-		if p, err := exec.LookPath("docker"); err == nil && p != "" {
-			dockerPath = p
-			if logger != nil {
-				logger.Debug("shellwrap: resolved docker via PATH", zap.String("path", p))
-			}
-			return
-		}
-
-		// Slow path: shell out once via the user's login shell.
-		if runtime.GOOS == osWindows {
-			dockerPathErr = fmt.Errorf("docker not found in PATH")
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		shell, shellArgs := WrapWithUserShell(logger, "command", []string{"-v", "docker"})
-		cmd := exec.CommandContext(ctx, shell, shellArgs...)
-		out, err := cmd.Output()
-		if err != nil {
-			dockerPathErr = fmt.Errorf("login-shell docker lookup failed: %w", err)
-			return
-		}
-		resolved := strings.TrimSpace(string(out))
-		if resolved == "" {
-			dockerPathErr = fmt.Errorf("docker not found in login shell PATH")
-			return
-		}
-		dockerPath = resolved
-		if logger != nil {
-			logger.Debug("shellwrap: resolved docker via login shell",
-				zap.String("path", resolved))
-		}
-	})
-	return dockerPath, dockerPathErr
+	dockerPathMu.Lock()
+	defer dockerPathMu.Unlock()
+	return resolveDockerPathLocked(logger)
 }
 
-// resetDockerPathCacheForTest is used by tests to probe the sync.Once
-// behaviour. It is intentionally unexported and only referenced from
+// resolveDockerPathLocked is the single cache-aware resolver. Callers MUST hold
+// dockerPathMu. It is the one place the docker-path cache (path, err, expiry)
+// AND the parallel dockerPathSource enum are written, so ResolveDockerPath and
+// ResolveDockerSource can never diverge on the same cache state — including the
+// MCP-2744 stat-probe override. (Earlier the two functions duplicated this
+// logic and the source-tracking drifted between them.)
+func resolveDockerPathLocked(logger *zap.Logger) (string, error) {
+	// Honor cache: keep successful resolutions forever.
+	if dockerPathHasResult && dockerPathErr == nil {
+		return dockerPath, nil
+	}
+
+	// A cached negative within its TTL would normally short-circuit here. But
+	// the well-known-path probe is a pure os.Stat — never sandbox- or
+	// login-shell-restricted — so a negative cached because only the restricted
+	// login-shell leg failed must NOT permanently shadow a docker binary that is
+	// sitting at a well-known path right now (the spawn-vs-status divergence in
+	// MCP-2744). Re-run the cheap probe before honoring a live negative; on
+	// success, upgrade the cache to a permanent success and return it.
+	if dockerPathHasResult && dockerPathErr != nil &&
+		!dockerPathExpires.IsZero() && time.Now().Before(dockerPathExpires) {
+		if p := probeWellKnownDocker(logger); p != "" {
+			dockerPath = p
+			// The override resolves via the well-known-path probe, so the
+			// source is "bundled". Must be set here too, else a stale "absent"
+			// from the prior failed resolution leaks into docker_cli_source
+			// telemetry on the next ResolveDockerSource call (schema v5).
+			dockerPathSource = DockerSourceBundled
+			dockerPathErr = nil
+			dockerPathExpires = time.Time{}
+			return p, nil
+		}
+		return dockerPath, dockerPathErr
+	}
+
+	path, source, err := resolveDockerPathUncached(logger)
+	dockerPath = path
+	dockerPathSource = source
+	dockerPathErr = err
+	dockerPathHasResult = true
+	if err != nil {
+		dockerPathExpires = time.Now().Add(dockerPathNegativeTTL)
+	} else {
+		dockerPathExpires = time.Time{}
+	}
+	return path, err
+}
+
+// ResolveDockerSource returns the coarse, fixed-enum label describing how the
+// docker CLI was resolved (DockerSourcePath / DockerSourceBundled /
+// DockerSourceLoginShell), or DockerSourceAbsent when docker cannot be found.
+// It drives the SAME cache path as ResolveDockerPath (via resolveDockerPathLocked),
+// so the reported source always matches the resolution ResolveDockerPath would
+// give for the current cache state — including the MCP-2744 stat-probe override
+// during the negative-TTL window. Never returns the resolved path — only the
+// branch — so callers (telemetry) cannot leak it.
+func ResolveDockerSource(logger *zap.Logger) string {
+	dockerPathMu.Lock()
+	defer dockerPathMu.Unlock()
+	if _, err := resolveDockerPathLocked(logger); err != nil {
+		return DockerSourceAbsent
+	}
+	return sourceOrAbsent(dockerPathSource)
+}
+
+// sourceOrAbsent normalizes an empty source string to DockerSourceAbsent so the
+// enum is never blank on the wire.
+func sourceOrAbsent(source string) string {
+	if source == "" {
+		return DockerSourceAbsent
+	}
+	return source
+}
+
+// resolveDockerPathUncached resolves docker and reports which branch found it.
+// The returned source is one of DockerSourcePath / DockerSourceBundled /
+// DockerSourceLoginShell on success, or DockerSourceAbsent on failure.
+func resolveDockerPathUncached(logger *zap.Logger) (path, source string, err error) {
+	// Fast path: ask Go's standard PATH lookup first.
+	if p, lookErr := exec.LookPath("docker"); lookErr == nil && p != "" {
+		if logger != nil {
+			logger.Debug("shellwrap: resolved docker via PATH", zap.String("path", p))
+		}
+		return p, DockerSourcePath, nil
+	}
+
+	// Well-known path probe: covers PKG-installer / launchd / sandboxed
+	// contexts where $SHELL=/bin/sh and the user's interactive PATH
+	// customizations are unreachable, but Docker Desktop is installed at
+	// a standard location. Cheap (just os.Stat) and reliable.
+	if p := probeWellKnownDocker(logger); p != "" {
+		return p, DockerSourceBundled, nil
+	}
+
+	// Slow path: shell out via the user's login shell. Only useful for
+	// non-standard installs (Colima, custom prefixes); skipped on Windows.
+	if runtime.GOOS == osWindows {
+		return "", DockerSourceAbsent, fmt.Errorf("docker not found in PATH or well-known locations")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	shell, shellArgs := WrapWithUserShell(logger, "command", []string{"-v", "docker"})
+	cmd := exec.CommandContext(ctx, shell, shellArgs...)
+	out, lookErr := cmd.Output()
+	if lookErr != nil {
+		return "", DockerSourceAbsent, fmt.Errorf("login-shell docker lookup failed: %w", lookErr)
+	}
+	resolved := strings.TrimSpace(string(out))
+	if resolved == "" {
+		return "", DockerSourceAbsent, fmt.Errorf("docker not found in login shell PATH")
+	}
+	if logger != nil {
+		logger.Debug("shellwrap: resolved docker via login shell",
+			zap.String("path", resolved))
+	}
+	return resolved, DockerSourceLoginShell, nil
+}
+
+// resetDockerPathCacheForTest is used by tests to clear the cache between
+// scenarios. It is intentionally unexported and only referenced from
 // shellwrap_test.go.
 func resetDockerPathCacheForTest() {
-	dockerPathOnce = sync.Once{}
+	dockerPathMu.Lock()
+	defer dockerPathMu.Unlock()
 	dockerPath = ""
+	dockerPathSource = ""
 	dockerPathErr = nil
+	dockerPathHasResult = false
+	dockerPathExpires = time.Time{}
 }
 
 // --- Login-shell PATH capture --------------------------------------------
 
-var (
-	loginShellPathOnce sync.Once
-	loginShellPathVal  string
-)
-
 // LoginShellPATH returns the PATH value emitted by the user's login shell.
-// It is captured exactly once per process via
-// `<shell> -l -c 'printf %s "$PATH"'` and cached for the rest of the
-// process lifetime.
+// It is a thin view over captureLoginShellEnv (hydrate.go), which sources the
+// login shell exactly once per process and caches the full environment — so
+// PATH capture and env hydration share a single shell fork.
 //
 // Why this exists: when mcpproxy runs as a macOS App Bundle or LaunchAgent,
 // os.Getenv("PATH") is often `/usr/bin:/bin`. That is enough for Go's
@@ -219,39 +389,11 @@ var (
 // Callers should treat an empty return value as "no override available"
 // and fall back to os.Getenv("PATH").
 func LoginShellPATH(logger *zap.Logger) string {
-	loginShellPathOnce.Do(func() {
-		if runtime.GOOS == osWindows {
-			return
-		}
-		shell := resolveLoginShell()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		// `-l -c 'printf %s "$PATH"'` works on bash, zsh, dash, sh.
-		// We deliberately build the argv ourselves rather than going
-		// through WrapWithUserShell because shellescape would quote
-		// the `$PATH` and suppress expansion.
-		cmd := exec.CommandContext(ctx, shell, "-l", "-c", `printf %s "$PATH"`)
-		out, err := cmd.Output()
-		if err != nil {
-			if logger != nil {
-				logger.Debug("shellwrap: login-shell PATH capture failed",
-					zap.String("shell", shell),
-					zap.Error(err))
-			}
-			return
-		}
-		captured := strings.TrimSpace(string(out))
-		if captured == "" {
-			return
-		}
-		loginShellPathVal = captured
-		if logger != nil {
-			logger.Debug("shellwrap: captured login-shell PATH",
-				zap.String("shell", shell),
-				zap.Int("path_length", len(captured)))
-		}
-	})
-	return loginShellPathVal
+	env := captureLoginShellEnv(logger)
+	if env == nil {
+		return ""
+	}
+	return env["PATH"]
 }
 
 // mergePathUnique joins two PATH-style strings into one, preserving the
@@ -283,10 +425,10 @@ func mergePathUnique(primary, secondary, sep string) string {
 	return strings.Join(parts, sep)
 }
 
-// resetLoginShellPathCacheForTest is only referenced from shellwrap_test.go.
+// resetLoginShellPathCacheForTest clears the shared login-shell capture cache.
+// Only referenced from shellwrap_test.go.
 func resetLoginShellPathCacheForTest() {
-	loginShellPathOnce = sync.Once{}
-	loginShellPathVal = ""
+	resetLoginShellEnvCacheForTest()
 }
 
 // --- Minimal environment for scanner subprocesses ------------------------

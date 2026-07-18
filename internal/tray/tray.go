@@ -26,7 +26,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/mod/semver"
 
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server"
 	// "github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/cli" // replaced by in-process OAuth
@@ -88,6 +87,13 @@ type ServerInterface interface {
 
 	// OAuth control
 	TriggerOAuthLogin(serverName string) error
+
+	// Profile switcher (Profiles v2 T5). The tray holds no state — it reads the
+	// configured profiles and the server-level default active profile from the
+	// core, and writes the active profile back, all via REST.
+	GetProfiles() ([]ProfileInfo, error)
+	GetActiveProfile() (string, error)
+	SetActiveProfile(name string) error
 }
 
 // App represents the system tray application
@@ -111,6 +117,7 @@ type App struct {
 	// startStopItem removed - tray doesn't directly control core lifecycle
 	upstreamServersMenu *systray.MenuItem
 	quarantineMenu      *systray.MenuItem
+	profileMenu         *systray.MenuItem
 	portConflictMenu    *systray.MenuItem
 	portConflictInfo    *systray.MenuItem
 	portConflictRetry   *systray.MenuItem
@@ -128,11 +135,17 @@ type App struct {
 	autostartItem    *systray.MenuItem
 
 	// Update notification menu item (hidden until update is available)
-	updateMenuItem     *systray.MenuItem
-	updateAvailable    bool
-	latestVersion      string
-	latestReleaseURL   string
-	updateCheckMu      sync.RWMutex
+	updateMenuItem   *systray.MenuItem
+	updateAvailable  bool
+	latestVersion    string
+	latestReleaseURL string
+	updateCheckMu    sync.RWMutex
+
+	// selfUpdateFunc, when non-nil, replaces the legacy GitHub self-update flow
+	// that runs after the core-API update-check gate. Tests inject it to assert
+	// whether the network path runs once the gate passes; production leaves it
+	// nil so performSelfUpdate runs.
+	selfUpdateFunc func()
 
 	// Config path for opening from menu
 	configPath string
@@ -540,10 +553,13 @@ func (a *App) onReady() {
 	// --- Upstream & Quarantine Menus ---
 	a.upstreamServersMenu = systray.AddMenuItem("Upstream Servers", "Manage upstream servers")
 	a.quarantineMenu = systray.AddMenuItem("Security Quarantine", "Manage quarantined servers")
+
+	// --- Profile Switcher (Profiles v2 T5) ---
+	a.profileMenu = systray.AddMenuItem("Profile: All servers", "Switch the active tool-discovery profile")
 	systray.AddSeparator()
 
 	// --- Initialize Managers ---
-	a.menuManager = NewMenuManager(a.upstreamServersMenu, a.quarantineMenu, a.logger)
+	a.menuManager = NewMenuManager(a.upstreamServersMenu, a.quarantineMenu, a.profileMenu, a.logger)
 	a.syncManager = NewSynchronizationManager(a.stateManager, a.server, a.menuManager, a.logger)
 	a.syncManager.SetOnSync(func() {
 		a.instrumentation.NotifyMenus()
@@ -1024,7 +1040,13 @@ func (a *App) onExit() {
 	}
 }
 
-// checkForUpdates checks for new releases on GitHub
+// checkForUpdates gates the tray's legacy GitHub self-update check on the
+// core's decision, then runs it. Per the tray-holds-no-state rule the tray must
+// never read mcp_config.json itself; instead it asks the core (via the same
+// /api/v1/info endpoint checkUpdateFromAPI uses) whether update checking is on.
+// The core's update_check config is thus the single source of truth (Spec 079
+// FR-015). The environment kill-switch MCPPROXY_DISABLE_AUTO_UPDATE is checked
+// first and wins regardless (FR-014 precedence: env > config).
 func (a *App) checkForUpdates() {
 	// Check if auto-update is disabled by environment variable
 	if os.Getenv("MCPPROXY_DISABLE_AUTO_UPDATE") == trueStr {
@@ -1032,6 +1054,38 @@ func (a *App) checkForUpdates() {
 		return
 	}
 
+	// Ask the core whether an update check should run. The core omits the
+	// update object when update_check.enabled=false (or when no update exists),
+	// so its answer gates this tray-owned GitHub check without the tray reading
+	// the config file.
+	info, reachable := a.fetchCoreUpdateInfo()
+	if !reachable {
+		// Core unreachable: skip this tick rather than fall open to a network
+		// check the operator may have disabled via config. The 24h ticker
+		// retries; env kill-switch semantics are unchanged.
+		a.logger.Debug("Core unreachable for update-check gate; skipping tray self-update check this tick")
+		return
+	}
+	if info == nil {
+		// Core answered but omitted the update object: update checking is
+		// disabled (update_check.enabled=false, Spec 079 FR-015) or no update
+		// exists. Either way the tray must not run its own network check.
+		a.logger.Info("Update checking disabled or no update reported by core; skipping tray self-update check")
+		return
+	}
+
+	if a.selfUpdateFunc != nil {
+		a.selfUpdateFunc()
+		return
+	}
+	a.performSelfUpdate()
+}
+
+// performSelfUpdate runs the legacy tray-owned GitHub self-update flow (asset
+// resolution + download/apply). It only runs after checkForUpdates confirms via
+// the core that update checking is enabled. Full FR-001a convergence onto the
+// core's resolved asset is out of scope; the GitHub resolution stays here.
+func (a *App) performSelfUpdate() {
 	// Disable auto-update for app bundles by default (DMG installation should be manual)
 	if a.isAppBundle() && os.Getenv("MCPPROXY_UPDATE_APP_BUNDLE") != trueStr {
 		a.logger.Info("Auto-update disabled for app bundle installations (use DMG for updates)")
@@ -1161,16 +1215,30 @@ func (a *App) findAssetURL(release *GitHubRelease) (string, error) {
 		runtime.GOOS, runtime.GOARCH, latestSuffix, versionedSuffix)
 }
 
-// isHomebrewInstallation checks if this is a Homebrew installation
+// isHomebrewInstallation checks if this is a Homebrew installation.
+// Self-update is suppressed for Homebrew installs so it never conflicts with
+// the package manager (Spec 079 FR-011).
 func (a *App) isHomebrewInstallation() bool {
 	execPath, err := os.Executable()
 	if err != nil {
 		return false
 	}
 
-	// Check if running from Homebrew path
+	return isHomebrewPath(execPath)
+}
+
+// isHomebrewPath reports whether the executable path belongs to a Homebrew
+// prefix. Symlinks are resolved first: on Intel macs the binary is exposed as
+// /usr/local/bin/mcpproxy-tray, a symlink into /usr/local/Cellar/…, which the
+// raw-path checks would miss (Spec 079 US2 gap fix).
+func isHomebrewPath(execPath string) bool {
+	if resolved, err := filepath.EvalSymlinks(execPath); err == nil && resolved != "" {
+		execPath = resolved
+	}
+
 	return strings.Contains(execPath, "/opt/homebrew/") ||
 		strings.Contains(execPath, "/usr/local/Homebrew/") ||
+		strings.Contains(execPath, "/usr/local/Cellar/") ||
 		strings.Contains(execPath, "/home/linuxbrew/")
 }
 
@@ -1606,6 +1674,10 @@ func (a *App) handleServerAction(serverName, action string) {
 	case "unquarantine":
 		err = a.syncManager.HandleServerUnquarantine(serverName)
 
+	case "switch_profile":
+		// Profiles v2 T5: serverName carries the profile slug ("" = all servers).
+		err = a.handleSwitchProfile(serverName)
+
 	default:
 		a.logger.Warn("Unknown server action requested", zap.String("action", action))
 	}
@@ -1616,6 +1688,26 @@ func (a *App) handleServerAction(serverName, action string) {
 			zap.String("action", action),
 			zap.Error(err))
 	}
+}
+
+// handleSwitchProfile sets the server-level default active profile via the core
+// REST surface (Profiles v2 T5) and triggers an immediate sync so the submenu's
+// title and checkmarks reflect the new selection without waiting for the next
+// poll. An empty slug clears the profile (all servers).
+func (a *App) handleSwitchProfile(slug string) error {
+	if a.server == nil {
+		return fmt.Errorf("server interface unavailable")
+	}
+	a.logger.Info("Switching active profile from tray", zap.String("profile", slug))
+	if err := a.server.SetActiveProfile(slug); err != nil {
+		return fmt.Errorf("failed to set active profile %q: %w", slug, err)
+	}
+	if a.syncManager != nil {
+		if err := a.syncManager.SyncNow(); err != nil {
+			a.logger.Debug("Profile switch sync refresh failed", zap.Error(err))
+		}
+	}
+	return nil
 }
 
 // handleOAuthLogin handles OAuth authentication for a server from the tray menu
@@ -1662,47 +1754,6 @@ func (a *App) handleOAuthLogin(serverName string) error {
 	a.logger.Info("Found server for OAuth",
 		zap.String("server", serverName),
 		zap.Any("server_data", targetServer))
-
-	// Load the config file that mcpproxy is using
-	configPath := a.server.GetConfigPath()
-	if configPath == "" {
-		err := fmt.Errorf("config path not available")
-		a.logger.Error("Failed to get config path for OAuth login",
-			zap.String("server", serverName),
-			zap.Error(err))
-		return err
-	}
-
-	a.logger.Info("Loading config file for OAuth",
-		zap.String("server", serverName),
-		zap.String("config_path", configPath))
-
-	globalConfig, err := config.LoadFromFile(configPath)
-	if err != nil {
-		a.logger.Error("Failed to load server configuration for OAuth login",
-			zap.String("server", serverName),
-			zap.String("config_path", configPath),
-			zap.Error(err))
-		return fmt.Errorf("failed to load server configuration: %w", err)
-	}
-
-	// Debug: Check if server exists in config
-	var serverFound bool
-	for _, server := range globalConfig.Servers {
-		if server.Name == serverName {
-			serverFound = true
-			break
-		}
-	}
-
-	a.logger.Info("Server lookup in config",
-		zap.String("server", serverName),
-		zap.Bool("found_in_config", serverFound),
-		zap.String("config_path", configPath))
-
-	a.logger.Info("Config loaded for OAuth",
-		zap.String("server", serverName),
-		zap.Int("total_servers", len(globalConfig.Servers)))
 
 	// Trigger OAuth inside the running daemon to avoid DB lock conflicts
 	a.logger.Info("Triggering in-process OAuth from tray", zap.String("server", serverName))
@@ -1792,11 +1843,29 @@ func (a *App) startUpdateChecker() {
 	}
 }
 
-// checkUpdateFromAPI queries the core's /api/v1/info endpoint for update information
-func (a *App) checkUpdateFromAPI() {
+// coreUpdateInfo mirrors the update object the core exposes at /api/v1/info.
+type coreUpdateInfo struct {
+	Available     bool   `json:"available"`
+	LatestVersion string `json:"latest_version"`
+	ReleaseURL    string `json:"release_url"`
+	IsPrerelease  bool   `json:"is_prerelease"`
+}
+
+// fetchCoreUpdateInfo queries the core's /api/v1/info endpoint. It returns the
+// update object and whether the core was reachable and answered successfully:
+//   - reachable=false → the core could not be reached / did not answer OK; the
+//     caller cannot infer anything and should skip (not fall open).
+//   - reachable=true, info=nil → the core omitted the update object, meaning
+//     update checking is disabled (update_check.enabled=false, Spec 079 FR-015)
+//     or no update exists.
+//   - reachable=true, info!=nil → the core reported update details.
+//
+// This lets the tray use the core as the single source of truth for update
+// checking without ever reading mcp_config.json itself.
+func (a *App) fetchCoreUpdateInfo() (info *coreUpdateInfo, reachable bool) {
 	// Only check when connected
 	if a.getConnectionState() != ConnectionStateConnected {
-		return
+		return nil, false
 	}
 
 	// Build URL to core's API
@@ -1812,7 +1881,7 @@ func (a *App) checkUpdateFromAPI() {
 	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		a.logger.Debug("Failed to parse listen address for update check", zap.Error(err))
-		return
+		return nil, false
 	}
 	if host == "" || host == "0.0.0.0" {
 		host = "127.0.0.1"
@@ -1825,53 +1894,78 @@ func (a *App) checkUpdateFromAPI() {
 	resp, err := client.Get(apiURL)
 	if err != nil {
 		a.logger.Debug("Failed to fetch update info from core", zap.Error(err))
-		return
+		return nil, false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		a.logger.Debug("Unexpected status from core info endpoint", zap.Int("status", resp.StatusCode))
-		return
+		return nil, false
 	}
 
 	var response struct {
 		Success bool `json:"success"`
 		Data    struct {
-			Version string `json:"version"`
-			Update  *struct {
-				Available     bool   `json:"available"`
-				LatestVersion string `json:"latest_version"`
-				ReleaseURL    string `json:"release_url"`
-				IsPrerelease  bool   `json:"is_prerelease"`
-			} `json:"update"`
+			Version string          `json:"version"`
+			Update  *coreUpdateInfo `json:"update"`
 		} `json:"data"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		a.logger.Debug("Failed to parse update info from core", zap.Error(err))
+		return nil, false
+	}
+
+	if !response.Success {
+		return nil, false
+	}
+
+	return response.Data.Update, true
+}
+
+// checkUpdateFromAPI queries the core's /api/v1/info endpoint and reflects the
+// result onto the tray's update nudge menu item.
+func (a *App) checkUpdateFromAPI() {
+	update, reachable := a.fetchCoreUpdateInfo()
+	if !reachable {
 		return
 	}
 
-	if !response.Success || response.Data.Update == nil {
+	if update == nil {
+		// The core omits the update object entirely when update checking is
+		// disabled (update_check.enabled=false, Spec 079 FR-015). Treat the
+		// absence as "no update": clear state and hide any previously shown
+		// nudge so a hot-reload disable doesn't leave a stale
+		// "New version available" menu item until tray restart.
+		a.updateCheckMu.Lock()
+		wasAvailable := a.updateAvailable
+		a.updateAvailable = false
+		a.latestVersion = ""
+		a.latestReleaseURL = ""
+		a.updateCheckMu.Unlock()
+		if wasAvailable {
+			a.logger.Info("Update checking disabled on core; clearing update nudge")
+		}
+		a.hideUpdateMenuItem()
 		return
 	}
 
 	// Update internal state
 	a.updateCheckMu.Lock()
 	wasAvailable := a.updateAvailable
-	a.updateAvailable = response.Data.Update.Available
-	a.latestVersion = response.Data.Update.LatestVersion
-	a.latestReleaseURL = response.Data.Update.ReleaseURL
+	a.updateAvailable = update.Available
+	a.latestVersion = update.LatestVersion
+	a.latestReleaseURL = update.ReleaseURL
 	a.updateCheckMu.Unlock()
 
 	// Update menu visibility
-	if response.Data.Update.Available {
+	if update.Available {
 		if !wasAvailable {
 			a.logger.Info("Update available",
 				zap.String("current", a.version),
-				zap.String("latest", response.Data.Update.LatestVersion))
+				zap.String("latest", update.LatestVersion))
 		}
-		a.showUpdateMenuItem(response.Data.Update.LatestVersion, response.Data.Update.IsPrerelease)
+		a.showUpdateMenuItem(update.LatestVersion, update.IsPrerelease)
 	} else {
 		a.hideUpdateMenuItem()
 	}

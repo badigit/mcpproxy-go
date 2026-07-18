@@ -20,12 +20,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private var statusItem: NSStatusItem!
     private var mainWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
     private var keyMonitor: Any?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Prevent focus steal on launch — no Dock icon, no Cmd+Tab entry
         NSApp.setActivationPolicy(.prohibited)
+
+        // Disable macOS automatic text substitutions app-wide (issue #538).
+        // Smart-dash substitution rewrites "--" as an em-dash "—", which
+        // silently corrupts CLI flags typed into server Command/Arguments/Env
+        // fields (e.g. "--flag" → "—flag"), producing broken configs. Done
+        // before any window (and thus any NSTextView field editor) is created
+        // so every text field inherits the disabled state. See
+        // TextSubstitution.disableAutomaticTextSubstitutions.
+        TextSubstitution.disableAutomaticTextSubstitutions()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -56,6 +66,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 NSLog("[MCPProxy] Cmd+N: show add server")
                 self?.showAddServer()
                 return nil
+            case ",":
+                // Intercept ⌘, before SwiftUI's Settings scene sees it, so it
+                // opens our config window instead of the (unreliable) scene.
+                NSLog("[MCPProxy] Cmd+,: show settings")
+                self?.showSettingsWindow()
+                return nil
             default:
                 return event
             }
@@ -63,6 +79,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
         // Set up the app's main menu bar with View > Text Size commands
         setupMainMenu()
+
+        // The SwiftUI Settings scene window is owned by SwiftUI, not us, so it
+        // never hits our NSWindowDelegate. Observe all window closes so we can
+        // drop back to a menu-bar-only app when the Settings window is dismissed.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async { self?.restoreAccessoryIfNoVisibleWindows() }
+        }
 
         // Create the status bar item with the MCPProxy monochrome icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -83,8 +108,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         // Build initial menu (rebuildMenu creates the NSMenu and sets delegate)
         rebuildMenu()
 
-        // Subscribe to state changes — update icon, menu, and refresh servers periodically
-        appState.objectWillChange
+        // Subscribe to state changes — update icon, menu, and refresh servers periodically.
+        // Merge UpdateService changes so a fresh GitHub check repaints the menu immediately
+        // instead of waiting for the next server-poll cycle.
+        Publishers.Merge(
+            appState.objectWillChange.map { _ in () },
+            updateService.objectWillChange.map { _ in () }
+        )
             .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.updateStatusIcon()
@@ -92,16 +122,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             .store(in: &cancellables)
 
-        // Periodic server refresh every 10s to keep health/action data current
-        Timer.publish(every: 10, on: .main, in: .common)
+        // Spec 048: dropped the 10 s server-refresh timer. The server list is
+        // now SSE-driven via the spec 047 `servers.changed` payload — appState
+        // updates within ~50 ms of any state transition with zero round trip.
+        // The safety-net below covers the rare case where SSE drops events.
+        Timer.publish(every: 300, on: .main, in: .common)   // 5 minutes
             .autoconnect()
             .sink { [weak self] _ in
-                guard let self, let client = self.appState.apiClient else { return }
-                Task {
-                    if let servers = try? await client.servers() {
-                        await self.appState.updateServers(servers)
-                    }
-                }
+                guard let self, let core = self.coreManager else { return }
+                Task { await core.refreshServersForSafetyNet() }
+            }
+            .store(in: &cancellables)
+
+        // Auto-check GitHub for a newer release as soon as the core reports its version,
+        // and again every hour. This avoids relying solely on the core's 4h cache, which
+        // can lag behind freshly published releases.
+        appState.$version
+            .removeDuplicates()
+            .filter { !$0.isEmpty }
+            .first()
+            .sink { [weak self] version in
+                guard let self else { return }
+                self.updateService.currentVersion = version
+                self.updateService.checkForUpdates()
+            }
+            .store(in: &cancellables)
+
+        Timer.publish(every: 3600, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self, !self.appState.version.isEmpty else { return }
+                self.updateService.currentVersion = self.appState.version
+                self.updateService.checkForUpdates()
             }
             .store(in: &cancellables)
 
@@ -121,22 +173,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         Task {
             await startCore()
         }
+
+        // Spec 044 (T055+T056): publish current autostart state to the tray
+        // sidecar so the core's telemetry can emit autostart_enabled on the
+        // very next heartbeat. Then — if we've never done first-run before —
+        // present the first-run dialog with "Launch at login" default ON.
+        //
+        // Order: sidecar refresh first, so even if the user cancels the
+        // dialog the core has a non-null reading.
+        AutostartSidecarService.refresh()
+        DispatchQueue.main.async {
+            presentFirstRunDialogIfNeeded()
+        }
     }
 
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
-        // Fetch fresh server data before building the menu
-        // This ensures health.action (login/restart) is current
-        if let client = appState.apiClient {
-            Task {
-                if let servers = try? await client.servers() {
-                    await appState.updateServers(servers)
-                    await MainActor.run { rebuildMenu() }
-                }
-            }
-        }
-        // Build with current data immediately (async fetch updates it shortly after)
+        // Spec 048: dropped the per-click `client.servers()` fetch. appState
+        // is fed by SSE (spec 047), so it's already current within ~50 ms of
+        // the last upstream state change. Rebuild from in-memory state only.
         rebuildMenu()
     }
 
@@ -200,6 +256,55 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         showMainWindow()
     }
 
+    // Our single config window. Both the tray "Settings…" item and the app
+    // menu's "Settings…" / ⌘, route here (the latter via the key monitor +
+    // menu-item repoint in setupMainMenu) — never the SwiftUI Settings scene,
+    // whose programmatic opening proved unreliable from a menu-bar app.
+    @objc private func showSettingsWindow() {
+        // Reuse the existing window if it's already open.
+        if let window = settingsWindow, window.isVisible {
+            NSApp.setActivationPolicy(.regular)
+            setupMainMenu()
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        // A menu-bar (.accessory) app can't make a window key without first
+        // becoming a regular app — same dance as showMainWindow().
+        NSApp.setActivationPolicy(.regular)
+
+        let hostingView = NSHostingView(rootView: SettingsView(appState: appState))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 660),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "MCPProxy Settings"
+        window.contentView = hostingView
+        window.setFrameAutosaveName("MCPProxySettingsWindow")
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        setupMainMenu()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        settingsWindow = window
+    }
+
+    /// Called from the SwiftUI Settings scene bridge: open the real config
+    /// window, then close the empty SwiftUI scene window SwiftUI just created.
+    func openSettingsFromScene() {
+        showSettingsWindow()
+        DispatchQueue.main.async {
+            NSApp.windows
+                .first { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }?
+                .close()
+        }
+    }
+
     @objc private func showAddServer() {
         showMainWindow()
         // First switch to the Servers tab so ServersView is mounted and
@@ -222,16 +327,40 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    // NSWindowDelegate — hide from Dock when window closes
+    // NSWindowDelegate — hide from Dock when the last managed window closes.
     func windowWillClose(_ notification: Notification) {
-        // Return to accessory (menu bar only) when main window closes
-        NSApp.setActivationPolicy(.accessory)
+        // Defer so the closing window has already left the visible set.
+        DispatchQueue.main.async { [weak self] in self?.restoreAccessoryIfNoVisibleWindows() }
+    }
+
+    // Drop back to a menu-bar-only (.accessory) app once no real window remains.
+    // Covers both the AppKit main window (delegate) and the SwiftUI Settings
+    // scene window (which we don't own — handled via a global close observer).
+    private func restoreAccessoryIfNoVisibleWindows() {
+        let anyVisible = NSApp.windows.contains { win in
+            win.isVisible && win.styleMask.contains(.titled) && !(win is NSPanel)
+        }
+        if !anyVisible {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     // MARK: - Main Menu Bar (View > Text Size)
 
     private func setupMainMenu() {
         guard let mainMenu = NSApp.mainMenu else { return }
+
+        // Route a CLICK on the app-menu "Settings…" item to our config window
+        // (the ⌘, keyboard shortcut is intercepted separately in the key
+        // monitor). Both bypass the empty SwiftUI `Settings {}` scene.
+        if let appMenu = mainMenu.item(at: 0)?.submenu {
+            for item in appMenu.items where item.title.hasPrefix("Settings") || item.title.hasPrefix("Preferences") {
+                item.target = self
+                item.action = #selector(showSettingsWindow)
+                item.keyEquivalent = ","
+                item.keyEquivalentModifierMask = .command
+            }
+        }
 
         // Find or create View menu and add text size items
         let viewMenu: NSMenu
@@ -299,10 +428,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     // MARK: - Core Startup
 
+    /// Bring up the core on app launch.
+    ///
+    /// GH #410: `maySpawn` is the user's "Start Core when app opens" preference.
+    /// When it is off the manager still ATTACHES to a core that is already
+    /// running — it just will not start one, and idles watching for one instead.
     private func startCore() async {
         await notificationService.setup()
+
+        let policy = CoreLaunchPolicy()
         await MainActor.run {
             appState.autoStartEnabled = AutoStartService.isEnabled
+            // NOTE: do NOT assign appState.startCoreOnLaunch here. AppState already
+            // initializes it from CoreLaunchPolicy, and its didSet WRITES to
+            // UserDefaults — so a redundant sync would materialize the key on
+            // every launch, including for users who only set MCPPROXY_TRAY_SKIP_CORE
+            // and never touched the preference.
         }
 
         if SymlinkService.needsSetup() {
@@ -316,7 +457,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             notificationService: notificationService
         )
         coreManager = manager
-        await manager.start()
+        await manager.start(maySpawn: policy.maySpawnCore)
     }
 
     private func resolveBundledCoreBinary() -> String? {
@@ -491,23 +632,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             for server in appState.servers {
                 let item = NSMenuItem(title: server.name, action: nil, keyEquivalent: "")
 
-                // Status icon: colored dot + auth indicator
-                let needsAuth = server.health?.action == "login"
-                let dotColor = server.statusNSColor
+                // Status icon: colored dot. The OAuth login-required state is a
+                // calm, actionable affordance (MCP-1822) — `menuStatusNSColor`
+                // gives it the system accent tint instead of the red error dot +
+                // red lock badge that previously framed sign-in as a hard failure.
+                let needsAuth = server.isOAuthLoginRequired
+                let dotColor = server.menuStatusNSColor
 
                 let iconSize = NSSize(width: 16, height: 16)
-                let icon = NSImage(size: iconSize, flipped: false) { rect in
+                let icon = NSImage(size: iconSize, flipped: false) { _ in
                     // Draw health dot
                     let dotRect = NSRect(x: 2, y: 4, width: 8, height: 8)
                     dotColor.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
-
-                    // Draw auth lock icon overlay if needed
-                    if needsAuth {
-                        let lockRect = NSRect(x: 9, y: 0, width: 7, height: 7)
-                        NSColor.systemRed.setFill()
-                        NSBezierPath(ovalIn: lockRect).fill()
-                    }
                     return true
                 }
                 item.image = icon
@@ -526,12 +663,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
                 sub.addItem(.separator())
 
-                // Auth login button — prominently first if needed
+                // OAuth sign-in — calm, actionable affordance shown first when
+                // login is required (MCP-1822), not error framing.
                 if needsAuth {
-                    let login = NSMenuItem(title: "Log In (Opens Browser)", action: #selector(loginServer(_:)), keyEquivalent: "")
+                    let login = NSMenuItem(title: "Sign in", action: #selector(loginServer(_:)), keyEquivalent: "")
                     login.target = self
                     login.representedObject = server.name
-                    login.image = NSImage(systemSymbolName: "person.badge.key", accessibilityDescription: "login")
+                    login.image = NSImage(systemSymbolName: "person.badge.key", accessibilityDescription: "sign in")
                     sub.addItem(login)
                     sub.addItem(.separator())
                 }
@@ -571,14 +709,50 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             menu.addItem(.separator())
         }
 
+        // Profile switcher (Profiles v2 T5) — only shown when profiles are
+        // configured. Lists "All servers" (clears the profile) plus each profile
+        // with its tool count; the active selection carries a checkmark. Clicking
+        // switches the server-level default active profile via REST; a switch made
+        // by another client arrives over SSE (`active_profile.changed`) and
+        // repaints this submenu.
+        if !appState.profiles.isEmpty {
+            let activeLabel = appState.activeProfile.isEmpty ? "All servers" : appState.activeProfile
+            let profileMenuItem = NSMenuItem(title: "Profile: \(activeLabel)", action: nil, keyEquivalent: "")
+            let profileSubmenu = NSMenu()
+
+            let allItem = NSMenuItem(title: "All servers", action: #selector(switchProfile(_:)), keyEquivalent: "")
+            allItem.target = self
+            allItem.representedObject = ""
+            allItem.state = appState.activeProfile.isEmpty ? .on : .off
+            profileSubmenu.addItem(allItem)
+            profileSubmenu.addItem(.separator())
+
+            for profile in appState.profiles {
+                let item = NSMenuItem(title: "\(profile.name) (\(profile.toolCount) tools)",
+                                      action: #selector(switchProfile(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = profile.name
+                item.state = profile.name == appState.activeProfile ? .on : .off
+                profileSubmenu.addItem(item)
+            }
+
+            profileMenuItem.submenu = profileSubmenu
+            menu.addItem(profileMenuItem)
+            menu.addItem(.separator())
+        }
+
         // Actions
         let addServer = NSMenuItem(title: "Add Server...", action: #selector(showAddServer), keyEquivalent: "n")
         addServer.target = self
         menu.addItem(addServer)
 
-        let openApp = NSMenuItem(title: "Open MCPProxy...", action: #selector(openMainWindow), keyEquivalent: ",")
+        let openApp = NSMenuItem(title: "Open MCPProxy...", action: #selector(openMainWindow), keyEquivalent: "")
         openApp.target = self
         menu.addItem(openApp)
+
+        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(showSettingsWindow), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         let webUI = NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: "")
         webUI.target = self
@@ -597,8 +771,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         checkUpdates.isEnabled = updateService.canCheckForUpdates
         menu.addItem(checkUpdates)
 
-        // Show update from either appState (from core /api/v1/info) or UpdateService (GitHub check)
-        let updateVersion = appState.updateAvailable ?? updateService.latestVersion
+        // Show update from either appState (from core /api/v1/info) or UpdateService (direct
+        // GitHub check). Prefer whichever source advertises the newer version so a stale
+        // core cache never masks a freshly-published release.
+        let updateVersion: String? = {
+            switch (appState.updateAvailable, updateService.latestVersion) {
+            case let (.some(a), .some(b)):
+                return UpdateService.compareSemver(a, b) >= 0 ? a : b
+            case let (.some(a), .none):
+                return a
+            case let (.none, .some(b)):
+                return b
+            case (.none, .none):
+                return nil
+            }
+        }()
         if let available = updateVersion {
             let updateNote = NSMenuItem(title: "Update available: v\(available)", action: #selector(openDownloadPage), keyEquivalent: "")
             updateNote.target = self
@@ -615,10 +802,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             start.image?.size = NSSize(width: 18, height: 18)
             menu.addItem(start)
         } else if appState.coreState == .connected || appState.coreState.isOperational {
-            let stop = NSMenuItem(title: "Stop MCPProxy Core", action: #selector(stopCore), keyEquivalent: "")
+            // A core we only attached to cannot be stopped by us — we hold no PID
+            // for it and the core has no shutdown endpoint. Say "Disconnect", and
+            // mean it (#410).
+            let ownership = appState.ownership
+            let stop = NSMenuItem(title: ownership.stopActionTitle, action: #selector(stopCore), keyEquivalent: "")
             stop.target = self
-            stop.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "stop")
+            let symbol = ownership.shouldTerminateOnShutdown ? "stop.circle.fill" : "eject.circle.fill"
+            stop.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "stop")
             stop.image?.size = NSSize(width: 18, height: 18)
+            if !ownership.shouldTerminateOnShutdown {
+                stop.toolTip = "This core was started outside MCPProxy. Disconnecting leaves it running."
+            }
             menu.addItem(stop)
         }
 
@@ -636,11 +831,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc private func stopCore() {
-        NSLog("[MCPProxy] stopCore: stopping core")
+        // Only a core WE spawned gets signalled. For an attached core this is a
+        // disconnect: tear down our clients and leave the core alone (#410).
+        let ownsCore = appState.ownership.shouldTerminateOnShutdown
+        NSLog("[MCPProxy] stopCore: ownership=%@", ownsCore ? "tray-managed" : "external-attached")
         appState.isStopped = true
 
         // Kill the core process directly — most reliable method
-        let proc = coreManager?.managedProcess
+        let proc = ownsCore ? coreManager?.managedProcess : nil
         NSLog("[MCPProxy] stopCore: managedProcess=%@, isRunning=%@",
               proc != nil ? "exists" : "nil",
               proc?.isRunning == true ? "yes" : "no")
@@ -667,6 +865,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 appState.connectedCount = 0
                 appState.totalServers = 0
                 appState.totalTools = 0
+                appState.serversLoaded = false
                 appState.apiClient = nil
                 updateStatusIcon()
                 rebuildMenu()
@@ -677,12 +876,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc private func startCoreAction() {
         Task {
             appState.isStopped = false
+            // Retire the outgoing manager first. In idle mode it is still polling
+            // for a core to attach to, and it would otherwise find the core the
+            // NEW manager is about to spawn and label it "external" (#410).
+            await coreManager?.supersede()
+
             let manager = CoreProcessManager(
                 appState: appState,
                 notificationService: notificationService
             )
             coreManager = manager
-            await manager.start()
+            // An explicit "Start MCPProxy Core" always spawns, whatever the
+            // autostart preference says — the preference governs app LAUNCH, and
+            // the user is asking for a core right now (#410).
+            await manager.start(maySpawn: true)
             updateStatusIcon()
         }
     }
@@ -729,6 +936,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc private func restartServer(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         Task { try? await appState.apiClient?.restartServer(id) }
+    }
+
+    /// Switch the server-level default active profile (Profiles v2 T5). The
+    /// represented object is the profile slug ("" clears it / all servers). The
+    /// explicit refresh gives immediate feedback; the core also emits
+    /// `active_profile.changed` over SSE which repaints every client.
+    @objc private func switchProfile(_ sender: NSMenuItem) {
+        guard let slug = sender.representedObject as? String else { return }
+        Task {
+            try? await appState.apiClient?.setActiveProfile(slug)
+            await coreManager?.refreshProfiles()
+        }
     }
 
     @objc private func loginServer(_ sender: NSMenuItem) {
@@ -796,6 +1015,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 appState.autoStartEnabled = true
             }
         } catch {}
+        // Spec 044 (T055): publish new state so the core's telemetry reader
+        // observes the change within its 1h TTL. We write the effective
+        // SMAppService state rather than the optimistic toggle value — that
+        // way a registration failure does not poison the sidecar.
+        AutostartSidecarService.refresh()
         rebuildMenu()
     }
 
@@ -830,7 +1054,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func actionDisplayName(for action: String) -> String {
         switch action {
-        case "login": return "Login Required"
+        case "login": return "Sign in"
         case "restart": return "Restart Needed"
         case "enable": return "Disabled"
         case "approve": return "Approval Needed"
@@ -867,14 +1091,30 @@ struct MCPProxyApp: App {
     @NSApplicationDelegateAdaptor(AppController.self) var controller
 
     var body: some Scene {
-        // No SwiftUI scenes — the tray menu is pure AppKit (NSStatusItem + NSMenu).
-        // This avoids the MenuBarExtra .menu style bug where ForEach duplicates items.
-        // Settings scene intentionally hidden — Cmd+, is handled by tray menu "Open MCPProxy..." item.
+        // The tray menu is pure AppKit (NSStatusItem + NSMenu) — this avoids the
+        // MenuBarExtra .menu ForEach-duplication bug. There is ONE config window,
+        // the AppKit NSWindow in showSettingsWindow(). The tray "Settings…", the
+        // app-menu "Settings…" click, and ⌘, all route there. This SwiftUI
+        // Settings scene exists only to own the system "Settings…" slot; it is
+        // bridged away so it never actually shows.
         Settings {
-            Text("Use the MCPProxy tray menu to access settings.")
-                .frame(width: 300, height: 100)
-                .font(.body)
-                .foregroundColor(.secondary)
+            // Safety net only: ⌘, is intercepted by the key monitor and the
+            // app-menu "Settings…" click is repointed (both in AppController),
+            // so this scene normally never opens. If some path we didn't catch
+            // does open it, redirect to the real config window and dismiss this
+            // empty scene window — the user must never see a stub.
+            SettingsSceneBridge(controller: controller)
         }
+    }
+}
+
+/// Empty stand-in for the SwiftUI Settings scene that immediately hands off to
+/// the AppController's AppKit config window. See `body` above for why.
+private struct SettingsSceneBridge: View {
+    let controller: AppController
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .onAppear { controller.openSettingsFromScene() }
     }
 }

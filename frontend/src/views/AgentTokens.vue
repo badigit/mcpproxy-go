@@ -30,23 +30,41 @@
       </div>
     </div>
 
-    <!-- Summary Stats -->
+    <!-- Summary Stats — clickable cards drive the token filter (issue #436) -->
     <div class="stats shadow bg-base-100 w-full">
-      <div class="stat">
+      <button
+        type="button"
+        data-test="kpi-card-total"
+        :class="['stat text-left transition-colors cursor-pointer hover:bg-base-200/60', tokenFilter === 'all' ? 'bg-base-200 ring-2 ring-inset ring-primary/40' : '']"
+        :aria-pressed="tokenFilter === 'all'"
+        @click="tokenFilter = 'all'"
+      >
         <div class="stat-title">Total Tokens</div>
         <div class="stat-value">{{ tokens.length }}</div>
         <div class="stat-desc">All agent tokens</div>
-      </div>
-      <div class="stat">
+      </button>
+      <button
+        type="button"
+        data-test="kpi-card-active"
+        :class="['stat text-left transition-colors cursor-pointer hover:bg-base-200/60', tokenFilter === 'active' ? 'bg-base-200 ring-2 ring-inset ring-primary/40' : '']"
+        :aria-pressed="tokenFilter === 'active'"
+        @click="tokenFilter = tokenFilter === 'active' ? 'all' : 'active'"
+      >
         <div class="stat-title">Active</div>
         <div class="stat-value text-success">{{ activeCount }}</div>
         <div class="stat-desc">Currently valid</div>
-      </div>
-      <div class="stat">
+      </button>
+      <button
+        type="button"
+        data-test="kpi-card-expired"
+        :class="['stat text-left transition-colors cursor-pointer hover:bg-base-200/60', tokenFilter === 'expired' ? 'bg-base-200 ring-2 ring-inset ring-primary/40' : '']"
+        :aria-pressed="tokenFilter === 'expired'"
+        @click="tokenFilter = tokenFilter === 'expired' ? 'all' : 'expired'"
+      >
         <div class="stat-title">Expired / Revoked</div>
         <div class="stat-value text-warning">{{ expiredOrRevokedCount }}</div>
         <div class="stat-desc">No longer usable</div>
-      </div>
+      </button>
     </div>
 
     <!-- Loading State -->
@@ -86,6 +104,16 @@
       </button>
     </div>
 
+    <!-- Filter empty state: tokens exist but none match the active filter -->
+    <div v-else-if="filteredTokens.length === 0" class="text-center py-12" data-test="tokens-filter-empty">
+      <p class="text-base-content/70 mb-4">
+        No tokens match the <span class="font-semibold">{{ tokenFilter }}</span> filter.
+      </p>
+      <button @click="tokenFilter = 'all'" class="btn btn-sm btn-outline">
+        Show all
+      </button>
+    </div>
+
     <!-- Token List Table -->
     <div v-else class="overflow-x-auto">
       <table class="table table-zebra w-full">
@@ -102,7 +130,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="token in tokens" :key="token.name">
+          <tr v-for="token in filteredTokens" :key="token.name">
             <td class="font-medium">{{ token.name }}</td>
             <td>
               <code class="text-sm bg-base-200 px-2 py-1 rounded">{{ token.token_prefix }}</code>
@@ -169,6 +197,17 @@
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
                   </svg>
                   Revoke
+                </button>
+                <button
+                  v-if="token.revoked || isExpired(token)"
+                  @click="handleDelete(token.name)"
+                  class="btn btn-xs btn-error"
+                  title="Permanently delete token and free its name for reuse"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete
                 </button>
               </div>
             </td>
@@ -392,6 +431,19 @@ const expiredOrRevokedCount = computed(() => {
   return tokens.value.filter(t => t.revoked || isExpired(t)).length
 })
 
+// KPI-card-driven filter (issue #436): 'all' | 'active' | 'expired'
+const tokenFilter = ref<'all' | 'active' | 'expired'>('all')
+
+const filteredTokens = computed(() => {
+  if (tokenFilter.value === 'active') {
+    return tokens.value.filter(t => !t.revoked && !isExpired(t))
+  }
+  if (tokenFilter.value === 'expired') {
+    return tokens.value.filter(t => t.revoked || isExpired(t))
+  }
+  return tokens.value
+})
+
 // Helper functions
 function isExpired(token: AgentTokenInfo): boolean {
   return new Date(token.expires_at) < new Date()
@@ -598,6 +650,38 @@ async function handleRevoke(name: string) {
       type: 'error',
       title: 'Revoke Failed',
       message: err.message || 'Failed to revoke token',
+    })
+  }
+}
+
+// Permanently delete a (revoked or expired) token, freeing its name for reuse
+async function handleDelete(name: string) {
+  if (!confirm(`Permanently delete token "${name}"? This removes it completely and frees the name for reuse. This action cannot be undone.`)) {
+    return
+  }
+
+  try {
+    const response = await apiClient.deleteAgentToken(name)
+    if (response.success || !response.error) {
+      await loadTokens()
+
+      systemStore.addToast({
+        type: 'success',
+        title: 'Token Deleted',
+        message: `Token "${name}" has been permanently deleted`,
+      })
+    } else {
+      systemStore.addToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: response.error || 'Failed to delete token',
+      })
+    }
+  } catch (err: any) {
+    systemStore.addToast({
+      type: 'error',
+      title: 'Delete Failed',
+      message: err.message || 'Failed to delete token',
     })
   }
 }

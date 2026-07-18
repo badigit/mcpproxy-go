@@ -3,9 +3,12 @@ package scanner
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -434,6 +437,81 @@ func TestResolveNpxCache(t *testing.T) {
 	}
 }
 
+// TestResolveNpxCachePrefersRealSourceOverStub reproduces MCP-2397: when the
+// same package name exists under multiple npx cache hashes, one holding the
+// real installed source (package.json + dist) and another holding only a
+// tools.json stub that mcpproxy itself wrote, the resolver must scan the real
+// source even when the stub directory has a NEWER mtime. The old newest-mtime
+// heuristic would pick the stub and report false "1 file scanned" coverage.
+func TestResolveNpxCachePrefersRealSourceOverStub(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir) // Windows uses USERPROFILE
+
+	pkg := filepath.Join("node_modules", "@modelcontextprotocol", "server-everything")
+
+	// Real source under one hash: package.json + dist/*.js (older mtime).
+	realDir := filepath.Join(homeDir, ".npm", "_npx", "realhash", pkg)
+	os.MkdirAll(filepath.Join(realDir, "dist"), 0755)
+	os.WriteFile(filepath.Join(realDir, "package.json"), []byte(`{"name":"@modelcontextprotocol/server-everything"}`), 0644)
+	os.WriteFile(filepath.Join(realDir, "dist", "index.js"), []byte("// real server source"), 0644)
+
+	// Stub under a different hash: only a tools.json (newer mtime → would win
+	// under the old heuristic).
+	stubDir := filepath.Join(homeDir, ".npm", "_npx", "stubhash", pkg)
+	os.MkdirAll(stubDir, 0755)
+	os.WriteFile(filepath.Join(stubDir, "tools.json"), []byte(`{"tools":[]}`), 0644)
+
+	// Force the stub directory to be strictly newer than the real one so the
+	// legacy newest-mtime selection would choose the stub.
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now()
+	if err := os.Chtimes(realDir, older, older); err != nil {
+		t.Fatalf("chtimes real: %v", err)
+	}
+	if err := os.Chtimes(stubDir, newer, newer); err != nil {
+		t.Fatalf("chtimes stub: %v", err)
+	}
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveNpxCache(ServerInfo{
+		Name:    "everything-server",
+		Command: "npx",
+		Args:    []string{"-y", "@modelcontextprotocol/server-everything"},
+	})
+	if err != nil {
+		t.Fatalf("resolveNpxCache: %v", err)
+	}
+	if result.SourceDir != realDir {
+		t.Errorf("expected real source %q, got stub %q", realDir, result.SourceDir)
+	}
+}
+
+// TestResolveNpxCacheStubOnlyReturnsError verifies the post-MCP-2206
+// interaction: when the npx cache holds ONLY a tools.json stub (no real
+// package source anywhere locally), resolveNpxCache returns an error rather
+// than the stub. This lets Resolve()'s published-source fetch fallback take
+// over and fetch the real source, instead of reporting false "1 file" coverage.
+func TestResolveNpxCacheStubOnlyReturnsError(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir) // Windows uses USERPROFILE
+
+	stubDir := filepath.Join(homeDir, ".npm", "_npx", "stubhash", "node_modules", "@modelcontextprotocol", "server-everything")
+	os.MkdirAll(stubDir, 0755)
+	os.WriteFile(filepath.Join(stubDir, "tools.json"), []byte(`{"tools":[]}`), 0644)
+
+	r := NewSourceResolver(zap.NewNop())
+	_, err := r.resolveNpxCache(ServerInfo{
+		Name:    "everything-server",
+		Command: "npx",
+		Args:    []string{"-y", "@modelcontextprotocol/server-everything"},
+	})
+	if err == nil {
+		t.Fatal("expected error when npx cache contains only a stub, got nil (would short-circuit the published-fetch fallback)")
+	}
+}
+
 func TestResolveNpxCacheNotFound(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -508,6 +586,417 @@ func TestResolveUvxCacheGitCheckout(t *testing.T) {
 	}
 }
 
+// writeUvArchiveWheel materializes a fake unpacked wheel inside a uv archive-v0
+// entry. uv content-addresses each wheel by an opaque hash, so the package is
+// found by globbing all entries and matching the .dist-info directory — never
+// by constructing a name-based path. distName is the (un-normalized) PyPI
+// distribution name; it gets PEP 503 normalized (lowercased, -._ → _) for the
+// .dist-info name, mirroring what uv writes to disk.
+func writeUvArchiveWheel(t *testing.T, homeDir, hash, distName, version, importPkg string, venvStyle bool) string {
+	t.Helper()
+	norm := strings.ToLower(distName)
+	norm = strings.NewReplacer("-", "_", ".", "_").Replace(norm)
+	entry := filepath.Join(homeDir, ".cache", "uv", "archive-v0", hash)
+	base := entry
+	if venvStyle {
+		base = filepath.Join(entry, "lib", "python3.11", "site-packages")
+	}
+	pkgDir := filepath.Join(base, importPkg)
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "__init__.py"), []byte("# server source"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	distInfo := filepath.Join(base, norm+"-"+version+".dist-info")
+	if err := os.MkdirAll(distInfo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(distInfo, "METADATA"), []byte("Name: "+distName+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return entry
+}
+
+// TestResolveUvxCacheArchiveFlat verifies the COMMON `uvx <pkg>` case: the
+// package was run locally (so its wheel sits unpacked in the ephemeral
+// ~/.cache/uv/archive-v0 cache) but was never `uv tool install`-ed, so the
+// tools dir is empty. Before MCP-2400 this fell through to
+// tool_definitions_only / a network fetch; now it resolves from local cache.
+func TestResolveUvxCacheArchiveFlat(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	entry := writeUvArchiveWheel(t, homeDir, "Ab12Cd34Ef56", "mcp-server-fetch", "1.2.3", "mcp_server_fetch", false)
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveUvxCache(ServerInfo{
+		Name:    "fetch",
+		Command: "uvx",
+		Args:    []string{"mcp-server-fetch"},
+	})
+	if err != nil {
+		t.Fatalf("resolveUvxCache: %v", err)
+	}
+	if result.SourceDir != entry {
+		t.Errorf("expected source_dir %q, got %q", entry, result.SourceDir)
+	}
+	if result.Method != "uvx_cache" {
+		t.Errorf("expected method 'uvx_cache', got %q", result.Method)
+	}
+}
+
+// TestResolveUvxCacheArchiveVenvStyle verifies the venv-style archive layout
+// (<hash>/lib/python*/site-packages/<pkg>) is also discovered.
+func TestResolveUvxCacheArchiveVenvStyle(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	entry := writeUvArchiveWheel(t, homeDir, "Zz99Yy88Xx77", "some-tool", "0.4.0", "some_tool", true)
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveUvxCache(ServerInfo{
+		Name:    "some-tool",
+		Command: "uvx",
+		Args:    []string{"--from", "some-tool", "some-tool"},
+	})
+	if err != nil {
+		t.Fatalf("resolveUvxCache: %v", err)
+	}
+	if result.SourceDir != entry {
+		t.Errorf("expected source_dir %q, got %q", entry, result.SourceDir)
+	}
+}
+
+// TestResolveUvxCacheArchiveNameNormalization verifies a uvx spec with a
+// version pin and hyphen/case differences still matches the underscore-
+// normalized .dist-info on disk.
+func TestResolveUvxCacheArchiveNameNormalization(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	entry := writeUvArchiveWheel(t, homeDir, "Hash1234", "My.Cool-Server", "2.0.0", "my_cool_server", false)
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveUvxCache(ServerInfo{
+		Name:    "cool",
+		Command: "uvx",
+		Args:    []string{"My.Cool-Server==2.0.0"},
+	})
+	if err != nil {
+		t.Fatalf("resolveUvxCache: %v", err)
+	}
+	if result.SourceDir != entry {
+		t.Errorf("expected source_dir %q, got %q", entry, result.SourceDir)
+	}
+}
+
+// TestResolveUvxCacheArchiveNewestWins verifies that when the same distribution
+// is cached at multiple versions (multiple archive hashes), the most recently
+// modified entry is chosen — consistent with resolveNpxCache.
+func TestResolveUvxCacheArchiveNewestWins(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	old := writeUvArchiveWheel(t, homeDir, "old0000", "dup-pkg", "1.0.0", "dup_pkg", false)
+	newer := writeUvArchiveWheel(t, homeDir, "new1111", "dup-pkg", "2.0.0", "dup_pkg", false)
+	// Force a deterministic ordering of mod times.
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveUvxCache(ServerInfo{
+		Name:    "dup",
+		Command: "uvx",
+		Args:    []string{"dup-pkg"},
+	})
+	if err != nil {
+		t.Fatalf("resolveUvxCache: %v", err)
+	}
+	if result.SourceDir != newer {
+		t.Errorf("expected newest entry %q, got %q", newer, result.SourceDir)
+	}
+	_ = old
+}
+
+// TestResolveUvxCacheArchiveNoMatch verifies a clean error (fall-through) when
+// the package is not present in any local uv cache.
+func TestResolveUvxCacheArchiveNoMatch(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	// A different package is cached; the requested one is absent.
+	writeUvArchiveWheel(t, homeDir, "other999", "unrelated-pkg", "1.0.0", "unrelated_pkg", false)
+
+	r := NewSourceResolver(zap.NewNop())
+	_, err := r.resolveUvxCache(ServerInfo{
+		Name:    "missing",
+		Command: "uvx",
+		Args:    []string{"definitely-not-cached"},
+	})
+	if err == nil {
+		t.Error("expected error when package absent from uv cache")
+	}
+}
+
+// TestResolveNpxCacheHonorsPinnedVersion (MCP-2445) verifies that when the same
+// package is cached under multiple npx hashes at DIFFERENT versions, a spec with
+// an exact version pin selects the matching install — NOT the newest-mtime one.
+func TestResolveNpxCacheHonorsPinnedVersion(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	pkg := filepath.Join("node_modules", "@modelcontextprotocol", "server-everything")
+
+	// Pinned version 1.0.0 lives under an OLDER mtime.
+	wantDir := filepath.Join(homeDir, ".npm", "_npx", "wanthash", pkg)
+	os.MkdirAll(wantDir, 0755)
+	os.WriteFile(filepath.Join(wantDir, "package.json"),
+		[]byte(`{"name":"@modelcontextprotocol/server-everything","version":"1.0.0"}`), 0644)
+
+	// A NEWER but version-mismatched install (2.0.0) would win newest-mtime.
+	otherDir := filepath.Join(homeDir, ".npm", "_npx", "otherhash", pkg)
+	os.MkdirAll(otherDir, 0755)
+	os.WriteFile(filepath.Join(otherDir, "package.json"),
+		[]byte(`{"name":"@modelcontextprotocol/server-everything","version":"2.0.0"}`), 0644)
+
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now()
+	if err := os.Chtimes(wantDir, older, older); err != nil {
+		t.Fatalf("chtimes want: %v", err)
+	}
+	if err := os.Chtimes(otherDir, newer, newer); err != nil {
+		t.Fatalf("chtimes other: %v", err)
+	}
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveNpxCache(ServerInfo{
+		Name:    "everything-server",
+		Command: "npx",
+		Args:    []string{"-y", "@modelcontextprotocol/server-everything@1.0.0"},
+	})
+	if err != nil {
+		t.Fatalf("resolveNpxCache: %v", err)
+	}
+	if result.SourceDir != wantDir {
+		t.Errorf("expected version-pinned dir %q, got %q", wantDir, result.SourceDir)
+	}
+}
+
+// TestResolveNpxCachePinMissNotResolved (MCP-2445 round-2 hole #3) verifies that
+// when an exact version is pinned but ONLY a different version is cached, the
+// resolver returns an error rather than substituting the mismatched version
+// (which would scan the wrong code and report false coverage).
+func TestResolveNpxCachePinMissNotResolved(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	pkg := filepath.Join("node_modules", "@modelcontextprotocol", "server-everything")
+	// Only version 2.0.0 is cached; the spec pins 1.0.0.
+	dir := filepath.Join(homeDir, ".npm", "_npx", "onlyhash", pkg)
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "package.json"),
+		[]byte(`{"name":"@modelcontextprotocol/server-everything","version":"2.0.0"}`), 0644)
+
+	r := NewSourceResolver(zap.NewNop())
+	_, err := r.resolveNpxCache(ServerInfo{
+		Name:    "everything-server",
+		Command: "npx",
+		Args:    []string{"-y", "@modelcontextprotocol/server-everything@1.0.0"},
+	})
+	if err == nil {
+		t.Fatal("expected error on version-pin miss (must not substitute a mismatched cached version)")
+	}
+}
+
+// TestResolveUvxCacheArchivePinMissNotResolved (MCP-2445 round-2 hole #3): an
+// exact pin absent from the archive cache must NOT fall back to a different
+// cached version.
+func TestResolveUvxCacheArchivePinMissNotResolved(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	// Only 2.0.0 cached; spec pins 1.0.0.
+	writeUvArchiveWheel(t, homeDir, "Hashonly", "mcp-server-fetch", "2.0.0", "mcp_server_fetch", false)
+
+	r := NewSourceResolver(zap.NewNop())
+	_, err := r.resolveUvxCache(ServerInfo{
+		Name:    "fetch",
+		Command: "uvx",
+		Args:    []string{"mcp-server-fetch==1.0.0"},
+	})
+	if err == nil {
+		t.Fatal("expected error on uvx archive version-pin miss (must not substitute a mismatched version)")
+	}
+}
+
+// TestResolveUvxCacheToolsDirPinGuard (MCP-2445 round-2 hole #3): the persistent
+// `uv tool install` tools dir must not satisfy a version pin it doesn't match.
+func TestResolveUvxCacheToolsDirPinGuard(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	// Tools dir installed at 2.0.0 (dist-info under the venv site-packages).
+	toolsDir := filepath.Join(homeDir, ".local", "share", "uv", "tools", "my-tool")
+	sp := filepath.Join(toolsDir, "lib", "python3.11", "site-packages")
+	os.MkdirAll(filepath.Join(sp, "my_tool-2.0.0.dist-info"), 0755)
+	os.WriteFile(filepath.Join(sp, "my_tool-2.0.0.dist-info", "METADATA"), []byte("Name: my-tool\n"), 0644)
+	os.MkdirAll(filepath.Join(sp, "my_tool"), 0755)
+	os.WriteFile(filepath.Join(sp, "my_tool", "__init__.py"), []byte("# src"), 0644)
+
+	r := NewSourceResolver(zap.NewNop())
+
+	// Pin 1.0.0 (absent) → must NOT resolve the 2.0.0 tools dir.
+	if _, err := r.resolveUvxCache(ServerInfo{Name: "my-tool", Command: "uvx", Args: []string{"my-tool==1.0.0"}}); err == nil {
+		t.Error("expected pin-miss error: tools dir is 2.0.0, pinned 1.0.0")
+	}
+	// Pin 2.0.0 (present) → resolves the tools dir.
+	res, err := r.resolveUvxCache(ServerInfo{Name: "my-tool", Command: "uvx", Args: []string{"my-tool==2.0.0"}})
+	if err != nil {
+		t.Fatalf("exact-pin hit should resolve: %v", err)
+	}
+	if res.SourceDir != toolsDir {
+		t.Errorf("got %q, want tools dir %q", res.SourceDir, toolsDir)
+	}
+	// No pin → resolves the tools dir (unchanged behavior).
+	if _, err := r.resolveUvxCache(ServerInfo{Name: "my-tool", Command: "uvx", Args: []string{"my-tool"}}); err != nil {
+		t.Errorf("unpinned should resolve tools dir: %v", err)
+	}
+}
+
+// TestResolveUvxCacheWithFlag (MCP-2445) verifies that `uvx --with <extra> <pkg>`
+// resolves the TARGET package, not the additional `--with` dependency. The old
+// parser stopped at the first positional after `--with`, mistaking the extra dep
+// (or, with `--with x --from y`, never reaching `--from`) for the target.
+func TestResolveUvxCacheWithFlag(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	// Only the TARGET package is present in the tools dir; the --with dep is not.
+	toolDir := filepath.Join(homeDir, ".local", "share", "uv", "tools", "main-tool")
+	os.MkdirAll(toolDir, 0755)
+	os.WriteFile(filepath.Join(toolDir, "main.py"), []byte("# main"), 0644)
+
+	r := NewSourceResolver(zap.NewNop())
+	for _, args := range [][]string{
+		{"--with", "extra-dep", "main-tool"},
+		{"--with", "extra-dep", "--from", "main-tool", "main-tool"},
+	} {
+		result, err := r.resolveUvxCache(ServerInfo{Name: "main-tool", Command: "uvx", Args: args})
+		if err != nil {
+			t.Fatalf("resolveUvxCache(%v): %v", args, err)
+		}
+		if result.SourceDir != toolDir {
+			t.Errorf("args %v: expected target tool dir %q (not the --with dep), got %q", args, toolDir, result.SourceDir)
+		}
+	}
+}
+
+// TestResolveUvxCacheArchiveHonorsPinnedVersion (MCP-2445) verifies that an exact
+// version pin selects the matching .dist-info archive entry over a newer one.
+func TestResolveUvxCacheArchiveHonorsPinnedVersion(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	wantEntry := writeUvArchiveWheel(t, homeDir, "Hashwant", "mcp-server-fetch", "1.0.0", "mcp_server_fetch", false)
+	otherEntry := writeUvArchiveWheel(t, homeDir, "Hashother", "mcp-server-fetch", "2.0.0", "mcp_server_fetch", false)
+
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now()
+	if err := os.Chtimes(wantEntry, older, older); err != nil {
+		t.Fatalf("chtimes want: %v", err)
+	}
+	if err := os.Chtimes(otherEntry, newer, newer); err != nil {
+		t.Fatalf("chtimes other: %v", err)
+	}
+
+	r := NewSourceResolver(zap.NewNop())
+	result, err := r.resolveUvxCache(ServerInfo{
+		Name:    "fetch",
+		Command: "uvx",
+		Args:    []string{"mcp-server-fetch==1.0.0"},
+	})
+	if err != nil {
+		t.Fatalf("resolveUvxCache: %v", err)
+	}
+	if result.SourceDir != wantEntry {
+		t.Errorf("expected version-pinned archive %q, got %q", wantEntry, result.SourceDir)
+	}
+}
+
+// TestNpxContainerLocateScript (MCP-2445) exercises the generated /bin/sh locate
+// script on the host against a fake npx cache tree. It proves: (a) with a version
+// pin, the bucket whose package.json declares that version is returned even when a
+// different version sorts first in the glob; (b) with no pin, the first match is
+// returned (previous behavior).
+func TestNpxContainerLocateScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("script targets /bin/sh; not applicable on Windows")
+	}
+	root := t.TempDir()
+	pkg := "@modelcontextprotocol/server-everything"
+
+	// hashA sorts first alphabetically and holds version 2.0.0.
+	dirA := filepath.Join(root, "hashA", "node_modules", pkg)
+	os.MkdirAll(dirA, 0755)
+	os.WriteFile(filepath.Join(dirA, "package.json"), []byte(`{"name":"x","version":"2.0.0"}`), 0644)
+	// hashB sorts later and holds the pinned version 1.0.0.
+	dirB := filepath.Join(root, "hashB", "node_modules", pkg)
+	os.MkdirAll(dirB, 0755)
+	os.WriteFile(filepath.Join(dirB, "package.json"), []byte(`{"name":"x","version":"1.0.0"}`), 0644)
+	// hashC holds a version with regex-special chars: a literal '.' and '-'. A pin
+	// of "1.0.0-alpha.1" must NOT match this "1.0.0-alpha-1" (the '.' is not a
+	// wildcard) — the container compare must be literal, not an ERE (MCP-2445 round-3).
+	dirC := filepath.Join(root, "hashC", "node_modules", pkg)
+	os.MkdirAll(dirC, 0755)
+	os.WriteFile(filepath.Join(dirC, "package.json"), []byte(`{"name":"x","version":"1.0.0-alpha-1"}`), 0644)
+
+	run := func(version string) string {
+		script := npxContainerLocateScript(root, pkg, version)
+		out, err := exec.Command("sh", "-c", script).Output()
+		if err != nil {
+			t.Fatalf("script error (version=%q): %v", version, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Version pin selects the matching bucket, not the first-globbed one.
+	if got := run("1.0.0"); got != dirB {
+		t.Errorf("version pin 1.0.0: got %q, want %q", got, dirB)
+	}
+	// No pin returns the first match (hashA sorts first).
+	if got := run(""); got != dirA {
+		t.Errorf("no pin: got %q, want first match %q", got, dirA)
+	}
+	// A pin with no matching install returns NOTHING — never a mismatched
+	// version (MCP-2445 round-2 hole #3): scanning the wrong version = false coverage.
+	if got := run("9.9.9"); got != "" {
+		t.Errorf("unmatched pin: got %q, want empty (no mismatched substitute)", got)
+	}
+	// Regex-special pin must compare LITERALLY: "1.0.0-alpha.1" must NOT match the
+	// cached "1.0.0-alpha-1" (an ERE would treat '.' as a wildcard) — MCP-2445 round-3.
+	if got := run("1.0.0-alpha.1"); got != "" {
+		t.Errorf("regex-special pin matched a different version (got %q); compare must be literal", got)
+	}
+	// The exact version (incl. the literal '.') still resolves.
+	if got := run("1.0.0-alpha-1"); got != dirC {
+		t.Errorf("exact regex-special pin: got %q, want %q", got, dirC)
+	}
+}
+
 // TestSourceResolverNpxFilesystemArgNotPicked verifies that a filesystem-style
 // positional argument (e.g. `/tmp/mydata` for @modelcontextprotocol/server-filesystem)
 // is NOT picked up as the server's source directory. Package-runner commands
@@ -564,6 +1053,12 @@ func TestSourceResolverNpxDataDirFallsThroughWhenNoCache(t *testing.T) {
 	os.WriteFile(filepath.Join(dataDir, "data.csv"), []byte("a,b,c"), 0644)
 
 	r := NewSourceResolver(zap.NewNop())
+	// Pin the published-package-source fetch OFF (MCP-2206) so this test isolates
+	// the LOCAL cache-miss fallthrough deterministically. With fetch enabled the
+	// resolver would (correctly) `npm pack` the published package, which both
+	// changes the outcome and depends on npm + network being present — covered
+	// separately by the package_fetch unit tests.
+	r.SetFetchPackageSource(false)
 	_, err := r.Resolve(context.Background(), ServerInfo{
 		Name:     "fs-server",
 		Protocol: "stdio",
@@ -650,45 +1145,98 @@ func TestDirLooksLikeSource(t *testing.T) {
 
 func TestIsPackageRunnerCommand(t *testing.T) {
 	tests := []struct {
+		name string
 		cmd  string
+		args []string
 		want bool
 	}{
-		{"npx", true},
-		{"/usr/local/bin/npx", true},
-		{"uvx", true},
-		{"pipx", true},
-		{"bunx", true},
-		{"python", false},
-		{"node", false},
-		{"./server", false},
+		// npx/uvx/bunx always run a package — runner by name.
+		{"npx", "npx", []string{"-y", "pkg"}, true},
+		{"npx path", "/usr/local/bin/npx", []string{"pkg"}, true},
+		{"uvx", "uvx", []string{"pkg"}, true},
+		{"bunx", "bunx", []string{"pkg"}, true},
+		// Subcommand-style runners: ONLY a runner when the ephemeral-run keyword is
+		// present (argument-aware classification, MCP-2445 round-2 hole #2).
+		{"pipx run", "pipx", []string{"run", "pkg"}, true},
+		{"pipx install (not runner)", "pipx", []string{"install", "pkg"}, false},
+		{"pnpm dlx", "pnpm", []string{"dlx", "pkg"}, true},
+		{"pnpm start (not runner)", "pnpm", []string{"start"}, false},
+		{"pnpm -p start (not runner)", "pnpm", []string{"-p", "start"}, false},
+		{"yarn dlx", "yarn", []string{"dlx", "pkg"}, true},
+		{"yarn build (not runner)", "yarn", []string{"build"}, false},
+		{"bun x", "bun", []string{"x", "pkg"}, true},
+		{"bun server.ts (not runner)", "bun", []string{"server.ts"}, false},
+		// Non-runners.
+		{"python", "python", []string{"app.py"}, false},
+		{"node", "node", []string{"server.js"}, false},
+		{"./server", "./server", nil, false},
 	}
 	for _, tt := range tests {
-		t.Run(tt.cmd, func(t *testing.T) {
-			if got := isPackageRunnerCommand(tt.cmd); got != tt.want {
-				t.Errorf("isPackageRunnerCommand(%q) = %v, want %v", tt.cmd, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPackageRunnerCommand(tt.cmd, tt.args); got != tt.want {
+				t.Errorf("isPackageRunnerCommand(%q, %v) = %v, want %v", tt.cmd, tt.args, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestSanitizeForDocker(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"simple", "simple"},
-		{"my-server", "my-server"},
-		{"org/repo", "org-repo"},
-		{"host:port", "host-port"},
-		{"with.dots", "with-dots"},
-		{"with spaces", "with-spaces"},
-	}
+// Container-name sanitization now lives in internal/dockernaming
+// (SanitizeServerName) so the scanner's container lookup and the launcher's
+// container naming share one rule. Its behavior — including the MCP-2123
+// regression case where dotted official-registry names must be preserved — is
+// covered by TestSanitizeServerName in that package.
 
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			if got := sanitizeForDocker(tt.input); got != tt.want {
-				t.Errorf("sanitizeForDocker(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
+// TestDockerCmdResolvesBinaryViaShellwrap verifies that the SourceResolver
+// resolves the docker binary through shellwrap.ResolveDockerPath rather than
+// shelling out with a bare "docker" arg. The previous behavior caused silent
+// failures when mcpproxy was launched from a sandboxed PATH (PKInstallSandbox
+// or a stripped GUI launchd context) — see #420 for the related image-probe
+// fix in internal/security/scanner/docker.go.
+//
+// We exercise the helper directly: the returned *exec.Cmd must have an
+// absolute Path (or, if shellwrap could not resolve docker, the literal
+// fallback "docker"). Crucially, we never silently leak a relative-path
+// invocation that depends on the daemon's $PATH.
+func TestDockerCmdUsesResolvedBinary(t *testing.T) {
+	r := NewSourceResolver(zap.NewNop())
+	cmd := r.dockerCmd(context.Background(), "ps")
+	if cmd == nil {
+		t.Fatal("dockerCmd returned nil")
+	}
+	if cmd.Path == "" {
+		t.Fatal("dockerCmd produced an exec.Cmd with empty Path")
+	}
+	// Either an absolute resolved path (Docker Desktop bundle, /usr/local/bin,
+	// etc.) or the explicit "docker" fallback. A non-"docker" relative path
+	// would mean we are silently relying on the process $PATH again.
+	if !filepath.IsAbs(cmd.Path) && cmd.Path != "docker" {
+		t.Errorf("dockerCmd.Path = %q; expected absolute path or literal \"docker\" fallback", cmd.Path)
+	}
+}
+
+// TestDockerCmdFallbackWhenShellwrapFails verifies the documented fallback
+// behavior: if shellwrap cannot resolve docker, the helper still returns a
+// usable *exec.Cmd (with Path="docker") so the caller surfaces a clean ENOENT
+// instead of a nil-pointer panic. This mirrors the pattern already in use in
+// scanner/docker.go's getDockerCmd.
+func TestDockerCmdFallbackWhenShellwrapFails(t *testing.T) {
+	// We can't easily force shellwrap.ResolveDockerPath to fail in-process
+	// (it caches across tests). Instead we just assert the helper is
+	// non-nil and has *some* Path on every call — the property we actually
+	// rely on at runtime is "never returns nil, never panics on caller use".
+	r := NewSourceResolver(zap.NewNop())
+	for _, args := range [][]string{
+		{"ps", "--filter", "name=foo"},
+		{"diff", "abc123"},
+		{"cp", "abc:/etc/hostname", "/tmp/x"},
+		{"exec", "abc", "sh", "-c", "ls"},
+	} {
+		cmd := r.dockerCmd(context.Background(), args...)
+		if cmd == nil {
+			t.Fatalf("dockerCmd(%v) = nil", args)
+		}
+		if cmd.Path == "" {
+			t.Errorf("dockerCmd(%v) returned empty Path", args)
+		}
 	}
 }

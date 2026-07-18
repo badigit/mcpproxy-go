@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
 )
 
@@ -30,7 +31,7 @@ func TestOutputDiagnostics_JSONFormat(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "json"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -69,7 +70,7 @@ func TestOutputDiagnostics_PrettyFormat_NoIssues(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -111,7 +112,7 @@ func TestOutputDiagnostics_PrettyFormat_WithUpstreamErrors(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -167,7 +168,7 @@ func TestOutputDiagnostics_PrettyFormat_WithOAuthRequired(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -213,7 +214,7 @@ func TestOutputDiagnostics_PrettyFormat_WithMissingSecrets(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -255,7 +256,7 @@ func TestOutputDiagnostics_PrettyFormat_WithRuntimeWarnings(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -309,7 +310,7 @@ func TestOutputDiagnostics_PrettyFormat_MultipleIssueTypes(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -356,7 +357,7 @@ func TestOutputDiagnostics_PrettyFormat_SingleIssue(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -386,7 +387,7 @@ func TestOutputDiagnostics_EmptyFormat(t *testing.T) {
 
 	// Empty string should default to pretty format
 	doctorOutput = ""
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -403,18 +404,18 @@ func TestOutputDiagnostics_EmptyFormat(t *testing.T) {
 	}
 }
 
-func TestShouldUseDoctorDaemon(t *testing.T) {
+func TestDoctorDaemonDetection_NoDaemon(t *testing.T) {
+	clearDaemonEnv(t)
+
 	// Test with non-existent directory
-	result := shouldUseDoctorDaemon("/tmp/nonexistent-mcpproxy-test-dir-67890")
-	if result {
-		t.Error("shouldUseDoctorDaemon should return false for non-existent directory")
+	if _, ok := newDaemonClient(&config.Config{DataDir: "/tmp/nonexistent-mcpproxy-test-dir-67890"}, nil); ok {
+		t.Error("newDaemonClient should report no daemon for non-existent directory")
 	}
 
 	// Test with existing directory but no socket
 	tmpDir := t.TempDir()
-	result = shouldUseDoctorDaemon(tmpDir)
-	if result {
-		t.Error("shouldUseDoctorDaemon should return false when socket doesn't exist")
+	if _, ok := newDaemonClient(&config.Config{DataDir: tmpDir}, nil); ok {
+		t.Error("newDaemonClient should report no daemon when socket doesn't exist")
 	}
 }
 
@@ -551,7 +552,7 @@ func TestOutputDiagnostics_WarningWithoutTitle(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -586,7 +587,7 @@ func TestOutputDiagnostics_HighSeverityWarning(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -624,7 +625,7 @@ func TestOutputDiagnostics_SecretWithoutOptionalFields(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer
@@ -665,7 +666,7 @@ func TestOutputDiagnostics_MissingSecretsRealJSON(t *testing.T) {
 	defer func() { os.Stdout = oldStdout }()
 
 	doctorOutput = "pretty"
-	err := outputDiagnostics(diag, nil, nil)
+	err := outputDiagnostics(diag, nil, nil, "")
 
 	w.Close()
 	var buf bytes.Buffer

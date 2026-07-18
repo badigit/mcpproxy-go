@@ -10,14 +10,40 @@ import (
 
 	"github.com/mark3labs/mcp-go/client"
 	uptransport "github.com/mark3labs/mcp-go/client/transport"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"go.uber.org/zap"
 )
 
+// packageRunnerNoArgs lists commands that behave as "runner for a package
+// named on the command line" — invoking them with no args prints help and
+// exits, which manifests downstream as an opaque "context deadline exceeded"
+// on MCP initialize. We fail fast instead.
+var packageRunnerNoArgs = map[string]string{
+	"uvx":  "the Python package to run (e.g. [\"obsidian-mcp\"])",
+	"npx":  "the npm package to run (e.g. [\"-y\", \"some-mcp-server\"])",
+	"pipx": "the subcommand and package (e.g. [\"run\", \"obsidian-mcp\"])",
+}
+
+// validateStdioConfig runs cheap pre-flight checks on a stdio server
+// configuration before launching a subprocess. Separated out so it can be
+// unit-tested without exercising the full connection path.
+func validateStdioConfig(cfg *config.ServerConfig) error {
+	if cfg.Command == "" {
+		return fmt.Errorf("no command specified for stdio transport")
+	}
+	if len(cfg.Args) == 0 {
+		if hint, ok := packageRunnerNoArgs[cfg.Command]; ok {
+			return fmt.Errorf("server %q: command %q has no args — %s is required", cfg.Name, cfg.Command, hint)
+		}
+	}
+	return nil
+}
+
 // connectStdio establishes a stdio transport connection to an MCP server
 func (c *Client) connectStdio(ctx context.Context) error {
-	if c.config.Command == "" {
-		return fmt.Errorf("no command specified for stdio transport")
+	if err := validateStdioConfig(c.config); err != nil {
+		return err
 	}
 
 	// Validate working directory if specified
@@ -76,7 +102,7 @@ func (c *Client) connectStdio(ctx context.Context) error {
 		c.logger.Debug("Docker command detected, setting up container ID tracking",
 			zap.String("server", c.config.Name),
 			zap.String("command", c.config.Command),
-			zap.Strings("original_args", args))
+			zap.Strings("original_args", shellwrap.RedactDockerArgs(args)))
 
 		// CRITICAL: Clean up any existing containers first to prevent duplicates
 		// This makes container creation idempotent and safe to call multiple times
@@ -115,39 +141,82 @@ func (c *Client) connectStdio(ctx context.Context) error {
 			zap.String("server", c.config.Name),
 			zap.String("original_command", c.config.Command))
 
-		// Use Docker isolation (now shell-wrapped for PATH inheritance)
-		finalCommand, finalArgs = c.setupDockerIsolation(c.config.Command, args)
+		// Use Docker isolation. On resolution to a verified absolute executable
+		// this direct-execs the docker binary (no shell wrap); otherwise it falls
+		// back to a login-shell wrap. dockerShellWrapped selects the matching
+		// cidfile helper.
+		var dockerShellWrapped bool
+		var dockerDir string
+		finalCommand, finalArgs, dockerShellWrapped, dockerDir = c.setupDockerIsolation(c.config.Command, args)
 		c.isDockerCommand = true
 
-		// Add cidfile to shell-wrapped Docker command if we have one
+		// Prepend the docker bundle dir to the child PATH so the spawned docker
+		// can exec its sibling credential helper / tooling on a registry pull
+		// (#715). No-op when docker did not resolve to an absolute path.
+		envVars = prependDockerDirToPath(envVars, dockerDir)
+
+		// Add cidfile to the Docker command if we have one
 		if cidFile != "" {
-			finalArgs = c.insertCidfileIntoShellDockerCommand(finalArgs, cidFile)
+			if dockerShellWrapped {
+				finalArgs = c.insertCidfileIntoShellDockerCommand(finalArgs, cidFile)
+			} else {
+				finalArgs = c.insertCidfileIntoDockerArgs(finalArgs, cidFile)
+			}
 		}
-	} else {
-		// For direct docker commands, inject env vars as -e flags before shell wrapping
+	} else if isDirectDockerRun := (c.config.Command == cmdDocker || strings.HasSuffix(c.config.Command, "/"+cmdDocker)) && len(args) > 0 && args[0] == cmdRun; isDirectDockerRun {
+		// USER-SUPPLIED `docker run …` upstream (config.Command IS `docker`).
+		// Inject env vars as -e flags, then reuse the SAME resolve→spawn decision
+		// as the isolation path (resolveDockerSpawn) so this path also direct-execs
+		// the resolved ABSOLUTE docker binary instead of shell-wrapping bare
+		// `docker` — the GH #696 / MCP-2868 fix. Previously this branch always
+		// called wrapWithUserShell("docker", …), which failed with
+		// `command not found: docker` on a default Docker Desktop macOS install.
+		c.isDockerCommand = true
+
 		argsToWrap := args
-		isDirectDockerRun := (c.config.Command == cmdDocker || strings.HasSuffix(c.config.Command, "/"+cmdDocker)) && len(args) > 0 && args[0] == cmdRun
-		if isDirectDockerRun && len(c.config.Env) > 0 {
+		if len(c.config.Env) > 0 {
 			argsToWrap = c.injectEnvVarsIntoDockerArgs(args, c.config.Env)
 			c.logger.Debug("Injected env vars into direct docker command",
 				zap.String("server", c.config.Name),
 				zap.Int("env_count", len(c.config.Env)),
-				zap.Strings("modified_args", argsToWrap))
+				zap.Strings("modified_args", shellwrap.RedactDockerArgs(argsToWrap)))
 		}
 
-		// Use shell wrapping for environment inheritance
-		// This fixes issues when mcpproxy is launched via Launchd and doesn't inherit
-		// user's shell environment (like PATH customizations from .bashrc, .zshrc, etc.)
-		finalCommand, finalArgs = c.wrapWithUserShell(c.config.Command, argsToWrap)
+		var dockerShellWrapped bool
+		var dockerDir string
+		finalCommand, finalArgs, dockerShellWrapped, dockerDir = c.resolveDockerSpawn(argsToWrap)
+
+		// Prepend the docker bundle dir to the child PATH so the spawned docker
+		// can exec its sibling credential helper / tooling on a registry pull
+		// (#715). No-op when docker did not resolve to an absolute path.
+		envVars = prependDockerDirToPath(envVars, dockerDir)
+
+		// Insert --cidfile via the helper that matches how we spawn: args-based on
+		// the direct-exec path, string-based on the login-shell fallback.
+		if cidFile != "" {
+			if dockerShellWrapped {
+				finalArgs = c.insertCidfileIntoShellDockerCommand(finalArgs, cidFile)
+			} else {
+				finalArgs = c.insertCidfileIntoDockerArgs(finalArgs, cidFile)
+			}
+		}
+	} else {
+		// Plain (non-docker) stdio command. Use shell wrapping for environment
+		// inheritance. This fixes issues when mcpproxy is launched via Launchd and
+		// doesn't inherit the user's shell environment (PATH customizations from
+		// .bashrc, .zshrc, etc.).
+		finalCommand, finalArgs = c.wrapWithUserShell(c.config.Command, args)
 		c.isDockerCommand = false
 
-		// Handle explicit docker commands
-		if isDirectDockerRun {
-			c.isDockerCommand = true
-			if cidFile != "" {
-				// For shell-wrapped Docker commands, we need to modify the shell command string
-				finalArgs = c.insertCidfileIntoShellDockerCommand(finalArgs, cidFile)
-			}
+		// Native sandbox isolation (MCP-34.3): when the resolved mode is
+		// "sandbox", re-exec the shell-wrapped command through the mcpproxy
+		// sandbox wrapper, which applies Landlock + rlimits before exec. Stdin/
+		// stdout passthrough is preserved (no mux). Non-Linux / unavailable
+		// kernels degrade to unconfined inside wrapWithSandbox.
+		if c.isolationManager != nil && c.isolationManager.ResolveMode(c.config) == config.IsolationModeSandbox {
+			var extraEnv []string
+			finalCommand, finalArgs, extraEnv = c.wrapWithSandbox(finalCommand, finalArgs)
+			envVars = append(envVars, extraEnv...)
 		}
 	}
 
@@ -171,9 +240,9 @@ func (c *Client) connectStdio(ctx context.Context) error {
 	c.logger.Debug("Initialized stdio transport",
 		zap.String("server", c.config.Name),
 		zap.String("final_command", finalCommand),
-		zap.Strings("final_args", finalArgs),
+		zap.Strings("final_args", shellwrap.RedactDockerArgs(finalArgs)),
 		zap.String("original_command", c.config.Command),
-		zap.Strings("original_args", args),
+		zap.Strings("original_args", shellwrap.RedactDockerArgs(args)),
 		zap.String("working_dir", c.config.WorkingDir),
 		zap.Bool("docker_isolation", c.isDockerCommand))
 
@@ -240,7 +309,22 @@ func (c *Client) connectStdio(ctx context.Context) error {
 			}
 			c.processGroupID = 0
 		}
-		return fmt.Errorf("MCP initialize failed for stdio transport: %w", err)
+		// Do not re-prefix with another "MCP initialize failed" — the
+		// inner error from initialize() already carries a human-readable
+		// message. Attach just the transport-level context (command that
+		// was launched and whether Docker isolation was in effect) so
+		// users can tell from one log line whether to look at the host
+		// command or the Docker layer.
+		//
+		// Report the RESOLVED command actually exec'd (finalCommand), not
+		// c.config.Command. For a Docker-isolated server config.Command is
+		// always "docker", so reporting it made a successful direct-exec of an
+		// absolute path (e.g. /Applications/Docker.app/.../docker, #696) look
+		// identical in the error to a bare-`docker` spawn — actively
+		// misdirecting diagnosis. finalCommand is the real argv[0]: an absolute
+		// path on direct-exec, or the login shell on the shell-wrap fallback.
+		return fmt.Errorf("stdio transport (command=%q, docker_isolation=%t): %w",
+			finalCommand, c.isDockerCommand, err)
 	}
 
 	// CRITICAL FIX: Extract underlying process from mcp-go transport for lifecycle management
@@ -343,7 +427,7 @@ func (c *Client) wrapWithUserShell(command string, args []string) (shellCommand 
 	c.logger.Debug("Wrapping command with user shell for full environment inheritance",
 		zap.String("server", c.config.Name),
 		zap.String("original_command", command),
-		zap.Strings("original_args", args),
+		zap.Strings("original_args", shellwrap.RedactDockerArgs(args)),
 		zap.String("shell", shellCommand))
 	return shellCommand, shellArgs
 }

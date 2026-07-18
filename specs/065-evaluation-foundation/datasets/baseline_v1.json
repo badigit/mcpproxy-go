@@ -1,0 +1,57 @@
+{
+  "__doc__": "Spec 065 D1+D2 regression baseline. Retrieval metrics are TOP-LEVEL because mcp-eval RetrievalScorer reads baseline[\"recall_at\"][\"5\"] etc. directly (quickstart \u00a74: --baseline datasets/baseline_v1.json). The CI gate (FR-009/MCP-742) fails if a fresh Recall@5 < baseline.recall_at[5] - tolerance.recall_at_5. The \"security\" section is appended by the D2 issue (CN-004); it is intentionally empty here.",
+  "corpus_version": "corpus_v1",
+  "golden_version": "retrieval_golden_v1",
+  "generated_from": {
+    "harness": "mcp-eval retrieval @ cb37f84",
+    "source_config": "datasets/snapshot-servers.config.json",
+    "mcpproxy": "BM25 index over corpus_v1 (45 tools, 7 no-auth reference servers)",
+    "runs": 1,
+    "note": "Reference = current BM25 behavior, a regression anchor (NOT a quality target). Refresh requires re-freezing corpus + re-review."
+  },
+  "recall_at": {
+    "1": 0.4184397163120567,
+    "3": 0.5602836879432624,
+    "5": 0.6808510638297872,
+    "10": 0.7907801418439717
+  },
+  "mrr": 0.5684903748733535,
+  "ndcg_at_10": 0.6094872517781414,
+  "map": 0.5435916919959473,
+  "tolerance": {
+    "recall_at_5": 0.05
+  },
+  "runs_averaged": 1,
+  "security": {
+    "__doc__": "Spec 065 D2 regression baseline for the deterministic sensitive-data detector. The CI gate (C1/MCP-742, eval.yml) runs `mcp-eval security --verdicts <scan-eval out> --corpus security_corpus_v1.json` and FAILS if a fresh run's FPR > gate.fpr_ceiling OR recall < gate.recall_floor. recall is intentionally low: sensitive-data detects secret/path-leak, NOT prompt injection; ~18/20 malicious corpus entries (prompt_injection/shadowing/rug_pull) are structurally out of scope and will be owned by future detectors. The FPR ceiling is the primary quiet-security gate; recall_floor is a total-blindness anchor. Per-detector floats are copied verbatim (full precision) from the scorer report for exact diffing. Refresh requires re-freezing the corpus + re-review (CN-002/CN-004).",
+    "corpus_version": "v1",
+    "generated_from": {
+      "scorer": "mcp-eval security @ 76df3a47",
+      "scan_eval": "cmd/scan-eval @ 33bb6e39",
+      "corpus": "datasets/security_corpus_v1.json (43 entries)",
+      "detector": "internal/security sensitive-data (deterministic, N=1)",
+      "runs": 1,
+      "note": "Reference = current deterministic detector behavior, a regression anchor (NOT a quality target). Gate thresholds approved at Gate 2 (MCP-815 plan revision, board-accepted 2026-06-02)."
+    },
+    "runs_averaged": 1,
+    "per_detector": [
+      {
+        "detector": "sensitive-data",
+        "precision": 0.6666666666666666,
+        "recall": 0.1,
+        "f1": 0.1739130434782609,
+        "fpr": 0.043478260869565216,
+        "fpr_std": 0.0,
+        "tp": 2,
+        "fp": 1,
+        "tn": 22,
+        "fn": 18,
+        "runs": 1
+      }
+    ],
+    "gate": {
+      "fpr_ceiling": 0.1,
+      "recall_floor": 0.05
+    }
+  }
+}

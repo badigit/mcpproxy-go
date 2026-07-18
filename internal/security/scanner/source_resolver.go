@@ -3,12 +3,16 @@ package scanner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/dockernaming"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"go.uber.org/zap"
 )
 
@@ -19,11 +23,64 @@ import (
 //   - Local stdio servers: uses working_dir or command directory
 type SourceResolver struct {
 	logger *zap.Logger
+
+	// fetchPackageSource, when true, allows the resolver to fetch the PUBLISHED
+	// source of a package-runner server (npx/uvx) — without executing it — as a
+	// last resort before falling back to a tool-definitions-only scan. This is a
+	// facet of the opt-in deep-scan layer (Spec 077 US3): the server layer keeps
+	// it false unless security.deep_scan.enabled is true, and even then honors
+	// security.deep_scan.fetch_package_source (default true) so air-gapped
+	// deployments can forbid the network egress. With deep scan off it is always
+	// false, so no published-package-source fetch happens by default.
+	fetchPackageSource bool
+
+	// resolveCalls / resolveFullSourceCalls count invocations of Resolve and
+	// ResolveFullSource. They exist so tests can assert the Spec 077 US3
+	// invariant that neither runs while the opt-in deep-scan layer is off (no
+	// Docker lookup / extraction / package fetch by default). Atomic so the
+	// Pass-2 goroutine's ResolveFullSource increment is race-free.
+	resolveCalls           atomic.Int64
+	resolveFullSourceCalls atomic.Int64
 }
 
 // NewSourceResolver creates a new SourceResolver
 func NewSourceResolver(logger *zap.Logger) *SourceResolver {
-	return &SourceResolver{logger: logger}
+	return &SourceResolver{logger: logger, fetchPackageSource: true}
+}
+
+// SetFetchPackageSource toggles the published-package-source fetch fallback.
+func (r *SourceResolver) SetFetchPackageSource(enabled bool) {
+	r.fetchPackageSource = enabled
+}
+
+// dockerCmd builds an exec.Cmd that invokes the resolved `docker` binary.
+//
+// The binary is looked up via shellwrap.ResolveDockerPath rather than relying
+// on $PATH directly. mcpproxy is frequently launched from a GUI bundle or a
+// PKInstallSandbox where $PATH does not include /usr/local/bin or
+// /opt/homebrew/bin, so a bare "docker" exec would silently fail and the
+// caller would see "no Docker container found" with no signal as to why. The
+// shellwrap helper probes well-known install locations (Docker Desktop bundle
+// binary, ~/.docker/bin, OrbStack, Homebrew, snap) and falls back to a login
+// shell — the same resolution the rest of the scanner already uses for the
+// image probe (see internal/security/scanner/docker.go).
+//
+// The minimal env is intentionally NOT applied here: source extraction runs
+// against user-trusted local containers (already running with the user's own
+// docker daemon) and `docker cp` of UTF-8 paths needs LANG/LC_* to round-trip
+// correctly. The narrower secret-leak concern handled in docker.go applies to
+// scanner containers we spawn, not to read-only `ps`/`diff`/`cp`/`exec` calls
+// against an existing container.
+func (r *SourceResolver) dockerCmd(ctx context.Context, args ...string) *exec.Cmd {
+	dockerBin, err := shellwrap.ResolveDockerPath(r.logger)
+	if err != nil || dockerBin == "" {
+		dockerBin = "docker"
+		if r.logger != nil {
+			r.logger.Debug("source resolver: falling back to bare 'docker' lookup",
+				zap.Error(err))
+		}
+	}
+	return exec.CommandContext(ctx, dockerBin, args...)
 }
 
 // ServerInfo contains the information needed to resolve a server's source
@@ -39,14 +96,15 @@ type ServerInfo struct {
 
 // ResolvedSource contains the resolved source information for scanning
 type ResolvedSource struct {
-	SourceDir   string   // Host directory containing source files
-	ContainerID string   // Docker container ID (if applicable)
-	ServerURL   string   // URL for mcp_connection input (HTTP/SSE servers)
-	Method      string   // How source was resolved: "docker_extract", "working_dir", "local_path", "url", "manual"
-	Cleanup     func()   // Cleanup function (removes temp dirs)
-	Files       []string // List of files found in source dir (capped)
-	TotalFiles  int      // Total file count
-	TotalSize   int64    // Total size in bytes
+	SourceDir      string   // Host directory containing source files
+	ContainerID    string   // Docker container ID (if applicable)
+	ContainerImage string   // Docker image reference (for "container_image" input)
+	ServerURL      string   // URL for mcp_connection input (HTTP/SSE servers)
+	Method         string   // How source was resolved: "docker_extract", "container_image", "working_dir", "local_path", "url", "manual"
+	Cleanup        func()   // Cleanup function (removes temp dirs)
+	Files          []string // List of files found in source dir (capped)
+	TotalFiles     int      // Total file count
+	TotalSize      int64    // Total size in bytes
 }
 
 // Resolve determines the source directory for scanning a server.
@@ -56,6 +114,7 @@ type ResolvedSource struct {
 //  3. Use directory containing the server command
 //  4. For HTTP servers, return URL for mcp_connection scanners
 func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*ResolvedSource, error) {
+	r.resolveCalls.Add(1)
 	// HTTP/SSE servers: scanners connect via URL
 	if info.Protocol == "http" || info.Protocol == "sse" || info.Protocol == "streamable-http" {
 		if info.URL != "" {
@@ -66,6 +125,26 @@ func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*Resolve
 			}, nil
 		}
 		return nil, fmt.Errorf("HTTP server %s has no URL configured", info.Name)
+	}
+
+	// User-managed Docker-image servers (e.g. `docker run -i --rm mcp/fetch`).
+	// These are NOT mcpproxy-managed containers (which use uvx/npx commands wrapped
+	// in `mcpproxy-<name>-*` containers and are handled below). Here the user wired
+	// `docker run <image>` directly as the server command, so there is no source
+	// tree to extract and no managed container to diff — the scan target is the
+	// image itself. Surface it so scanners that accept a "container_image" input
+	// (Trivy) can scan the image instead of falling back to an empty source dir
+	// (which produced source_method=tool_definitions_only and zero scanning).
+	if image := dockerImageFromCommand(info); image != "" {
+		r.logger.Info("Resolved source as Docker image reference",
+			zap.String("server", info.Name),
+			zap.String("image", image),
+		)
+		return &ResolvedSource{
+			ContainerImage: image,
+			Method:         "container_image",
+			Cleanup:        func() {},
+		}, nil
 	}
 
 	// Stdio servers: try Docker container first
@@ -89,6 +168,18 @@ func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*Resolve
 			zap.String("server", info.Name),
 			zap.Error(err),
 		)
+	} else if err != nil {
+		// Surface the docker-ps failure so users can see why source extraction
+		// fell back to working_dir or tool_definitions_only. The most common
+		// cause in production has been mcpproxy launched from a sandboxed PATH
+		// where the bare "docker" binary couldn't be found — silently swallowing
+		// that produced the misleading "Local (no Docker)" badge in the UI even
+		// when the server WAS running in a container (see #420 for the related
+		// image-probe fix).
+		r.logger.Warn("Docker container lookup failed, will fall back to non-Docker source resolution",
+			zap.String("server", info.Name),
+			zap.Error(err),
+		)
 	}
 
 	// For package-runner commands (npx, uvx, pipx, bunx, pnpm dlx, yarn dlx),
@@ -96,7 +187,7 @@ func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*Resolve
 	// a server like `npx @modelcontextprotocol/server-filesystem /tmp/data`
 	// from picking up the user's data dir (`/tmp/data`) as the server
 	// source — the arg is the filesystem server's allowed root, not code.
-	if info.Command != "" && isPackageRunnerCommand(info.Command) {
+	if info.Command != "" && isPackageRunnerCommand(info.Command, info.Args) {
 		if resolved, err := r.resolveFromPackageCache(ctx, info); err == nil {
 			return resolved, nil
 		} else {
@@ -178,9 +269,26 @@ func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*Resolve
 
 	// Last resort: try the package cache for any other command (e.g. the user
 	// has an absolute path to node_modules that we didn't match above).
-	if info.Command != "" && !isPackageRunnerCommand(info.Command) {
+	if info.Command != "" && !isPackageRunnerCommand(info.Command, info.Args) {
 		if resolved, err := r.resolveFromPackageCache(ctx, info); err == nil {
 			return resolved, nil
+		}
+	}
+
+	// Final fallback for package-runner servers (npx/uvx): fetch the PUBLISHED
+	// package source without executing it. This is the primary scan target —
+	// a quarantined-on-add server is never run locally, so the local cache above
+	// always misses (MCP-2206). Fetching real source lets the AI + supply-chain
+	// scanners run instead of degrading to tool_definitions_only.
+	if r.fetchPackageSource && info.Command != "" && isPackageRunnerCommand(info.Command, info.Args) {
+		if resolved, err := r.resolveFromPackageFetch(ctx, info); err == nil {
+			return resolved, nil
+		} else {
+			r.logger.Debug("Published package fetch failed, falling back to tool definitions only",
+				zap.String("server", info.Name),
+				zap.String("command", info.Command),
+				zap.Error(err),
+			)
 		}
 	}
 
@@ -191,13 +299,99 @@ func (r *SourceResolver) Resolve(ctx context.Context, info ServerInfo) (*Resolve
 // a remote registry rather than running local source code. For these, the
 // server source lives in the package manager's cache, not in any positional
 // argument.
-func isPackageRunnerCommand(command string) bool {
+//
+// Classification is ARGUMENT-AWARE for subcommand-style runners (MCP-2445):
+// npx/uvx/bunx always run a remote package by name, but pnpm/yarn/bun/pipx are
+// general multi-command tools — they are runners ONLY when their ephemeral-run
+// keyword (`dlx`/`x`/`run`) is actually present. Classifying `pnpm start` or
+// `bun server.ts` as a runner by name alone would route a local invocation into
+// the package cache/fetch path and scan the wrong token. We decide this up front
+// rather than relying on a later parser failure.
+func isPackageRunnerCommand(command string, args []string) bool {
 	base := strings.ToLower(filepath.Base(command))
 	switch base {
-	case "npx", "uvx", "pipx", "bunx":
+	case "npx", "uvx", "bunx":
 		return true
+	case "pipx", "pnpm", "yarn", "bun":
+		// Runner only when the ephemeral-run keyword yields a resolvable package.
+		return runnerPackageSpec(base, args) != ""
 	}
 	return false
+}
+
+// dockerRunValueFlags lists the `docker run` / `podman run` flags that consume
+// the following argument as their value. Used by dockerImageFromCommand to skip
+// past flag values when locating the positional image reference. Flags not in
+// this set (and not containing "=") are treated as boolean (e.g. -i, -t, --rm),
+// consuming no extra token. Attached forms ("--flag=value", "-eFOO=bar") carry
+// their value inline and are detected by the "=" check, so they need no entry.
+var dockerRunValueFlags = map[string]bool{
+	// Short forms
+	"-e": true, "-v": true, "-p": true, "-u": true, "-w": true, "-l": true, "-m": true,
+	// Long forms
+	"--env": true, "--volume": true, "--publish": true, "--name": true,
+	"--workdir": true, "--entrypoint": true, "--network": true, "--net": true,
+	"--user": true, "--label": true, "--mount": true, "--env-file": true,
+	"--add-host": true, "--device": true, "--expose": true, "--hostname": true,
+	"--memory": true, "--memory-swap": true, "--cpus": true, "--cpu-shares": true,
+	"--cpuset-cpus": true, "--platform": true, "--pull": true, "--restart": true,
+	"--log-driver": true, "--log-opt": true, "--cap-add": true, "--cap-drop": true,
+	"--security-opt": true, "--tmpfs": true, "--ulimit": true, "--gpus": true,
+	"--dns": true, "--link": true, "--volumes-from": true, "--sysctl": true,
+	"--shm-size": true, "--stop-signal": true, "--stop-timeout": true,
+	"--pid": true, "--ipc": true, "--uts": true, "--userns": true,
+	"--cgroupns": true, "--group-add": true, "--runtime": true,
+	"--health-cmd": true, "--health-interval": true, "--health-timeout": true,
+	"--health-retries": true, "--health-start-period": true,
+}
+
+// dockerImageFromCommand returns the Docker/Podman image reference for a server
+// whose command is a literal `docker run <image>` (or `podman run <image>`, or
+// `docker container run <image>`). It returns "" when the command is not a
+// docker/podman run invocation or no positional image argument can be found.
+//
+// This handles the common case where a user wires an MCP server as
+// `command: "docker", args: ["run", "-i", "--rm", "mcp/fetch"]`. Such servers
+// are not mcpproxy-managed containers, so the running-container resolver finds
+// nothing; without this the scan degraded to tool-definitions-only and Trivy
+// scanned an empty directory.
+//
+// Flag handling follows docker's CLI grammar: flags containing "=" carry their
+// value inline; flags listed in dockerRunValueFlags consume the next token;
+// every other flag (and combined short booleans like -it) consumes no value.
+// The first non-flag token after `run` is the image; anything after it belongs
+// to the containerized command and is ignored.
+func dockerImageFromCommand(info ServerInfo) string {
+	base := strings.ToLower(filepath.Base(info.Command))
+	if base != "docker" && base != "podman" {
+		return ""
+	}
+
+	args := info.Args
+	// Skip an optional "container" management subcommand: `docker container run`.
+	if len(args) > 0 && args[0] == "container" {
+		args = args[1:]
+	}
+	if len(args) == 0 || args[0] != "run" {
+		return ""
+	}
+	args = args[1:]
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			if strings.Contains(arg, "=") {
+				continue // --flag=value / -eFOO=bar — value is inline
+			}
+			if dockerRunValueFlags[arg] {
+				i++ // consume the flag's value token
+			}
+			continue
+		}
+		// First positional argument after `run` is the image reference.
+		return arg
+	}
+	return ""
 }
 
 // isSourceFile returns true if the path looks like a source-code file by
@@ -264,12 +458,16 @@ func dirLooksLikeSource(dir string) bool {
 	return found
 }
 
-// findServerContainer finds the running Docker container for a server
-// MCPProxy names containers as: mcpproxy-<sanitized-server-name>-<suffix>
+// findServerContainer finds the running Docker container for a server.
+// MCPProxy names containers as: mcpproxy-<sanitized-server-name>-<suffix>.
+// The sanitization MUST match the one used to name the container at launch
+// (internal/upstream/core), hence the shared dockernaming package — official
+// registry names like "com.pulsemcp/google-flights" keep their dots and would
+// otherwise never match (MCP-2123).
 func (r *SourceResolver) findServerContainer(ctx context.Context, serverName string) (string, error) {
 	// Use docker ps with filter to find matching containers
-	cmd := exec.CommandContext(ctx, "docker", "ps",
-		"--filter", fmt.Sprintf("name=mcpproxy-%s-", sanitizeForDocker(serverName)),
+	cmd := r.dockerCmd(ctx, "ps",
+		"--filter", fmt.Sprintf("name=mcpproxy-%s-", dockernaming.SanitizeServerName(serverName)),
 		"--format", "{{.ID}}",
 		"--no-trunc",
 	)
@@ -303,8 +501,12 @@ func (r *SourceResolver) findServerContainer(ctx context.Context, serverName str
 // hoisted into the same shared cache cannot leak into the scan.
 func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID string, info ServerInfo) (string, func(), error) {
 	serverName := info.Name
-	// Create temp directory for extracted source
-	tempDir, err := os.MkdirTemp("", fmt.Sprintf("mcpproxy-scan-%s-", serverName))
+	// Create temp directory for extracted source. Keep the pattern a constant:
+	// os.MkdirTemp's random suffix already guarantees uniqueness, so embedding the
+	// (user-controlled) server name added nothing but a go/path-injection taint
+	// (MCP-2155) and a slash-rejection bug for official-registry names like
+	// "com.pulsemcp/google-flights" (MCP-2123). Dropping it fixes both.
+	tempDir, err := os.MkdirTemp("", "mcpproxy-scan-")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
@@ -316,7 +518,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 	if targetDir := r.findContainerTargetDir(ctx, containerID, info); targetDir != "" {
 		destDir := filepath.Join(tempDir, "target")
 		_ = os.MkdirAll(destDir, 0755)
-		cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+targetDir+"/.", destDir)
+		cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+targetDir+"/.", destDir)
 		if err := cpCmd.Run(); err == nil {
 			r.logger.Info("Extracted target package from container",
 				zap.String("server", serverName),
@@ -333,7 +535,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 	}
 
 	// Strategy 2: docker diff for any user-added app source.
-	cmd := exec.CommandContext(ctx, "docker", "diff", containerID)
+	cmd := r.dockerCmd(ctx, "diff", containerID)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	diffErr := cmd.Run()
@@ -357,7 +559,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 			zap.String("container", containerID),
 		)
 		// Try UV git checkouts first (uvx --from pkg@git+URL)
-		uvCheckoutCmd := exec.CommandContext(ctx, "docker", "exec", containerID, "find", "/root/.cache/uv/git-v0/checkouts", "-maxdepth", "2", "-mindepth", "2", "-type", "d")
+		uvCheckoutCmd := r.dockerCmd(ctx, "exec", containerID, "find", "/root/.cache/uv/git-v0/checkouts", "-maxdepth", "2", "-mindepth", "2", "-type", "d")
 		var uvOut bytes.Buffer
 		uvCheckoutCmd.Stdout = &uvOut
 		if uvCheckoutCmd.Run() == nil {
@@ -367,7 +569,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 				}
 				destDir := filepath.Join(tempDir, "source")
 				os.MkdirAll(destDir, 0755)
-				cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+dir+"/.", destDir)
+				cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+dir+"/.", destDir)
 				if cpCmd.Run() == nil {
 					r.logger.Info("Extracted UV git checkout", zap.String("dir", dir))
 					return tempDir, cleanup, nil
@@ -376,7 +578,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 		}
 		// Try common app dirs (NOT /root — too broad)
 		for _, dir := range []string{"/app", "/src", "/opt/app"} {
-			cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+dir+"/.", filepath.Join(tempDir, filepath.Base(dir)))
+			cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+dir+"/.", filepath.Join(tempDir, filepath.Base(dir)))
 			if cpCmd.Run() == nil {
 				return tempDir, cleanup, nil
 			}
@@ -389,7 +591,7 @@ func (r *SourceResolver) extractFromContainer(ctx context.Context, containerID s
 	for _, dir := range appDirs {
 		destDir := filepath.Join(tempDir, filepath.Base(dir))
 		os.MkdirAll(destDir, 0755)
-		cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+dir+"/.", destDir)
+		cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+dir+"/.", destDir)
 		if err := cpCmd.Run(); err != nil {
 			r.logger.Debug("Failed to copy directory from container",
 				zap.String("dir", dir),
@@ -569,18 +771,8 @@ func npxTargetPackage(info ServerInfo) string {
 	if info.Command == "" || filepath.Base(info.Command) != "npx" {
 		return ""
 	}
-	for _, arg := range info.Args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		pkg := arg
-		// Strip version: @scope/name@1.0.0 → @scope/name, pkg@1.0.0 → pkg
-		if idx := strings.LastIndex(pkg, "@"); idx > 0 {
-			pkg = pkg[:idx]
-		}
-		return pkg
-	}
-	return ""
+	name, _ := parsePackageSpec(runnerPackageSpec("npx", info.Args))
+	return name
 }
 
 // uvxTargetPackage returns the Python package name a uvx-based server launches.
@@ -591,17 +783,9 @@ func uvxTargetPackage(info ServerInfo) string {
 	if info.Command == "" || filepath.Base(info.Command) != "uvx" {
 		return ""
 	}
-	var raw string
-	for i, arg := range info.Args {
-		if arg == "--from" && i+1 < len(info.Args) {
-			raw = info.Args[i+1]
-			break
-		}
-		if !strings.HasPrefix(arg, "-") {
-			raw = arg
-			break
-		}
-	}
+	// runnerPackageSpec skips `--with <dep>` / `-p <python>` values so the target
+	// is not shadowed by an extra dependency or python version (MCP-2445).
+	raw := runnerPackageSpec("uvx", info.Args)
 	if raw == "" {
 		return ""
 	}
@@ -615,13 +799,40 @@ func uvxTargetPackage(info ServerInfo) string {
 		return ""
 	}
 	// Strip version specifier: pkg@1.0 or pkg==1.0.
-	if idx := strings.LastIndex(raw, "@"); idx > 0 {
-		raw = raw[:idx]
+	name, _ := parsePackageSpec(raw)
+	return name
+}
+
+// npxContainerLocateScript builds a /bin/sh script that locates the npx cache
+// directory for pkg under npxGlobRoot (`<root>/<hash>/node_modules/<pkg>`). When
+// version is non-empty it PREFERS a bucket whose package.json declares that exact
+// version (honoring a version pin across a multi-version cache), and otherwise
+// echoes the first matching directory — preserving the previous newest/first
+// behavior. The package name and version are single-quote escaped for safe
+// embedding. Factored out so the shell logic is unit-testable on the host.
+func npxContainerLocateScript(npxGlobRoot, pkg, version string) string {
+	pkgEsc := strings.ReplaceAll(pkg, "'", `'\''`)
+	if version != "" {
+		// Pinned: return ONLY a bucket whose package.json declares that exact
+		// version. A pin-miss returns nothing — never a mismatched version, which
+		// would scan the wrong code and report false coverage (MCP-2445).
+		//
+		// The version is compared as a LITERAL shell string ([ "$v" = '...' ]),
+		// NOT as a regex: a pin like "1.0.0-alpha.1" must not match a cached
+		// "1.0.0-alpha-1" ('.' is not a wildcard) — MCP-2445 round-3. We extract
+		// the package.json "version" value with a grep whose pattern matches only
+		// the KEY (the value is captured as "[^\"]*", never the pin), pull the
+		// value out with sed, then compare it literally.
+		verEsc := strings.ReplaceAll(version, "'", `'\''`)
+		return "for d in " + npxGlobRoot + "/*/node_modules/'" + pkgEsc + "'; do " +
+			"[ -d \"$d\" ] || continue; " +
+			"v=$(grep -o '\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' \"$d/package.json\" 2>/dev/null | head -1 | sed 's/.*\"\\([^\"]*\\)\"$/\\1/'); " +
+			"if [ \"$v\" = '" + verEsc + "' ]; then printf '%s\\n' \"$d\"; exit 0; fi; " +
+			"done"
 	}
-	if idx := strings.Index(raw, "=="); idx > 0 {
-		raw = raw[:idx]
-	}
-	return raw
+	// Unpinned: first matching bucket.
+	return "for d in " + npxGlobRoot + "/*/node_modules/'" + pkgEsc + "'; do " +
+		"[ -d \"$d\" ] || continue; printf '%s\\n' \"$d\"; exit 0; done"
 }
 
 // findContainerTargetDir locates the target package's directory inside a
@@ -634,14 +845,12 @@ func uvxTargetPackage(info ServerInfo) string {
 // target cannot be located.
 func (r *SourceResolver) findContainerTargetDir(ctx context.Context, containerID string, info ServerInfo) string {
 	if pkg := npxTargetPackage(info); pkg != "" {
-		// Shell-escape single quotes in the package name and glob for it under
-		// every npx cache bucket inside the container.
-		escaped := strings.ReplaceAll(pkg, "'", `'\''`)
-		script := fmt.Sprintf(
-			"ls -d /root/.npm/_npx/*/node_modules/'%s' 2>/dev/null | head -n 1",
-			escaped,
-		)
-		if out, ok := dockerExecCapture(ctx, containerID, script); ok {
+		// Glob for the package under every npx cache bucket inside the container.
+		// When the spec carries an exact version pin, prefer the bucket whose
+		// package.json declares that version over the first match (MCP-2445).
+		_, wantVer := parsePackageSpec(runnerPackageSpec("npx", info.Args))
+		script := npxContainerLocateScript("/root/.npm/_npx", pkg, wantVer)
+		if out, ok := r.dockerExecCapture(ctx, containerID, script); ok {
 			if path := strings.TrimSpace(out); path != "" {
 				return path
 			}
@@ -680,7 +889,7 @@ func (r *SourceResolver) findContainerTargetDir(ctx context.Context, containerID
 			)
 		}
 		script := "for p in " + strings.Join(globs, " ") + "; do for d in $p; do [ -d \"$d\" ] && { echo \"$d\"; exit 0; }; done; done; exit 1"
-		if out, ok := dockerExecCapture(ctx, containerID, script); ok {
+		if out, ok := r.dockerExecCapture(ctx, containerID, script); ok {
 			if path := strings.TrimSpace(out); path != "" {
 				return path
 			}
@@ -691,8 +900,8 @@ func (r *SourceResolver) findContainerTargetDir(ctx context.Context, containerID
 
 // dockerExecCapture runs a shell command inside a container and returns its
 // stdout. Returns ok=false if the command fails or exits non-zero.
-func dockerExecCapture(ctx context.Context, containerID, script string) (string, bool) {
-	cmd := exec.CommandContext(ctx, "docker", "exec", containerID, "sh", "-c", script)
+func (r *SourceResolver) dockerExecCapture(ctx context.Context, containerID, script string) (string, bool) {
+	cmd := r.dockerCmd(ctx, "exec", containerID, "sh", "-c", script)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
@@ -705,6 +914,7 @@ func dockerExecCapture(ctx context.Context, containerID, script string) (string,
 // all dependencies (site-packages, node_modules, UV archives, etc.).
 // This is used for Pass 2 (supply chain audit) to scan the complete filesystem.
 func (r *SourceResolver) ResolveFullSource(ctx context.Context, info ServerInfo) (*ResolvedSource, error) {
+	r.resolveFullSourceCalls.Add(1)
 	// HTTP/SSE servers: no filesystem to scan
 	if info.Protocol == "http" || info.Protocol == "sse" || info.Protocol == "streamable-http" {
 		if info.URL != "" {
@@ -715,6 +925,21 @@ func (r *SourceResolver) ResolveFullSource(ctx context.Context, info ServerInfo)
 			}, nil
 		}
 		return nil, fmt.Errorf("HTTP server %s has no URL configured", info.Name)
+	}
+
+	// User-managed Docker-image servers: scan the image, not a source tree.
+	// Pass 2 (supply chain audit) benefits most here — Trivy image mode reports
+	// CVEs in the image's OS packages and bundled dependencies.
+	if image := dockerImageFromCommand(info); image != "" {
+		r.logger.Info("Resolved full source as Docker image reference for Pass 2",
+			zap.String("server", info.Name),
+			zap.String("image", image),
+		)
+		return &ResolvedSource{
+			ContainerImage: image,
+			Method:         "container_image",
+			Cleanup:        func() {},
+		}, nil
 	}
 
 	// Stdio servers: try Docker container first — extract FULL container
@@ -751,6 +976,16 @@ func (r *SourceResolver) ResolveFullSource(ctx context.Context, info ServerInfo)
 		}
 	}
 
+	// Final fallback for package-runner servers: fetch the published package
+	// source without executing it (MCP-2206). Same rationale as Pass 1 — without
+	// a local container or cache, Pass 2 supply-chain scanning would otherwise
+	// have nothing to analyze for npx/uvx servers.
+	if r.fetchPackageSource && info.Command != "" && isPackageRunnerCommand(info.Command, info.Args) {
+		if resolved, err := r.resolveFromPackageFetch(ctx, info); err == nil {
+			return resolved, nil
+		}
+	}
+
 	return nil, fmt.Errorf("could not resolve full source for server %s", info.Name)
 }
 
@@ -763,7 +998,10 @@ func (r *SourceResolver) ResolveFullSource(ctx context.Context, info ServerInfo)
 // false positives (e.g. flagging shutil.py or tempfile.py as "malicious").
 func (r *SourceResolver) extractFullFromContainer(ctx context.Context, containerID string, info ServerInfo) (string, func(), error) {
 	serverName := info.Name
-	tempDir, err := os.MkdirTemp("", fmt.Sprintf("mcpproxy-scan-full-%s-", serverName))
+	// Keep the pattern a constant — os.MkdirTemp's random suffix guarantees
+	// uniqueness; embedding the user-controlled server name only added a
+	// go/path-injection taint (MCP-2155) and a slash-rejection bug (MCP-2123).
+	tempDir, err := os.MkdirTemp("", "mcpproxy-scan-full-")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
@@ -778,7 +1016,7 @@ func (r *SourceResolver) extractFullFromContainer(ctx context.Context, container
 	if targetDir := r.findContainerTargetDir(ctx, containerID, info); targetDir != "" {
 		destDir := filepath.Join(tempDir, "target")
 		_ = os.MkdirAll(destDir, 0755)
-		cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+targetDir+"/.", destDir)
+		cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+targetDir+"/.", destDir)
 		if err := cpCmd.Run(); err == nil {
 			r.logger.Info("Extracted target package from container (Pass 2)",
 				zap.String("server", serverName),
@@ -796,7 +1034,7 @@ func (r *SourceResolver) extractFullFromContainer(ctx context.Context, container
 
 	// Strategy 2: docker diff for additional dependency subtrees that the
 	// server touched (e.g. anything at /app, /src, or installed site-packages).
-	cmd := exec.CommandContext(ctx, "docker", "diff", containerID)
+	cmd := r.dockerCmd(ctx, "diff", containerID)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	diffErr := cmd.Run()
@@ -816,7 +1054,7 @@ func (r *SourceResolver) extractFullFromContainer(ctx context.Context, container
 		for _, dir := range []string{"/app", "/src", "/opt/app"} {
 			destDir := filepath.Join(tempDir, filepath.Base(dir))
 			os.MkdirAll(destDir, 0755)
-			cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+dir+"/.", destDir)
+			cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+dir+"/.", destDir)
 			if cpCmd.Run() == nil {
 				return tempDir, cleanup, nil
 			}
@@ -832,7 +1070,7 @@ func (r *SourceResolver) extractFullFromContainer(ctx context.Context, container
 		destName := fmt.Sprintf("%d-%s", i, filepath.Base(dir))
 		destDir := filepath.Join(tempDir, destName)
 		os.MkdirAll(destDir, 0755)
-		cpCmd := exec.CommandContext(ctx, "docker", "cp", containerID+":"+dir+"/.", destDir)
+		cpCmd := r.dockerCmd(ctx, "cp", containerID+":"+dir+"/.", destDir)
 		if err := cpCmd.Run(); err != nil {
 			r.logger.Debug("Failed to copy directory from container (Pass 2)",
 				zap.String("dir", dir),
@@ -1054,21 +1292,15 @@ func (r *SourceResolver) resolveFromPackageCache(ctx context.Context, info Serve
 
 // resolveNpxCache finds an npx package's source in ~/.npm/_npx/*/node_modules/<package>/
 func (r *SourceResolver) resolveNpxCache(info ServerInfo) (*ResolvedSource, error) {
-	// Extract package name from args (first non-flag arg)
-	pkgName := ""
-	for _, arg := range info.Args {
-		if !strings.HasPrefix(arg, "-") {
-			pkgName = arg
-			break
-		}
-	}
-	if pkgName == "" {
+	// Extract the target package spec (handles `npx -p <pkg>`, `pnpm dlx <pkg>`,
+	// version pins, etc.) then split name from any exact version pin.
+	spec := runnerPackageSpec(strings.ToLower(filepath.Base(info.Command)), info.Args)
+	if spec == "" {
 		return nil, fmt.Errorf("no package name found in npx args")
 	}
-
-	// Strip version specifier: @modelcontextprotocol/server-everything@1.0.0 → @modelcontextprotocol/server-everything
-	if idx := strings.LastIndex(pkgName, "@"); idx > 0 {
-		pkgName = pkgName[:idx]
+	pkgName, wantVersion := parsePackageSpec(spec)
+	if pkgName == "" {
+		return nil, fmt.Errorf("no package name found in npx args")
 	}
 
 	// Find npm cache directory
@@ -1083,8 +1315,21 @@ func (r *SourceResolver) resolveNpxCache(info ServerInfo) (*ResolvedSource, erro
 	}
 
 	// Search for the package in npx cache: ~/.npm/_npx/<hash>/node_modules/<package>/
+	//
+	// The SAME package name can appear under multiple npx cache hashes. One may
+	// hold the real installed source (package.json + dist/lib/*.js) while another
+	// holds only a tools.json stub that mcpproxy itself wrote into the cache when
+	// it dumped tool definitions. The stub's mtime is frequently NEWER than the
+	// real source (it was just written), so a naive newest-mtime pick selects the
+	// stub and the scan reports a false "1 file" coverage (MCP-2397). We therefore
+	// prefer candidates that look like real package source, and only fall back to
+	// the newest-mtime tiebreak among candidates of the same class. When the spec
+	// carries an exact version pin, a candidate whose package.json declares that
+	// version is preferred over a newer-but-mismatched install (MCP-2445).
 	var bestMatch string
 	var bestModTime int64
+	var bestReal bool
+	var bestVerMatch bool
 
 	entries, err := os.ReadDir(npxCacheDir)
 	if err != nil {
@@ -1097,20 +1342,67 @@ func (r *SourceResolver) resolveNpxCache(info ServerInfo) (*ResolvedSource, erro
 		}
 		candidatePath := filepath.Join(npxCacheDir, entry.Name(), "node_modules", pkgName)
 		stat, err := os.Stat(candidatePath)
-		if err != nil {
+		if err != nil || !stat.IsDir() {
 			continue
 		}
-		if stat.IsDir() {
-			modTime := stat.ModTime().Unix()
-			if modTime > bestModTime {
-				bestModTime = modTime
-				bestMatch = candidatePath
-			}
+		real := npxCacheLooksReal(candidatePath)
+		verMatch := npxCacheVersionMatches(candidatePath, wantVersion)
+		modTime := stat.ModTime().Unix()
+
+		// Selection order (most to least significant):
+		//  1. any real-source candidate beats any stub;
+		//  2. a version-pin match beats a mismatch;
+		//  3. within the same class, the newest mtime wins.
+		better := false
+		switch {
+		case bestMatch == "":
+			better = true
+		case real != bestReal:
+			better = real
+		case verMatch != bestVerMatch:
+			better = verMatch
+		default:
+			better = modTime > bestModTime
+		}
+		if better {
+			bestMatch = candidatePath
+			bestModTime = modTime
+			bestReal = real
+			bestVerMatch = verMatch
 		}
 	}
 
 	if bestMatch == "" {
 		return nil, fmt.Errorf("package %q not found in npx cache (%s)", pkgName, npxCacheDir)
+	}
+
+	if wantVersion != "" && !bestVerMatch {
+		// An exact version was pinned but no cached candidate declares it. Do NOT
+		// substitute a different cached version — scanning the wrong code reports
+		// false coverage (MCP-2445). Defer to the published-source fetch fallback,
+		// which fetches the PINNED version, or degrade to tool_definitions_only.
+		r.logger.Warn("npx cache has the package but not the pinned version; deferring to published-source fetch",
+			zap.String("server", info.Name),
+			zap.String("package", pkgName),
+			zap.String("pinned_version", wantVersion),
+		)
+		return nil, fmt.Errorf("npx cache for %q has no entry matching pinned version %q (avoiding mismatched-version scan)", pkgName, wantVersion)
+	}
+
+	if !bestReal {
+		// Every candidate was a bare stub (e.g. a lone tools.json mcpproxy wrote
+		// into the cache) — no real installed source exists locally. Returning the
+		// stub here would report false "1 file" coverage AND, post-MCP-2206, would
+		// short-circuit the caller's published-source fetch fallback in Resolve(),
+		// which can fetch the REAL package source without executing it. So we treat
+		// stub-only as "not found" and let that fallback (or a tool_definitions_only
+		// degrade when fetch is disabled) take over instead.
+		r.logger.Warn("npx cache held only stub directories (no real package source); deferring to published-source fetch fallback",
+			zap.String("server", info.Name),
+			zap.String("package", pkgName),
+			zap.String("stub_path", bestMatch),
+		)
+		return nil, fmt.Errorf("npx cache for %q contained only stub directories (no real source) in %s", pkgName, npxCacheDir)
 	}
 
 	r.logger.Info("Resolved source from npx cache",
@@ -1126,29 +1418,78 @@ func (r *SourceResolver) resolveNpxCache(info ServerInfo) (*ResolvedSource, erro
 	}, nil
 }
 
-// resolveUvxCache finds a uvx package's source in ~/.cache/uv/ or ~/.local/share/uv/tools/
-func (r *SourceResolver) resolveUvxCache(info ServerInfo) (*ResolvedSource, error) {
-	// Extract package name from args
-	// uvx supports: uvx <package>, uvx --from <package> <command>, uvx git+<url>
-	pkgName := ""
-	isGitURL := false
-	for i, arg := range info.Args {
-		if arg == "--from" && i+1 < len(info.Args) {
-			pkgName = info.Args[i+1]
-			break
-		}
-		if !strings.HasPrefix(arg, "-") {
-			pkgName = arg
-			break
+// npxCacheVersionMatches reports whether the package.json at dir declares exactly
+// the given version. Returns false when version is empty or the file is missing /
+// unparseable. Used to prefer a version-pinned install over a newer-but-
+// mismatched one in a multi-version npx cache.
+func npxCacheVersionMatches(dir, version string) bool {
+	if version == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil {
+		return false
+	}
+	var pj struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pj); err != nil {
+		return false
+	}
+	return pj.Version == version
+}
+
+// npxCacheLooksReal reports whether an npx cache package directory holds the
+// real installed package rather than a bare stub. Every npm package ships a
+// package.json, so its presence is the canonical marker of real source. A stub
+// directory mcpproxy creates just to hold a dumped tools.json has none. As a
+// secondary signal we also accept a directory that contains a conventional
+// build/source subdirectory (dist/lib/build/src) or any JavaScript/TypeScript
+// source file, in case an unusual package omits package.json at the cache root.
+func npxCacheLooksReal(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "package.json")); err == nil {
+		return true
+	}
+	for _, sub := range []string{"dist", "lib", "build", "src"} {
+		if stat, err := os.Stat(filepath.Join(dir, sub)); err == nil && stat.IsDir() {
+			return true
 		}
 	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(e.Name())) {
+		case ".js", ".mjs", ".cjs", ".ts":
+			return true
+		}
+	}
+	return false
+}
+
+// resolveUvxCache finds a uvx package's source in ~/.cache/uv/ or ~/.local/share/uv/tools/
+func (r *SourceResolver) resolveUvxCache(info ServerInfo) (*ResolvedSource, error) {
+	// Extract the target package spec. runnerPackageSpec handles `uvx <pkg>`,
+	// `uvx --from <pkg> <cmd>`, `uvx git+<url>`, and crucially skips `--with <dep>`
+	// / `-p <python>` values so the additional dependency or python version is not
+	// mistaken for the target (MCP-2445).
+	pkgName := runnerPackageSpec(strings.ToLower(filepath.Base(info.Command)), info.Args)
 	if pkgName == "" {
 		return nil, fmt.Errorf("no package name found in uvx args")
 	}
 
 	// Check if it's a git URL: git+https://github.com/...
-	if strings.HasPrefix(pkgName, "git+") {
-		isGitURL = true
+	isGitURL := strings.HasPrefix(pkgName, "git+")
+
+	// Exact version pin (if any). Only meaningful for registry packages — git
+	// specs pin via the URL ref, not a PEP 440 version.
+	wantVersion := ""
+	if !isGitURL {
+		_, wantVersion = parsePackageSpec(pkgName)
 	}
 
 	homeDir, err := os.UserHomeDir()
@@ -1182,36 +1523,246 @@ func (r *SourceResolver) resolveUvxCache(info ServerInfo) (*ResolvedSource, erro
 		}
 	}
 
-	// Strategy 2: UV tools directory (for regular packages)
-	// Strip version: package@version → package
+	// Strategy 2: UV tools directory (for regular packages). Reduce the spec to a
+	// bare distribution name: strip a git+ URL to its repo, otherwise strip the
+	// `@version` form AND any PEP 440 specifier (`==`, `>=`, extras …) — the latter
+	// was previously missed, so a `pkg==1.0` spec produced a bogus `tools/pkg==1.0`
+	// path that never matched.
 	cleanPkg := pkgName
-	if idx := strings.LastIndex(cleanPkg, "@"); idx > 0 {
-		cleanPkg = cleanPkg[:idx]
-	}
-	// Also strip git+ prefix and URL
 	if strings.HasPrefix(cleanPkg, "git+") {
 		// Extract package name from URL: git+https://github.com/org/repo → repo
 		parts := strings.Split(cleanPkg, "/")
 		if len(parts) > 0 {
 			cleanPkg = parts[len(parts)-1]
 		}
+	} else {
+		if idx := strings.LastIndex(cleanPkg, "@"); idx > 0 {
+			cleanPkg = cleanPkg[:idx]
+		}
+		cleanPkg = stripPkgVersion(cleanPkg)
 	}
 
 	toolsDir := filepath.Join(homeDir, ".local", "share", "uv", "tools", cleanPkg)
 	if stat, err := os.Stat(toolsDir); err == nil && stat.IsDir() {
-		r.logger.Info("Resolved source from UV tools directory",
+		// When a version is pinned, only accept the tools dir if it actually holds
+		// that version — otherwise fall through so the published-source fetch gets
+		// the PINNED version instead of scanning whatever was `uv tool install`-ed
+		// (MCP-2445: never substitute a mismatched version).
+		if wantVersion == "" || uvDirHasVersion(toolsDir, stripPkgVersion(cleanPkg), wantVersion) {
+			r.logger.Info("Resolved source from UV tools directory",
+				zap.String("server", info.Name),
+				zap.String("package", cleanPkg),
+				zap.String("path", toolsDir),
+			)
+			return &ResolvedSource{
+				SourceDir: toolsDir,
+				Method:    "uvx_cache",
+				Cleanup:   func() {},
+			}, nil
+		}
+		r.logger.Warn("UV tools dir present but not the pinned version; deferring to archive/published-source fetch",
 			zap.String("server", info.Name),
 			zap.String("package", cleanPkg),
-			zap.String("path", toolsDir),
+			zap.String("pinned_version", wantVersion),
 		)
-		return &ResolvedSource{
-			SourceDir: toolsDir,
-			Method:    "uvx_cache",
-			Cleanup:   func() {},
-		}, nil
+	}
+
+	// Strategy 3: ephemeral uvx archive cache (~/.cache/uv/archive-v0/<hash>/).
+	// `uvx <pkg>` (the common case) never populates the persistent tools dir
+	// above — it unpacks the published wheel into a content-addressed archive
+	// entry keyed by an opaque hash, not by package name. So a server that HAS
+	// been run locally still missed both strategies above and fell through to a
+	// tool-definitions-only scan (or, post-MCP-2206, a redundant network fetch).
+	// The container resolver (findContainerTargetDir) already searches this
+	// cache; the host resolver now does too. Found by globbing every archive
+	// entry and matching the wheel's `.dist-info` (robust to dist-name vs
+	// import-name differences). git+URL packages live in git-v0 (Strategy 1),
+	// not archive-v0, so they are skipped here.
+	if !isGitURL {
+		archiveRoot := filepath.Join(homeDir, ".cache", "uv", "archive-v0")
+		// Honor an exact version pin: select the archive entry whose .dist-info
+		// declares the pinned version; a pin-miss resolves nothing (MCP-2445).
+		if dir, ok := findUvxArchiveDir(archiveRoot, stripPkgVersion(cleanPkg), wantVersion); ok {
+			r.logger.Info("Resolved source from UV archive cache",
+				zap.String("server", info.Name),
+				zap.String("package", cleanPkg),
+				zap.String("path", dir),
+			)
+			return &ResolvedSource{
+				SourceDir: dir,
+				Method:    "uvx_cache",
+				Cleanup:   func() {},
+			}, nil
+		}
 	}
 
 	return nil, fmt.Errorf("package %q not found in UV cache", pkgName)
+}
+
+// stripPkgVersion trims a PEP 508 version specifier and/or extras from a
+// package spec, leaving the bare distribution name. Handles `pkg==1.0`,
+// `pkg>=1.0`, `pkg~=1.0`, `pkg!=1.0`, `pkg[extra]`, and a trailing space/marker.
+// (The `@version` form is already stripped earlier by the caller.)
+func stripPkgVersion(spec string) string {
+	cut := len(spec)
+	for _, c := range []string{"==", ">=", "<=", "~=", "!=", ">", "<", "[", " ", ";"} {
+		if idx := strings.Index(spec, c); idx >= 0 && idx < cut {
+			cut = idx
+		}
+	}
+	return strings.TrimSpace(spec[:cut])
+}
+
+// normalizeDistName applies PEP 503 / wheel normalization to a Python
+// distribution name: lowercase, with runs of "-", "_" and "." collapsed to a
+// single "_". This matches the form uv writes for `.dist-info` directory names
+// (e.g. "My.Cool-Server" → "my_cool_server"), so a config's free-form package
+// spec can be matched against on-disk wheels.
+func normalizeDistName(name string) string {
+	n := strings.ToLower(name)
+	n = strings.NewReplacer("-", "_", ".", "_").Replace(n)
+	for strings.Contains(n, "__") {
+		n = strings.ReplaceAll(n, "__", "_")
+	}
+	return strings.Trim(n, "_")
+}
+
+// findUvxArchiveDir locates the unpacked wheel for distribution pkg inside the
+// uv ephemeral archive cache. Each archive entry (~/.cache/uv/archive-v0/<hash>)
+// holds exactly one unpacked wheel, content-addressed by an opaque hash — so the
+// package is found by scanning entries and matching the wheel's `.dist-info`
+// directory rather than by constructing a name-based path. Both the flat layout
+// (<hash>/<dist>-<ver>.dist-info) and the venv-style layout
+// (<hash>/lib/python*/site-packages/<dist>-<ver>.dist-info) are supported. When
+// multiple entries match (e.g. several cached versions) a wantVersion match wins
+// first; otherwise the most recently modified entry wins, consistent with
+// resolveNpxCache. wantVersion may be "" (no pin). Returns the archive entry root
+// (the <hash> dir) and ok=true on a hit.
+func findUvxArchiveDir(archiveRoot, pkg, wantVersion string) (string, bool) {
+	norm := normalizeDistName(pkg)
+	if norm == "" {
+		return "", false
+	}
+	entries, err := os.ReadDir(archiveRoot)
+	if err != nil {
+		return "", false
+	}
+
+	var best string
+	var bestMod int64
+	var bestVerMatch bool
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		entryPath := filepath.Join(archiveRoot, entry.Name())
+		// Check the flat layout, then any venv-style site-packages dirs.
+		matchDirs := []string{entryPath}
+		if sp, _ := filepath.Glob(filepath.Join(entryPath, "lib", "python*", "site-packages")); len(sp) > 0 {
+			matchDirs = append(matchDirs, sp...)
+		}
+		matched := false
+		verMatch := false
+		for _, d := range matchDirs {
+			nm, vm := distInfoMatch(d, norm, wantVersion)
+			if nm {
+				matched = true
+				if vm {
+					verMatch = true
+				}
+			}
+		}
+		if !matched {
+			continue
+		}
+		modTime := int64(0)
+		if fi, err := entry.Info(); err == nil {
+			modTime = fi.ModTime().Unix()
+		}
+		// Selection: a version-pin match beats a mismatch; then newest mtime wins.
+		better := false
+		switch {
+		case best == "":
+			better = true
+		case verMatch != bestVerMatch:
+			better = verMatch
+		default:
+			better = modTime > bestMod
+		}
+		if better {
+			best = entryPath
+			bestMod = modTime
+			bestVerMatch = verMatch
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	if wantVersion != "" && !bestVerMatch {
+		// Pinned version requested but no archive entry declares it. Do not
+		// substitute a different cached version (false coverage) — report not found
+		// so the caller fetches the pinned version or degrades (MCP-2445).
+		return "", false
+	}
+	return best, true
+}
+
+// uvDirHasVersion reports whether a uv venv-style directory (a `uv tool install`
+// tools dir) holds distribution pkg at exactly version. It looks for a matching
+// `<dist>-<version>.dist-info` under any `lib/python*/site-packages`. Used to keep
+// a version pin honest against the persistent tools dir.
+func uvDirHasVersion(root, pkg, version string) bool {
+	if version == "" {
+		return false
+	}
+	norm := normalizeDistName(pkg)
+	if norm == "" {
+		return false
+	}
+	sps, _ := filepath.Glob(filepath.Join(root, "lib", "python*", "site-packages"))
+	for _, d := range sps {
+		if _, vm := distInfoMatch(d, norm, version); vm {
+			return true
+		}
+	}
+	return false
+}
+
+// distInfoMatch reports whether dir directly contains a `<name>-<version>.dist-info`
+// directory whose normalized distribution name equals norm (nameMatch), and — when
+// wantVersion is non-empty — whether that directory's version equals wantVersion
+// (versionMatch). A wheel's `.dist-info` name is
+// `{normalized-distribution}-{version}.dist-info`, and the normalized distribution
+// name contains no "-" (those become "_"), so the FIRST "-" cleanly separates name
+// from version.
+func distInfoMatch(dir, norm, wantVersion string) (nameMatch, versionMatch bool) {
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		return false, false
+	}
+	for _, e := range es {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".dist-info") {
+			continue
+		}
+		base := name[:len(name)-len(".dist-info")]
+		idx := strings.Index(base, "-")
+		if idx <= 0 {
+			continue
+		}
+		if normalizeDistName(base[:idx]) != norm {
+			continue
+		}
+		nameMatch = true
+		if wantVersion != "" && base[idx+1:] == wantVersion {
+			// Exact version match — best possible, return immediately.
+			return true, true
+		}
+	}
+	return nameMatch, versionMatch
 }
 
 // findGitCheckoutByRepo searches UV git checkouts for a directory that matches the given repo.
@@ -1282,9 +1833,4 @@ func (r *SourceResolver) findGitCheckoutByRepo(checkoutsDir, repoName, gitURL st
 		return "", fmt.Errorf("no git checkout found matching repo %q", repoName)
 	}
 	return bestPath, nil
-}
-
-// sanitizeForDocker removes characters invalid in Docker container names
-func sanitizeForDocker(name string) string {
-	return strings.NewReplacer("/", "-", ":", "-", ".", "-", " ", "-").Replace(name)
 }

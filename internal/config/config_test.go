@@ -1356,3 +1356,405 @@ func TestServerConfig_ReconnectOnUse(t *testing.T) {
 		assert.Equal(t, server.ReconnectOnUse, restored.ReconnectOnUse)
 	})
 }
+
+func TestServerConfig_IsToolAllowedByConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *ServerConfig
+		toolName string
+		want     bool
+	}{
+		{"no filter allows everything", &ServerConfig{}, "anything", true},
+		{"allowlist: listed tool allowed", &ServerConfig{EnabledTools: []string{"read_file", "list_dir"}}, "read_file", true},
+		{"allowlist: unlisted tool denied", &ServerConfig{EnabledTools: []string{"read_file"}}, "delete_file", false},
+		{"denylist: listed tool denied", &ServerConfig{DisabledTools: []string{"delete_repo"}}, "delete_repo", false},
+		{"denylist: unlisted tool allowed", &ServerConfig{DisabledTools: []string{"delete_repo"}}, "list_repos", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.IsToolAllowedByConfig(tt.toolName)
+			if got != tt.want {
+				t.Errorf("IsToolAllowedByConfig(%q) = %v, want %v", tt.toolName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultOutputValidationConfig(t *testing.T) {
+	cfg := DefaultOutputValidationConfig()
+
+	// Verify the four defaults
+	assert.Equal(t, "warn", cfg.Mode, "default mode should be warn")
+	assert.Equal(t, 5<<20, cfg.MaxBytes, "default MaxBytes should be 5<<20")
+	assert.Equal(t, 64, cfg.MaxDepth, "default MaxDepth should be 64")
+	assert.Equal(t, "allow", cfg.MissingStructuredContent, "default MissingStructuredContent should be allow")
+}
+
+func TestOutputValidationConfig_NilSafeHelpers(t *testing.T) {
+	var c *OutputValidationConfig
+
+	// nil receiver behaves as defaults (warn-mode enabled)
+	assert.True(t, c.IsEnabled(), "nil: IsEnabled should return true (warn by default)")
+	assert.False(t, c.IsStrict(), "nil: IsStrict should return false")
+	assert.True(t, c.IsWarn(), "nil: IsWarn should return true")
+	assert.Equal(t, 5<<20, c.EffectiveMaxBytes(), "nil: EffectiveMaxBytes should return 5<<20")
+	assert.Equal(t, 64, c.EffectiveMaxDepth(), "nil: EffectiveMaxDepth should return 64")
+	assert.False(t, c.BlockOnMissingStructured(), "nil: BlockOnMissingStructured should return false")
+}
+
+func TestOutputValidationConfig_ModeOff(t *testing.T) {
+	c := &OutputValidationConfig{Mode: "off"}
+	assert.False(t, c.IsEnabled(), "mode=off: IsEnabled should be false")
+	assert.False(t, c.IsStrict(), "mode=off: IsStrict should be false")
+	assert.False(t, c.IsWarn(), "mode=off: IsWarn should be false")
+}
+
+func TestOutputValidationConfig_ModeStrict(t *testing.T) {
+	c := &OutputValidationConfig{Mode: "strict"}
+	assert.True(t, c.IsEnabled(), "mode=strict: IsEnabled should be true")
+	assert.True(t, c.IsStrict(), "mode=strict: IsStrict should be true")
+	assert.False(t, c.IsWarn(), "mode=strict: IsWarn should be false (strict, not warn)")
+}
+
+func TestOutputValidationConfig_BlockOnMissingStructured(t *testing.T) {
+	c := &OutputValidationConfig{Mode: "strict", MissingStructuredContent: "block"}
+	assert.True(t, c.BlockOnMissingStructured(), "MissingStructuredContent=block should return true")
+}
+
+func TestOutputValidationConfig_EffectiveDefaults(t *testing.T) {
+	// Zero values fall back to defaults
+	c := &OutputValidationConfig{Mode: "warn"}
+	assert.Equal(t, 5<<20, c.EffectiveMaxBytes(), "zero MaxBytes falls back to 5<<20")
+	assert.Equal(t, 64, c.EffectiveMaxDepth(), "zero MaxDepth falls back to 64")
+
+	// Non-zero values are preserved
+	c2 := &OutputValidationConfig{Mode: "warn", MaxBytes: 1024, MaxDepth: 32}
+	assert.Equal(t, 1024, c2.EffectiveMaxBytes(), "non-zero MaxBytes is preserved")
+	assert.Equal(t, 32, c2.EffectiveMaxDepth(), "non-zero MaxDepth is preserved")
+}
+
+func TestOutputValidationConfig_JSONRoundTrip(t *testing.T) {
+	// Build a root Config with an OutputValidation block and round-trip it
+	orig := &Config{
+		Listen: "127.0.0.1:9090",
+		OutputValidation: &OutputValidationConfig{
+			Mode:                     "strict",
+			MaxBytes:                 1 << 20,
+			MaxDepth:                 32,
+			MissingStructuredContent: "block",
+		},
+	}
+
+	data, err := json.Marshal(orig)
+	require.NoError(t, err, "marshal should not fail")
+
+	var restored Config
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err, "unmarshal should not fail")
+
+	require.NotNil(t, restored.OutputValidation, "OutputValidation should survive round-trip")
+	assert.Equal(t, "strict", restored.OutputValidation.Mode)
+	assert.Equal(t, 1<<20, restored.OutputValidation.MaxBytes)
+	assert.Equal(t, 32, restored.OutputValidation.MaxDepth)
+	assert.Equal(t, "block", restored.OutputValidation.MissingStructuredContent)
+}
+
+func TestDefaultOutputSanitisationConfig(t *testing.T) {
+	cfg := DefaultOutputSanitisationConfig()
+
+	assert.False(t, cfg.SpotlightUntrusted, "Track B is fully opt-in: default SpotlightUntrusted should be false")
+	assert.Equal(t, "spotlight", cfg.ResponseAction, "default ResponseAction should be spotlight")
+	assert.False(t, cfg.StripControlChars, "default StripControlChars should be false")
+	assert.Equal(t, []string{"ansi", "c0c1", "bidi", "zero_width"}, cfg.StripClasses, "default StripClasses")
+	assert.Equal(t, 100, cfg.MaxRedactions, "default MaxRedactions should be 100")
+}
+
+func TestOutputSanitisationConfig_NilSafeHelpers(t *testing.T) {
+	var c *OutputSanitisationConfig
+
+	assert.True(t, c.IsEnabled(), "nil: IsEnabled should default true")
+	assert.False(t, c.IsSpotlightEnabled(), "nil: IsSpotlightEnabled should be false (fully opt-in)")
+	assert.False(t, c.IsRedact(), "nil: IsRedact should be false")
+	assert.False(t, c.IsBlock(), "nil: IsBlock should be false")
+	assert.False(t, c.IsStripEnabled(), "nil: IsStripEnabled should be false")
+	assert.Empty(t, c.EnabledStripClasses(), "nil: EnabledStripClasses should be empty (strip disabled)")
+}
+
+func TestOutputSanitisationConfig_IsRedactIsBlock(t *testing.T) {
+	cases := []struct {
+		action string
+		redact bool
+		block  bool
+	}{
+		{"spotlight", false, false},
+		{"redact", true, false},
+		{"block", false, true},
+		{"", false, false},
+	}
+	for _, tc := range cases {
+		c := &OutputSanitisationConfig{ResponseAction: tc.action}
+		assert.Equal(t, tc.redact, c.IsRedact(), "IsRedact for action=%q", tc.action)
+		assert.Equal(t, tc.block, c.IsBlock(), "IsBlock for action=%q", tc.action)
+	}
+}
+
+func TestOutputSanitisationConfig_IsSpotlightEnabled(t *testing.T) {
+	cEnabled := &OutputSanitisationConfig{SpotlightUntrusted: true}
+	assert.True(t, cEnabled.IsSpotlightEnabled())
+
+	cDisabled := &OutputSanitisationConfig{SpotlightUntrusted: false}
+	assert.False(t, cDisabled.IsSpotlightEnabled())
+}
+
+func TestOutputSanitisationConfig_EnabledStripClasses(t *testing.T) {
+	// Strip disabled -> empty regardless of classes
+	cDisabled := &OutputSanitisationConfig{
+		StripControlChars: false,
+		StripClasses:      []string{"ansi", "bidi"},
+	}
+	assert.Empty(t, cDisabled.EnabledStripClasses(), "strip disabled -> empty map")
+
+	// Strip enabled -> set of valid, lowercased classes; invalid filtered out
+	cEnabled := &OutputSanitisationConfig{
+		StripControlChars: true,
+		StripClasses:      []string{"ANSI", "c0c1", "bogus", "Zero_Width", "bidi"},
+	}
+	set := cEnabled.EnabledStripClasses()
+	assert.True(t, set["ansi"], "ansi present")
+	assert.True(t, set["c0c1"], "c0c1 present")
+	assert.True(t, set["zero_width"], "zero_width present (lowercased)")
+	assert.True(t, set["bidi"], "bidi present")
+	assert.False(t, set["bogus"], "invalid class filtered out")
+	assert.Len(t, set, 4, "only the four valid classes")
+}
+
+func TestOutputSanitisationConfig_WouldMutate(t *testing.T) {
+	// default config is fully opt-in -> never mutates (any trust)
+	def := DefaultOutputSanitisationConfig()
+	assert.False(t, def.WouldMutate("trusted"), "default (opt-in) should not mutate trusted")
+	assert.False(t, def.WouldMutate("untrusted"), "default (opt-in) should not mutate untrusted")
+
+	// untrusted + spotlight explicitly enabled -> true
+	spot := &OutputSanitisationConfig{ResponseAction: "spotlight", SpotlightUntrusted: true}
+	assert.True(t, spot.WouldMutate("untrusted"), "untrusted + spotlight-on should mutate")
+	assert.False(t, spot.WouldMutate("trusted"), "trusted + spotlight should not mutate")
+
+	// redact regardless of trust -> true
+	redact := &OutputSanitisationConfig{ResponseAction: "redact"}
+	assert.True(t, redact.WouldMutate("trusted"), "redact mutates even for trusted")
+	assert.True(t, redact.WouldMutate("untrusted"), "redact mutates for untrusted")
+
+	// block regardless of trust -> true
+	block := &OutputSanitisationConfig{ResponseAction: "block"}
+	assert.True(t, block.WouldMutate("trusted"), "block mutates even for trusted")
+	assert.True(t, block.WouldMutate("untrusted"), "block mutates for untrusted")
+
+	// untrusted + strip enabled (spotlight off) -> true
+	strip := &OutputSanitisationConfig{ResponseAction: "spotlight", SpotlightUntrusted: false, StripControlChars: true}
+	assert.True(t, strip.WouldMutate("untrusted"), "untrusted + strip should mutate")
+	assert.False(t, strip.WouldMutate("trusted"), "trusted + strip-only should not mutate")
+}
+
+func TestOutputSanitisationConfig_JSONRoundTrip(t *testing.T) {
+	orig := &Config{
+		Listen: "127.0.0.1:9090",
+		OutputSanitisation: &OutputSanitisationConfig{
+			SpotlightUntrusted: true,
+			ResponseAction:     "redact",
+			StripControlChars:  true,
+			StripClasses:       []string{"ansi", "bidi"},
+			MaxRedactions:      42,
+		},
+	}
+
+	data, err := json.Marshal(orig)
+	require.NoError(t, err)
+
+	var restored Config
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err)
+
+	require.NotNil(t, restored.OutputSanitisation)
+	assert.True(t, restored.OutputSanitisation.SpotlightUntrusted)
+	assert.Equal(t, "redact", restored.OutputSanitisation.ResponseAction)
+	assert.True(t, restored.OutputSanitisation.StripControlChars)
+	assert.Equal(t, []string{"ansi", "bidi"}, restored.OutputSanitisation.StripClasses)
+	assert.Equal(t, 42, restored.OutputSanitisation.MaxRedactions)
+}
+
+func TestToolMetadata_OutputSchemaJSON(t *testing.T) {
+	// Verify OutputSchemaJSON field exists on ToolMetadata
+	meta := &ToolMetadata{
+		Name:             "test_tool",
+		ServerName:       "test_server",
+		Description:      "A test tool",
+		ParamsJSON:       `{"type":"object"}`,
+		OutputSchemaJSON: `{"type":"string"}`,
+	}
+
+	data, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	var restored ToolMetadata
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err)
+	assert.Equal(t, `{"type":"string"}`, restored.OutputSchemaJSON)
+
+	// Empty OutputSchemaJSON should be omitted from JSON (omitempty)
+	metaNoSchema := &ToolMetadata{
+		Name:       "test_tool",
+		ServerName: "test_server",
+		ParamsJSON: `{"type":"object"}`,
+	}
+	data2, err := json.Marshal(metaNoSchema)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data2), "output_schema_json", "empty OutputSchemaJSON should be omitted")
+}
+
+// TestMigrateDeepScanConfig verifies the Spec 077 US3 config migration:
+// the deprecated top-level scanner_fetch_package_source /
+// scanner_disable_no_new_privileges keys are folded into the unified
+// security.deep_scan block on load, the removed auto_scan_quarantined key is
+// ignored, and a round-trip through JSON preserves the migrated shape.
+func TestMigrateDeepScanConfig(t *testing.T) {
+	fetch := false
+	original := &Config{
+		Security: &SecurityConfig{
+			ScannerFetchPackageSource:     &fetch,
+			ScannerDisableNoNewPrivileges: true,
+		},
+	}
+
+	migrateDeepScanConfig(original)
+
+	require.NotNil(t, original.Security.DeepScan, "deep_scan block must be created by migration")
+	require.NotNil(t, original.Security.DeepScan.FetchPackageSource, "fetch_package_source must migrate into deep_scan")
+	assert.False(t, *original.Security.DeepScan.FetchPackageSource, "fetch_package_source value must be preserved")
+	assert.True(t, original.Security.DeepScan.DisableNoNewPrivileges, "disable_no_new_privileges must migrate into deep_scan")
+
+	// Legacy top-level keys must be cleared so the migrated config serializes
+	// only the new deep_scan.* surface (no duplicate/stale keys).
+	assert.Nil(t, original.Security.ScannerFetchPackageSource, "legacy scanner_fetch_package_source must be cleared after migration")
+	assert.False(t, original.Security.ScannerDisableNoNewPrivileges, "legacy scanner_disable_no_new_privileges must be cleared after migration")
+
+	// Effective accessors must read the migrated values.
+	assert.True(t, original.Security.IsDisableNoNewPrivileges(), "effective disable-no-new-privileges must reflect migrated value")
+	if got := original.Security.EffectiveFetchPackageSource(); assert.NotNil(t, got) {
+		assert.False(t, *got, "effective fetch-package-source must reflect migrated value")
+	}
+
+	// Round-trip: marshal then unmarshal, migrate again (idempotent), and
+	// confirm the deep_scan values survive and legacy keys do not reappear.
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "scanner_fetch_package_source", "migrated config must not serialize the legacy key")
+	assert.NotContains(t, string(data), "scanner_disable_no_new_privileges", "migrated config must not serialize the legacy key")
+	assert.Contains(t, string(data), "deep_scan", "migrated config must serialize the deep_scan block")
+
+	var restored Config
+	require.NoError(t, json.Unmarshal(data, &restored))
+	migrateDeepScanConfig(&restored)
+	require.NotNil(t, restored.Security.DeepScan)
+	require.NotNil(t, restored.Security.DeepScan.FetchPackageSource)
+	assert.False(t, *restored.Security.DeepScan.FetchPackageSource)
+	assert.True(t, restored.Security.DeepScan.DisableNoNewPrivileges)
+}
+
+// TestMigrateDeepScanConfigIgnoresAutoScanQuarantined proves that a config file
+// carrying the removed auto_scan_quarantined key loads without error and the
+// key is simply dropped (Spec 077 FR-016).
+func TestMigrateDeepScanConfigIgnoresAutoScanQuarantined(t *testing.T) {
+	jsonData := `{"security":{"auto_scan_quarantined":true,"scanner_disable_no_new_privileges":true}}`
+	var cfg Config
+	require.NoError(t, json.Unmarshal([]byte(jsonData), &cfg), "config with removed key must still unmarshal")
+	migrateDeepScanConfig(&cfg)
+	require.NotNil(t, cfg.Security)
+	require.NotNil(t, cfg.Security.DeepScan)
+	assert.True(t, cfg.Security.DeepScan.DisableNoNewPrivileges)
+
+	// The removed key must not round-trip back out (no struct field to hold it).
+	data, err := json.Marshal(&cfg)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "auto_scan_quarantined", "removed key must not serialize")
+}
+
+// Tests for tool_response_mode (Spec 085 T013 — FR-001/FR-015)
+
+func TestToolResponseModeValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		wantErr bool
+	}{
+		{name: "empty means full (default)", mode: "", wantErr: false},
+		{name: "full is valid", mode: ToolResponseModeFull, wantErr: false},
+		{name: "compact is valid", mode: ToolResponseModeCompact, wantErr: false},
+		{name: "bogus value is rejected", mode: "bogus", wantErr: true},
+		{name: "case-sensitive: Compact is rejected", mode: "Compact", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{ToolResponseMode: tt.mode}
+			errs := cfg.ValidateDetailed()
+
+			var found *ValidationError
+			for i := range errs {
+				if errs[i].Field == "tool_response_mode" {
+					found = &errs[i]
+					break
+				}
+			}
+			if tt.wantErr {
+				require.NotNil(t, found, "ValidateDetailed must reject %q with Field:\"tool_response_mode\"", tt.mode)
+				assert.Contains(t, found.Message, "full")
+				assert.Contains(t, found.Message, "compact")
+			} else {
+				assert.Nil(t, found, "ValidateDetailed must accept %q", tt.mode)
+			}
+		})
+	}
+}
+
+// The default (unset) survives Validate() untouched — Phase 1 ships full
+// behavior with no field written (FR-016).
+func TestToolResponseModeDefaultUnset(t *testing.T) {
+	cfg := &Config{}
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, "", cfg.ToolResponseMode, "unset stays unset; resolution to full happens at read time")
+}
+
+// Spec 085 T017: MCPPROXY_TOOL_RESPONSE_MODE explicit env alias overrides the
+// file value on the standard load path, and an invalid env value fails
+// validation with a clear message.
+func TestToolResponseModeEnvOverride(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "mcp_config.json")
+	raw, err := json.Marshal(map[string]any{
+		"listen":             "127.0.0.1:0",
+		"data_dir":           tmp,
+		"tool_response_mode": ToolResponseModeFull,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(cfgPath, raw, 0o600))
+
+	t.Run("env wins over file", func(t *testing.T) {
+		t.Setenv("MCPPROXY_TOOL_RESPONSE_MODE", ToolResponseModeCompact)
+		cfg, err := LoadFromFile(cfgPath)
+		require.NoError(t, err)
+		assert.Equal(t, ToolResponseModeCompact, cfg.ToolResponseMode)
+	})
+
+	t.Run("no env keeps file value", func(t *testing.T) {
+		cfg, err := LoadFromFile(cfgPath)
+		require.NoError(t, err)
+		assert.Equal(t, ToolResponseModeFull, cfg.ToolResponseMode)
+	})
+
+	t.Run("invalid env value fails validation", func(t *testing.T) {
+		t.Setenv("MCPPROXY_TOOL_RESPONSE_MODE", "bogus")
+		_, err := LoadFromFile(cfgPath)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tool_response_mode")
+	})
+}

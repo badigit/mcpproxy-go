@@ -196,6 +196,93 @@ func TestCalculateHealth_OAuthNone(t *testing.T) {
 	assert.Equal(t, ActionLogin, result.Action)
 }
 
+// TestCalculateHealth_OAuthLoginRequired verifies that a server awaiting a
+// first-time OAuth sign-in (ErrOAuthPending deferred for tray/CLI) is reported
+// as degraded/amber with a login action — NOT unhealthy/red (MCP-1820).
+func TestCalculateHealth_OAuthLoginRequired(t *testing.T) {
+	loginErrors := []string{
+		"OAuth authentication required for slack - use 'mcpproxy auth login --server=slack' or tray menu",
+		"OAuth authentication required for github: login available via Web UI, system tray menu, or 'mcpproxy auth login' CLI command",
+	}
+	for _, state := range []string{"error", "disconnected"} {
+		for _, lastErr := range loginErrors {
+			input := HealthCalculatorInput{
+				Name:          "test-server",
+				Enabled:       true,
+				State:         state,
+				OAuthRequired: true,
+				LastError:     lastErr,
+			}
+			result := CalculateHealth(input, nil)
+			assert.Equal(t, LevelDegraded, result.Level, "state=%s err=%q", state, lastErr)
+			assert.Equal(t, "Sign-in required", result.Summary, "state=%s err=%q", state, lastErr)
+			assert.Equal(t, ActionLogin, result.Action, "state=%s err=%q", state, lastErr)
+		}
+	}
+}
+
+// TestCalculateHealth_OAuthReauthRequired verifies that a server whose stored
+// token broke (re-auth needed) stays unhealthy/red with a login action — it was
+// working before, so this is a regression the user should treat as red (MCP-1820).
+func TestCalculateHealth_OAuthReauthRequired(t *testing.T) {
+	reauthErr := "OAuth authentication required for slack: server error with stored token - re-login available via Web UI, system tray menu, or 'mcpproxy auth login' CLI command"
+	for _, state := range []string{"error", "disconnected"} {
+		input := HealthCalculatorInput{
+			Name:          "test-server",
+			Enabled:       true,
+			State:         state,
+			OAuthRequired: true,
+			LastError:     reauthErr,
+		}
+		result := CalculateHealth(input, nil)
+		assert.Equal(t, LevelUnhealthy, result.Level, "state=%s", state)
+		assert.Equal(t, ActionLogin, result.Action, "state=%s", state)
+	}
+}
+
+// TestCalculateHealth_CallTimeOAuthRequired verifies the MCP-2084 path: a server
+// that connects anonymously and lists tools fine, but whose tool calls fail with
+// "authorization required", must surface a proactive Sign-in CTA instead of
+// looking fully healthy. The signal is CallTimeOAuthRequired (set by the managed
+// client on a call-time 401), NOT the config-derived OAuthRequired flag.
+func TestCalculateHealth_CallTimeOAuthRequired(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:                  "com.googleapis.sqladmin/mcp",
+		Enabled:               true,
+		State:                 "ready",
+		Connected:             true,
+		ToolCount:             15,
+		OAuthRequired:         false, // no config OAuth — connected anonymously
+		CallTimeOAuthRequired: true,  // but a tool call returned "authorization required"
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelDegraded, result.Level)
+	assert.Equal(t, StateEnabled, result.AdminState)
+	assert.Equal(t, "Sign-in required", result.Summary)
+	assert.Equal(t, ActionLogin, result.Action)
+}
+
+// TestCalculateHealth_CallTimeOAuthRequired_NotOverridingErrors verifies the
+// call-time flag does not mask a genuine connection error: error/disconnected
+// states short-circuit earlier, so the flag only applies to connected servers.
+func TestCalculateHealth_CallTimeOAuthRequired_NotOverridingErrors(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:                  "test-server",
+		Enabled:               true,
+		State:                 "error",
+		LastError:             "dial tcp: connection refused",
+		CallTimeOAuthRequired: true,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	// Connection error wins — not downgraded to a sign-in prompt.
+	assert.Equal(t, LevelUnhealthy, result.Level)
+	assert.Equal(t, ActionRestart, result.Action)
+}
+
 func TestCalculateHealth_UserLoggedOut(t *testing.T) {
 	input := HealthCalculatorInput{
 		Name:          "test-server",

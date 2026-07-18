@@ -35,6 +35,12 @@ type SecurityController interface {
 	GetSecurityOverview(ctx context.Context) (*scanner.SecurityOverview, error)
 	GetScanSummary(ctx context.Context, serverName string) *scanner.ScanSummary
 
+	// DeepScanEnabled reports whether the opt-in deep-scan layer
+	// (security.deep_scan.enabled, Spec 077 US3) is currently on. Used to warn
+	// when a Docker-based scanner is enabled while the layer that would run it
+	// is off (audit FIX 3b).
+	DeepScanEnabled() bool
+
 	// Batch scan operations
 	ScanAll(ctx context.Context, servers []scanner.ServerStatus, scannerIDs []string) (*scanner.QueueProgress, error)
 	GetQueueProgress() *scanner.QueueProgress
@@ -102,7 +108,18 @@ func (s *Server) handleInstallScanner(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeSuccess(w, map[string]string{"status": "enabled", "id": id})
+	resp := map[string]string{"status": "enabled", "id": id}
+	// Audit FIX 3b: enabling a Docker-based (deep) scanner while the opt-in
+	// deep-scan layer is off would otherwise be a silent no-op at scan time —
+	// the scanner is enabled but never runs. Surface an explicit hint so both
+	// the API caller and the CLI can tell the user what is still required.
+	if !s.securityController.DeepScanEnabled() {
+		if sc, err := s.securityController.GetScannerStatus(r.Context(), id); err == nil && sc != nil && !sc.InProcess {
+			resp["hint"] = "scanner enabled, but it will not run until security.deep_scan.enabled=true — " +
+				"Docker-based scanners belong to the opt-in deep-scan layer (see docs/features/tool-scanner.md)"
+		}
+	}
+	s.writeSuccess(w, resp)
 }
 
 func (s *Server) handleRemoveScanner(w http.ResponseWriter, r *http.Request) {
@@ -663,7 +680,12 @@ func (s *Server) handleGetScanReportByJobID(w http.ResponseWriter, r *http.Reque
 	if !s.requireSecurity(w, r) {
 		return
 	}
-	jobID := chi.URLParam(r, "jobId")
+	// chi routes on RawPath, so the param arrives percent-encoded. Scan job IDs
+	// embed the server name (scan-<serverName>-<ts>), and official-registry names
+	// contain '/', so the slash reaches us as %2F and must be decoded before the
+	// exact-match job lookup — otherwise the report page 404s for slash-named
+	// servers even after the SPA route resolves (MCP-2123).
+	jobID := decodePathParam(chi.URLParam(r, "jobId"))
 	if jobID == "" {
 		s.writeError(w, r, http.StatusBadRequest, "job ID is required")
 		return

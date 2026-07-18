@@ -23,6 +23,7 @@ type mockRuntimeStats struct {
 	quarantine            bool
 	dockerAvailable       bool
 	dockerIsolatedServers int
+	dockerCLISource       string
 }
 
 func (m *mockRuntimeStats) GetServerCount() int          { return m.serverCount }
@@ -34,6 +35,7 @@ func (m *mockRuntimeStats) IsDockerAvailable() bool      { return m.dockerAvaila
 func (m *mockRuntimeStats) GetDockerIsolatedServerCount() int {
 	return m.dockerIsolatedServers
 }
+func (m *mockRuntimeStats) GetDockerCLISource() string { return m.dockerCLISource }
 
 func TestHeartbeatSend(t *testing.T) {
 	// Clear env vars that would disable telemetry (GitHub Actions sets CI=true).
@@ -300,19 +302,20 @@ func TestEnsureAnonymousID(t *testing.T) {
 	}
 }
 
-// TestSchemaVersionV3 verifies that HeartbeatPayload carries schema_version=3
-// once the v3 fields ship. This is a tripwire against accidental downgrades.
-func TestSchemaVersionV3(t *testing.T) {
-	if SchemaVersion != 3 {
-		t.Fatalf("SchemaVersion = %d, want 3", SchemaVersion)
+// TestSchemaVersionV7 verifies that HeartbeatPayload carries schema_version=7
+// once the Spec 080 funnel/churn fields ship. This is a tripwire against
+// accidental downgrades.
+func TestSchemaVersionV7(t *testing.T) {
+	if SchemaVersion != 7 {
+		t.Fatalf("SchemaVersion = %d, want 7", SchemaVersion)
 	}
 
 	cfg := &config.Config{}
 	svc := New(cfg, "", "v1.0.0", "personal", zap.NewNop())
 	svc.SetRuntimeStats(&mockRuntimeStats{})
 	payload := svc.BuildPayload()
-	if payload.SchemaVersion != 3 {
-		t.Errorf("payload.SchemaVersion = %d, want 3", payload.SchemaVersion)
+	if payload.SchemaVersion != 7 {
+		t.Errorf("payload.SchemaVersion = %d, want 7", payload.SchemaVersion)
 	}
 }
 
@@ -341,6 +344,26 @@ func TestV3PayloadDockerAvailable(t *testing.T) {
 	}
 	if !p2.FeatureFlags.DockerAvailable {
 		t.Error("DockerAvailable should be true when runtime reports true")
+	}
+}
+
+// TestV5PayloadDockerCLISource verifies the telemetry service forwards the
+// runtime GetDockerCLISource() resolution branch into
+// feature_flags.docker_cli_source (the #696 fleet signal).
+func TestV5PayloadDockerCLISource(t *testing.T) {
+	cfg := &config.Config{DockerIsolation: &config.DockerIsolationConfig{Enabled: true}}
+
+	svc := New(cfg, "", "v1.0.0", "personal", zap.NewNop())
+	svc.SetRuntimeStats(&mockRuntimeStats{dockerAvailable: true, dockerCLISource: "bundled"})
+	p := svc.BuildPayload()
+	if p.FeatureFlags == nil {
+		t.Fatal("FeatureFlags nil")
+	}
+	if p.FeatureFlags.DockerCLISource != "bundled" {
+		t.Errorf("DockerCLISource = %q, want %q", p.FeatureFlags.DockerCLISource, "bundled")
+	}
+	if !p.FeatureFlags.DockerIsolationEnabled {
+		t.Error("DockerIsolationEnabled should be true when cfg enables global isolation")
 	}
 }
 
@@ -423,5 +446,37 @@ func TestMultipleHeartbeats(t *testing.T) {
 	count := received.Load()
 	if count < 2 {
 		t.Errorf("Expected at least 2 heartbeats, got %d", count)
+	}
+}
+
+// TestAnonymousIDStable_V2ToV3 (Spec 044 FR-017 / T023) asserts that moving
+// from a v2 payload (no env_kind / env_markers) to a v3 payload preserves the
+// exact anonymous_id byte string for the same fixture. If anonymous_id ever
+// changes due to a payload-builder refactor, the telemetry retention cohort
+// shifts silently and the dashboard can't join pre-044 rows to post-044 rows.
+func TestAnonymousIDStable_V2ToV3(t *testing.T) {
+	fixedID := "550e8400-e29b-41d4-a716-446655440000"
+	cfg := &config.Config{
+		Telemetry: &config.TelemetryConfig{
+			AnonymousID:          fixedID,
+			AnonymousIDCreatedAt: "2026-04-10T12:00:00Z",
+		},
+	}
+	svc := New(cfg, "", "v1.2.3", "personal", zap.NewNop())
+	svc.SetRuntimeStats(&mockRuntimeStats{})
+
+	// Build twice; each build goes through maybeRotateAnonymousID. The ID
+	// must be byte-identical across builds and match the fixture input.
+	p1 := svc.BuildPayload()
+	p2 := svc.BuildPayload()
+	if p1.AnonymousID != fixedID {
+		t.Errorf("v3 payload anonymous_id=%q, want %q (FR-017 byte-identical)", p1.AnonymousID, fixedID)
+	}
+	if p1.AnonymousID != p2.AnonymousID {
+		t.Errorf("anonymous_id drifted between builds: %q vs %q", p1.AnonymousID, p2.AnonymousID)
+	}
+	// SchemaVersion is 7 after the Spec 080 funnel/churn additions.
+	if p1.SchemaVersion != 7 {
+		t.Errorf("schema_version = %d, want 7 (Spec 080 additions)", p1.SchemaVersion)
 	}
 }

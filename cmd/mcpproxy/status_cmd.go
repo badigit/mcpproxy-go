@@ -11,34 +11,49 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 
 	clioutput "github.com/smart-mcp-proxy/mcpproxy-go/internal/cli/output"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 )
 
 // StatusInfo holds the collected status data for display.
 type StatusInfo struct {
-	State         string            `json:"state"`
-	Edition       string            `json:"edition"`
-	ListenAddr    string            `json:"listen_addr"`
-	Uptime        string            `json:"uptime,omitempty"`
-	UptimeSeconds float64           `json:"uptime_seconds,omitempty"`
-	APIKey        string            `json:"api_key"`
-	WebUIURL      string            `json:"web_ui_url"`
-	RoutingMode   string            `json:"routing_mode"`
-	Endpoints     map[string]string `json:"endpoints"`
-	Servers       *ServerCounts     `json:"servers,omitempty"`
-	SocketPath    string            `json:"socket_path,omitempty"`
-	ConfigPath    string            `json:"config_path,omitempty"`
-	Version       string            `json:"version,omitempty"`
-	TeamsInfo     *TeamsStatusInfo  `json:"teams,omitempty"`
+	State             string                   `json:"state"`
+	Edition           string                   `json:"edition"`
+	ListenAddr        string                   `json:"listen_addr"`
+	Uptime            string                   `json:"uptime,omitempty"`
+	UptimeSeconds     float64                  `json:"uptime_seconds,omitempty"`
+	APIKey            string                   `json:"api_key"`
+	WebUIURL          string                   `json:"web_ui_url"`
+	RoutingMode       string                   `json:"routing_mode"`
+	Endpoints         map[string]string        `json:"endpoints"`
+	Servers           *ServerCounts            `json:"servers,omitempty"`
+	SocketPath        string                   `json:"socket_path,omitempty"`
+	ConfigPath        string                   `json:"config_path,omitempty"`
+	Version           string                   `json:"version,omitempty"`
+	Update            *StatusUpdateInfo        `json:"update,omitempty"`
+	ServerEditionInfo *ServerEditionStatusInfo `json:"server_edition,omitempty"`
 }
 
-// TeamsStatusInfo holds teams-specific status information.
-type TeamsStatusInfo struct {
+// StatusUpdateInfo mirrors the `update` object of GET /api/v1/info
+// (internal/updatecheck.InfoResponseUpdate) for status output. The daemon's
+// background checker is the single source of truth; status only renders it.
+type StatusUpdateInfo struct {
+	Available      bool   `json:"available"`
+	LatestVersion  string `json:"latest_version,omitempty"`
+	ReleaseURL     string `json:"release_url,omitempty"`
+	CheckedAt      string `json:"checked_at,omitempty"` // RFC 3339, as serialized by the daemon
+	IsPrerelease   bool   `json:"is_prerelease,omitempty"`
+	CheckError     string `json:"check_error,omitempty"`
+	InstallChannel string `json:"install_channel,omitempty"` // Spec 079 FR-008
+	UpdateCommand  string `json:"update_command,omitempty"`  // Spec 079 FR-009
+}
+
+// ServerEditionStatusInfo holds server-edition-specific status information.
+type ServerEditionStatusInfo struct {
 	OAuthProvider string   `json:"oauth_provider"`
 	AdminEmails   []string `json:"admin_emails"`
 }
@@ -144,18 +159,15 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 func collectStatus(cfg *config.Config, configPath string) (*StatusInfo, error) {
 	socketPath := socket.DetectSocketPath(cfg.DataDir)
 
-	if socket.IsSocketAvailable(socketPath) {
-		return collectStatusFromDaemon(cfg, socketPath, configPath)
+	// Daemon detection: socket first, then TCP fallback (cfg.Listen + API key).
+	if client, ok := newDaemonClient(cfg, nil); ok {
+		return collectStatusFromDaemon(cfg, client, socketPath, configPath)
 	}
 
 	return collectStatusFromConfig(cfg, socketPath, configPath), nil
 }
 
-func collectStatusFromDaemon(cfg *config.Config, socketPath, configPath string) (*StatusInfo, error) {
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
-
-	client := cliclient.NewClient(socketPath, logger.Sugar())
+func collectStatusFromDaemon(cfg *config.Config, client *cliclient.Client, socketPath, configPath string) (*StatusInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -173,8 +185,8 @@ func collectStatusFromDaemon(cfg *config.Config, socketPath, configPath string) 
 		info.RoutingMode = config.RoutingModeRetrieveTools
 	}
 
-	// Add teams info if available
-	info.TeamsInfo = collectTeamsInfo(cfg)
+	// Add server edition info if available
+	info.ServerEditionInfo = collectServerEditionInfo(cfg)
 
 	// Get status data (running, listen_addr, upstream_stats)
 	statusData, err := client.GetStatus(ctx)
@@ -212,6 +224,7 @@ func collectStatusFromDaemon(cfg *config.Config, socketPath, configPath string) 
 		if url, ok := infoData["web_ui_url"].(string); ok {
 			info.WebUIURL = url
 		}
+		info.Update = extractStatusUpdate(infoData)
 	}
 
 	// Construct Web UI URL if not provided by daemon
@@ -247,7 +260,7 @@ func collectStatusFromConfig(cfg *config.Config, socketPath, configPath string) 
 		ConfigPath:  configPath,
 	}
 
-	info.TeamsInfo = collectTeamsInfo(cfg)
+	info.ServerEditionInfo = collectServerEditionInfo(cfg)
 
 	return info
 }
@@ -255,19 +268,111 @@ func collectStatusFromConfig(cfg *config.Config, socketPath, configPath string) 
 func extractServerCounts(stats map[string]interface{}) *ServerCounts {
 	counts := &ServerCounts{}
 
-	if v, ok := stats["connected"].(float64); ok {
-		counts.Connected = int(v)
-	}
-	if v, ok := stats["quarantined"].(float64); ok {
-		counts.Quarantined = int(v)
-	}
-	if v, ok := stats["total"].(float64); ok {
-		counts.Total = int(v)
+	// The daemon emits connected_servers/quarantined_servers/total_servers
+	// (see the GetStats builders in internal/server and internal/upstream);
+	// bare connected/quarantined/total are accepted for older daemons.
+	counts.Connected = statsInt(stats, "connected_servers", "connected")
+	counts.Quarantined = statsInt(stats, "quarantined_servers", "quarantined")
+	if v, ok := statsIntOK(stats, "total_servers", "total"); ok {
+		counts.Total = v
 	} else {
 		counts.Total = counts.Connected + counts.Quarantined
 	}
 
 	return counts
+}
+
+// statsInt returns the first of the given keys present in stats as an int.
+func statsInt(stats map[string]interface{}, keys ...string) int {
+	v, _ := statsIntOK(stats, keys...)
+	return v
+}
+
+func statsIntOK(stats map[string]interface{}, keys ...string) (int, bool) {
+	for _, key := range keys {
+		switch v := stats[key].(type) {
+		case float64:
+			return int(v), true
+		case int:
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// extractStatusUpdate pulls the `update` object out of the /api/v1/info
+// payload. Returns nil when the daemon did not report update state.
+func extractStatusUpdate(infoData map[string]interface{}) *StatusUpdateInfo {
+	updateData, ok := infoData["update"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	u := &StatusUpdateInfo{}
+	if v, ok := updateData["available"].(bool); ok {
+		u.Available = v
+	}
+	if v, ok := updateData["latest_version"].(string); ok {
+		u.LatestVersion = v
+	}
+	if v, ok := updateData["release_url"].(string); ok {
+		u.ReleaseURL = v
+	}
+	if v, ok := updateData["checked_at"].(string); ok {
+		u.CheckedAt = v
+	}
+	if v, ok := updateData["is_prerelease"].(bool); ok {
+		u.IsPrerelease = v
+	}
+	if v, ok := updateData["check_error"].(string); ok {
+		u.CheckError = v
+	}
+	if v, ok := updateData["install_channel"].(string); ok {
+		u.InstallChannel = v
+	}
+	if v, ok := updateData["update_command"].(string); ok {
+		u.UpdateCommand = v
+	}
+	return u
+}
+
+// statusVersionSuffix renders the update annotation appended to the Version
+// line, mirroring doctor's presentation. A failed or not-yet-completed check
+// renders nothing (quiet on failure; the error stays in JSON for diagnostics).
+//
+// TODO(spec-079/FR-002): extend the annotation with the human-readable
+// "N releases / M weeks behind" delta once internal/updatecheck computes it
+// (requires the release list + publish dates, not just the latest release;
+// additive per FR-021). This function is the single rendering point.
+func statusVersionSuffix(u *StatusUpdateInfo) string {
+	if u == nil || u.CheckError != "" {
+		return ""
+	}
+	if u.Available && u.LatestVersion != "" {
+		// Spec 079 US2 (FR-009): append the channel's exact one-line update
+		// command, or the channel-appropriate guidance when no command is
+		// safe. Older daemons omit install_channel — render the legacy form.
+		action := ""
+		switch {
+		case u.UpdateCommand != "":
+			action = " — Run: " + u.UpdateCommand
+		case u.InstallChannel != "":
+			// The release URL already appears in the suffix; pass "" so the
+			// guidance says "the releases page" instead of repeating it.
+			if g := updatecheck.GuidanceLine(u.InstallChannel, ""); g != "" {
+				action = " — " + g
+			}
+		}
+		if u.ReleaseURL != "" {
+			return fmt.Sprintf(" (update available: %s — %s%s)", u.LatestVersion, u.ReleaseURL, action)
+		}
+		return fmt.Sprintf(" (update available: %s%s)", u.LatestVersion, action)
+	}
+	if u.LatestVersion != "" {
+		// A successful check confirmed we are current.
+		return " (latest)"
+	}
+	return ""
 }
 
 // statusMaskAPIKey returns a masked version of the API key showing first and last 4 chars.
@@ -374,7 +479,7 @@ func printStatusTable(info *StatusInfo) {
 	fmt.Printf("  %-12s %s\n", "Edition:", info.Edition)
 
 	if info.Version != "" {
-		fmt.Printf("  %-12s %s\n", "Version:", info.Version)
+		fmt.Printf("  %-12s %s%s\n", "Version:", info.Version, statusVersionSuffix(info.Update))
 	}
 
 	fmt.Printf("  %-12s %s\n", "Listen:", info.ListenAddr)
@@ -416,11 +521,11 @@ func printStatusTable(info *StatusInfo) {
 		}
 	}
 
-	if info.TeamsInfo != nil {
+	if info.ServerEditionInfo != nil {
 		fmt.Println()
 		fmt.Println("Server Edition")
-		fmt.Printf("  %-12s %s\n", "OAuth:", info.TeamsInfo.OAuthProvider)
-		fmt.Printf("  %-12s %s\n", "Admins:", strings.Join(info.TeamsInfo.AdminEmails, ", "))
+		fmt.Printf("  %-12s %s\n", "OAuth:", info.ServerEditionInfo.OAuthProvider)
+		fmt.Printf("  %-12s %s\n", "Admins:", strings.Join(info.ServerEditionInfo.AdminEmails, ", "))
 	}
 }
 

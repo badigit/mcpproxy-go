@@ -4,6 +4,7 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -118,12 +119,34 @@ type Service interface {
 	// Returns BulkOperationResult with success/failure counts.
 	// This operation respects disable_management and read_only configuration gates.
 	LogoutAllOAuth(ctx context.Context) (*BulkOperationResult, error)
+
+	// SetScanSummaryEnricher wires the SecurityScanEnricher used by
+	// ListServers to populate Server.SecurityScan. The scanner is constructed
+	// later in the boot sequence than the management service, so this is a
+	// setter rather than a constructor parameter. Optional — callers without
+	// a scanner can skip the call and ListServers will return SecurityScan=nil.
+	SetScanSummaryEnricher(e SecurityScanEnricher)
 }
 
 // EventEmitter defines the interface for emitting runtime events.
 // This is used by the service to notify subscribers of state changes.
 type EventEmitter interface {
 	EmitServersChanged(reason string, extra map[string]any)
+}
+
+// SecurityScanEnricher provides the current security scan summary for a
+// server, shaped for inclusion in contracts.Server.SecurityScan. nil means
+// "no summary yet for this server" (never scanned, no cached result).
+//
+// ListServers calls this once per server when wired so REST and the SSE
+// servers.changed embed (which goes through runtime.buildServersChangedPayload
+// → lister.ListServers) share one enrichment site. Without that parity, the
+// Web UI's mergeServers (which treats incoming server data as authoritative
+// and deletes absent keys) silently strips security_scan from the store on
+// every SSE delivery — same bug class as the pre-existing quarantine-stats
+// staleness fixed by PR #463.
+type SecurityScanEnricher interface {
+	GetSecurityScanSummary(ctx context.Context, serverName string) *contracts.SecurityScanSummary
 }
 
 // RuntimeOperations defines the interface for runtime operations needed by the service.
@@ -150,6 +173,30 @@ type service struct {
 	eventEmitter   EventEmitter
 	secretResolver *secret.Resolver
 	logger         *zap.SugaredLogger
+
+	// scanEnricher is the optional adapter that populates each server's
+	// SecurityScan field on ListServers. Wired by internal/server after
+	// the scanner.Service is constructed (the scanner is created later
+	// in the boot sequence than the management service). Read-mostly,
+	// guarded by scanEnricherMu so wiring is concurrency-safe.
+	scanEnricher   SecurityScanEnricher
+	scanEnricherMu sync.RWMutex
+}
+
+// SetScanSummaryEnricher installs the SecurityScanEnricher used by
+// ListServers to populate Server.SecurityScan. Called once during wire-up
+// in internal/server.NewServerWithConfigPath right after the scanner is
+// constructed. nil disables enrichment.
+func (s *service) SetScanSummaryEnricher(e SecurityScanEnricher) {
+	s.scanEnricherMu.Lock()
+	s.scanEnricher = e
+	s.scanEnricherMu.Unlock()
+}
+
+func (s *service) getScanEnricher() SecurityScanEnricher {
+	s.scanEnricherMu.RLock()
+	defer s.scanEnricherMu.RUnlock()
+	return s.scanEnricher
 }
 
 // NewService creates a new management service with the given dependencies.
@@ -186,6 +233,26 @@ func (s *service) checkWriteGates() error {
 
 // ListServers returns all configured servers with aggregate statistics.
 // This is a read operation and never blocked by configuration gates.
+// stringifyDiagnosticField coerces a diagnostic code/severity field to a
+// plain string regardless of whether it was encoded as a Go named-string
+// type (diagnostics.Code, diagnostics.Severity) or a plain string after a
+// JSON round-trip. Spec 044.
+func stringifyDiagnosticField(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case fmt.Stringer:
+		return x.String()
+	default:
+		// Named string types (e.g. `type Code string`) won't match `string`
+		// above, but their underlying value is still a string. Use the
+		// generic `%v` formatter to extract it safely.
+		return fmt.Sprintf("%v", x)
+	}
+}
+
 func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contracts.ServerStats, error) {
 	// Get servers from runtime
 	serversRaw, err := s.runtime.GetAllServers()
@@ -242,10 +309,95 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		}
 		if args, ok := srvRaw["args"].([]string); ok {
 			srv.Args = args
+		} else if argsI, ok := srvRaw["args"].([]interface{}); ok {
+			srv.Args = make([]string, 0, len(argsI))
+			for _, a := range argsI {
+				if s, ok := a.(string); ok {
+					srv.Args = append(srv.Args, s)
+				}
+			}
 		}
 		if workingDir, ok := srvRaw["working_dir"].(string); ok {
 			srv.WorkingDir = workingDir
 		}
+
+		// Extract headers and env. Accept both typed (map[string]string,
+		// the shape used by the in-process StateView path) and generic
+		// (map[string]interface{}, the shape after a JSON round-trip)
+		// so this works regardless of how the runtime layer delivered
+		// the server map. Header redaction is applied later in the HTTP
+		// layer (see httpapi/server.go:redactServerHeaders).
+		if headersTyped, ok := srvRaw["headers"].(map[string]string); ok && len(headersTyped) > 0 {
+			srv.Headers = headersTyped
+		} else if headersGeneric, ok := srvRaw["headers"].(map[string]interface{}); ok && len(headersGeneric) > 0 {
+			srv.Headers = make(map[string]string, len(headersGeneric))
+			for k, v := range headersGeneric {
+				if vStr, ok := v.(string); ok {
+					srv.Headers[k] = vStr
+				}
+			}
+		}
+		if envTyped, ok := srvRaw["env"].(map[string]string); ok && len(envTyped) > 0 {
+			srv.Env = envTyped
+		} else if envGeneric, ok := srvRaw["env"].(map[string]interface{}); ok && len(envGeneric) > 0 {
+			srv.Env = make(map[string]string, len(envGeneric))
+			for k, v := range envGeneric {
+				if vStr, ok := v.(string); ok {
+					srv.Env[k] = vStr
+				}
+			}
+		}
+
+		// Extract isolation overrides if present. Like OAuth above, both
+		// typed and generic map shapes are accepted so this path works
+		// whether the runtime provides a map[string]interface{} directly
+		// or goes through a json round-trip first.
+		if isoRaw, ok := srvRaw["isolation"].(map[string]interface{}); ok && isoRaw != nil {
+			iso := &contracts.IsolationConfig{}
+			if enabled, ok := isoRaw["enabled"].(bool); ok {
+				iso.Enabled = enabled
+			}
+			if img, ok := isoRaw["image"].(string); ok {
+				iso.Image = img
+			}
+			if nm, ok := isoRaw["network_mode"].(string); ok {
+				iso.NetworkMode = nm
+			}
+			if extra, ok := isoRaw["extra_args"].([]string); ok {
+				iso.ExtraArgs = extra
+			} else if extraI, ok := isoRaw["extra_args"].([]interface{}); ok {
+				iso.ExtraArgs = make([]string, 0, len(extraI))
+				for _, a := range extraI {
+					if s, ok := a.(string); ok {
+						iso.ExtraArgs = append(iso.ExtraArgs, s)
+					}
+				}
+			}
+			if wd, ok := isoRaw["working_dir"].(string); ok {
+				iso.WorkingDir = wd
+			}
+			srv.Isolation = iso
+		}
+
+		// Populate resolved isolation defaults so UI clients (macOS tray,
+		// web UI) can render meaningful placeholders for the override
+		// fields. Only meaningful for stdio servers — HTTP servers don't
+		// run in containers. We compute this regardless of whether the
+		// server is currently isolated; the UI uses it as a hint.
+		if srv.Protocol == "stdio" && srv.Command != "" && s.config != nil && s.config.DockerIsolation != nil {
+			im := core.NewIsolationManager(s.config.DockerIsolation)
+			tmpCfg := &config.ServerConfig{Name: srv.Name, Command: srv.Command}
+			if defaults := im.ResolveDefaults(tmpCfg); defaults != nil {
+				srv.IsolationDefaults = &contracts.IsolationDefaults{
+					RuntimeType: defaults.RuntimeType,
+					Image:       defaults.Image,
+					NetworkMode: defaults.NetworkMode,
+					ExtraArgs:   defaults.ExtraArgs,
+					WorkingDir:  defaults.ContainerWorkingDir,
+				}
+			}
+		}
+
 		if authenticated, ok := srvRaw["authenticated"].(bool); ok {
 			srv.Authenticated = authenticated
 		}
@@ -326,9 +478,79 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 			srv.ReconnectOnUse = reconnectOnUse
 		}
 
+		// MCP-2940: project the per-server auto-approve intent. Tri-state
+		// *bool — only set the pointer when the key is present so an unset
+		// flag stays nil and the Web UI toggle can tell unset from false.
+		if autoApprove, ok := srvRaw["auto_approve_tool_changes"].(bool); ok {
+			v := autoApprove
+			srv.AutoApproveToolChanges = &v
+		}
+
+		// MCP-3322: project the per-server init_timeout override. The runtime
+		// emits it as a duration string; accept a typed *config.Duration too in
+		// case the map was delivered without a JSON round-trip.
+		if its, ok := srvRaw["init_timeout"].(string); ok && its != "" {
+			if d, err := time.ParseDuration(its); err == nil {
+				v := config.Duration(d)
+				srv.InitTimeout = &v
+			}
+		} else if itd, ok := srvRaw["init_timeout"].(*config.Duration); ok && itd != nil {
+			v := *itd
+			srv.InitTimeout = &v
+		}
+
 		// Extract unified health status
 		if health, ok := srvRaw["health"].(*contracts.HealthStatus); ok {
 			srv.Health = health
+		}
+
+		// Spec 044 — extract structured diagnostic + stable error code.
+		// The runtime layer already encodes these as a map[string]interface{}
+		// alongside the raw code string.
+		if errCode, ok := srvRaw["error_code"].(string); ok && errCode != "" {
+			srv.ErrorCode = errCode
+		}
+		if diagRaw, ok := srvRaw["diagnostic"].(map[string]interface{}); ok && diagRaw != nil {
+			d := &contracts.Diagnostic{}
+			// Code arrives as diagnostics.Code (a named string type) when the
+			// map is produced directly by runtime.GetAllServers, and as a
+			// plain string after a JSON round-trip. Handle both.
+			d.Code = stringifyDiagnosticField(diagRaw["code"])
+			d.Severity = stringifyDiagnosticField(diagRaw["severity"])
+			if cause, ok := diagRaw["cause"].(string); ok {
+				d.Cause = cause
+			}
+			if detected, ok := diagRaw["detected_at"].(time.Time); ok && !detected.IsZero() {
+				t := detected
+				d.DetectedAt = &t
+			}
+			if um, ok := diagRaw["user_message"].(string); ok {
+				d.UserMessage = um
+			}
+			if docs, ok := diagRaw["docs_url"].(string); ok {
+				d.DocsURL = docs
+			}
+			// fix_steps arrives as the concrete []diagnostics.FixStep slice
+			// from runtime.GetAllServers, or as []interface{} after a JSON
+			// round-trip. Use a JSON round-trip that works for both shapes —
+			// it's cheap and sidesteps the type-assertion explosion.
+			if steps, ok := diagRaw["fix_steps"]; ok && steps != nil {
+				if raw, err := json.Marshal(steps); err == nil {
+					_ = json.Unmarshal(raw, &d.FixSteps)
+				}
+			}
+			srv.Diagnostic = d
+		}
+
+		// MCP-901 — project registry provenance so the approval/quarantine
+		// view can show a server's origin. The SSE servers.changed embed
+		// shares this projection (buildServersChangedPayload → ListServers),
+		// so it stays in parity automatically.
+		if regID, ok := srvRaw["source_registry_id"].(string); ok && regID != "" {
+			srv.SourceRegistryID = regID
+		}
+		if prov, ok := srvRaw["source_registry_provenance"].(string); ok && prov != "" {
+			srv.SourceRegistryProvenance = prov
 		}
 
 		servers = append(servers, srv)
@@ -340,6 +562,23 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		}
 		if srv.Quarantined {
 			stats.QuarantinedServers++
+		}
+	}
+
+	// Enrich with security scan summary so REST and the SSE servers.changed
+	// embed share a single enrichment site. mergeServers on the Web UI
+	// deletes absent fields from incoming payloads, so any field added later
+	// on only one path silently goes stale on the other. Lives here so the
+	// runtime's emitServersChanged → buildServersChangedPayload chain (which
+	// calls ListServers) carries SecurityScan automatically.
+	if enricher := s.getScanEnricher(); enricher != nil {
+		for _, srv := range servers {
+			if srv == nil {
+				continue
+			}
+			if summary := enricher.GetSecurityScanSummary(ctx, srv.Name); summary != nil {
+				srv.SecurityScan = summary
+			}
 		}
 	}
 

@@ -17,7 +17,6 @@ import (
 	clioutput "github.com/smart-mcp-proxy/mcpproxy-go/internal/cli/output"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
 )
 
 var (
@@ -95,19 +94,15 @@ func newSecurityCLIClient() (*cliclient.Client, *config.Config, error) {
 	if dataDir != "" {
 		cfg.DataDir = dataDir
 	}
-	cfg.EnsureAPIKey()
-
-	socketPath := socket.DetectSocketPath(cfg.DataDir)
 
 	logger, _ := zap.NewProduction()
 	defer func() { _ = logger.Sync() }()
 
-	var client *cliclient.Client
-	if socket.IsSocketAvailable(socketPath) {
-		client = cliclient.NewClient(socketPath, logger.Sugar())
-	} else {
-		endpoint := fmt.Sprintf("http://%s", cfg.Listen)
-		client = cliclient.NewClientWithAPIKey(endpoint, cfg.APIKey, logger.Sugar())
+	// Socket first, then TCP fallback. Never generate an API key here —
+	// a fabricated key cannot match the running daemon's.
+	client, ok := newDaemonClient(cfg, logger.Sugar())
+	if !ok {
+		return nil, nil, fmt.Errorf("mcpproxy daemon is not reachable. Start with: mcpproxy serve")
 	}
 
 	return client, cfg, nil
@@ -133,6 +128,10 @@ func newSecurityEnableCmd() *cobra.Command {
 		Use:   "enable <scanner-id>",
 		Short: "Enable a security scanner",
 		Long: `Enable a security scanner by pulling its Docker image.
+
+Docker-based scanners belong to the opt-in deep-scan layer (Spec 077): they
+only run during scans when security.deep_scan.enabled=true in mcp_config.json.
+Enabling one here while deep scan is off prints a reminder.
 
 Examples:
   mcpproxy security enable mcp-scan
@@ -455,7 +454,29 @@ func runSecurityInstall(_ *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Scanner %q enabled successfully.\n", scannerID)
+	// Audit FIX 3b: if the core reports that the scanner belongs to the opt-in
+	// deep-scan layer and that layer is off, tell the user — otherwise the
+	// scanner is enabled but silently never runs.
+	if hint := scannerEnableHint(respBody); hint != "" {
+		fmt.Printf("Note: %s\n", hint)
+	}
 	return nil
+}
+
+// scannerEnableHint extracts the optional "hint" field from a successful
+// POST /security/scanners/{id}/enable response ({"success":true,"data":
+// {"status":"enabled","id":...,"hint":...}}). Returns "" when the response
+// carries no hint (older cores, deep scan already enabled, in-process scanner).
+func scannerEnableHint(respBody []byte) string {
+	var wrapper struct {
+		Data struct {
+			Hint string `json:"hint"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &wrapper); err != nil {
+		return ""
+	}
+	return wrapper.Data.Hint
 }
 
 func runSecurityRemove(_ *cobra.Command, args []string) error {
@@ -1254,6 +1275,104 @@ func getMapFloat(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
+// scannerDurationMs returns a scanner_statuses entry's wall-clock duration in
+// milliseconds. It prefers the explicit duration_ms field and falls back to
+// computing it from started_at/completed_at so reports produced before
+// duration_ms was recorded still render a timing value.
+func scannerDurationMs(ss map[string]interface{}) float64 {
+	if ms := getMapFloat(ss, "duration_ms"); ms > 0 {
+		return ms
+	}
+	start := getMapString(ss, "started_at")
+	end := getMapString(ss, "completed_at")
+	if start == "" || end == "" {
+		return 0
+	}
+	st, err1 := time.Parse(time.RFC3339Nano, start)
+	et, err2 := time.Parse(time.RFC3339Nano, end)
+	if err1 != nil || err2 != nil || et.Before(st) {
+		return 0
+	}
+	return float64(et.Sub(st).Milliseconds())
+}
+
+// formatScannerDurationMs renders a per-scanner duration for human-readable
+// output: sub-second values in milliseconds, larger values as a compact "X.Ys",
+// and missing/zero timing as a dash.
+func formatScannerDurationMs(ms float64) string {
+	if ms <= 0 {
+		return "-"
+	}
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", int(ms))
+	}
+	return fmt.Sprintf("%.1fs", ms/1000)
+}
+
+// printScannerStatusTable renders the per-scanner execution table including a
+// DURATION column. Nothing is printed when there are no scanner statuses.
+func printScannerStatusTable(scannerStatuses []interface{}) {
+	if len(scannerStatuses) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("  %-20s %-12s %-10s %-8s %s\n", "SCANNER", "STATUS", "DURATION", "FINDINGS", "ERROR")
+	fmt.Printf("  %s\n", strings.Repeat("-", 75))
+	for _, s := range scannerStatuses {
+		ss, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		scannerID := getMapString(ss, "scanner_id")
+		ssStatus := getMapString(ss, "status")
+		findings := "0"
+		if fc, ok := ss["findings_count"].(float64); ok {
+			findings = fmt.Sprintf("%d", int(fc))
+		}
+		ssErr := getMapString(ss, "error")
+		if len(ssErr) > 25 {
+			ssErr = ssErr[:22] + "..."
+		}
+		dur := formatScannerDurationMs(scannerDurationMs(ss))
+		fmt.Printf("  %-20s %-12s %-10s %-8s %s\n", scannerID, ssStatus, dur, findings, ssErr)
+	}
+}
+
+// printScannerTimings renders a compact per-scanner wall-clock timing block
+// from a scan report's scanner_statuses. Nothing is printed when timing data
+// is absent.
+func printScannerTimings(report map[string]interface{}) {
+	statuses, ok := report["scanner_statuses"].([]interface{})
+	if !ok || len(statuses) == 0 {
+		return
+	}
+	type timingRow struct{ id, status, dur string }
+	rows := make([]timingRow, 0, len(statuses))
+	for _, s := range statuses {
+		ss, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id := getMapString(ss, "scanner_id")
+		if id == "" {
+			continue
+		}
+		rows = append(rows, timingRow{
+			id:     id,
+			status: getMapString(ss, "status"),
+			dur:    formatScannerDurationMs(scannerDurationMs(ss)),
+		})
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Scanner timing:")
+	for _, r := range rows {
+		fmt.Printf("  %-20s %-12s %s\n", r.id, r.status, r.dur)
+	}
+}
+
 func runSecurityStatus(_ *cobra.Command, args []string) error {
 	client, _, err := newSecurityCLIClient()
 	if err != nil {
@@ -1310,26 +1429,9 @@ func runSecurityStatus(_ *cobra.Command, args []string) error {
 		fmt.Printf("  Error:    %s\n", errMsg)
 	}
 
-	// Per-scanner statuses
-	if scannerStatuses, ok := status["scanner_statuses"].([]interface{}); ok && len(scannerStatuses) > 0 {
-		fmt.Println()
-		fmt.Printf("  %-20s %-12s %-8s %s\n", "SCANNER", "STATUS", "FINDINGS", "ERROR")
-		fmt.Printf("  %s\n", strings.Repeat("-", 65))
-		for _, s := range scannerStatuses {
-			if ss, ok := s.(map[string]interface{}); ok {
-				scannerID := getMapString(ss, "scanner_id")
-				ssStatus := getMapString(ss, "status")
-				findings := "0"
-				if fc, ok := ss["findings_count"].(float64); ok {
-					findings = fmt.Sprintf("%d", int(fc))
-				}
-				ssErr := getMapString(ss, "error")
-				if len(ssErr) > 25 {
-					ssErr = ssErr[:22] + "..."
-				}
-				fmt.Printf("  %-20s %-12s %-8s %s\n", scannerID, ssStatus, findings, ssErr)
-			}
-		}
+	// Per-scanner statuses (includes a DURATION column)
+	if scannerStatuses, ok := status["scanner_statuses"].([]interface{}); ok {
+		printScannerStatusTable(scannerStatuses)
 	}
 
 	return nil
@@ -1393,16 +1495,27 @@ func runSecurityReport(_ *cobra.Command, args []string) error {
 	}
 
 	// F-10: also fetch /scan/status (best-effort) so we can name the scanners
-	// that failed. The aggregated report has counts but only sometimes carries
-	// per-scanner names; the live job status is the authoritative source.
-	failedNames := fetchFailedScannerNames(client, ctx, serverName)
-	return printReportTable(serverName, report, failedNames)
+	// that failed AND surface the per-scanner error message. The aggregated
+	// report has counts but only sometimes carries per-scanner names; the
+	// live job status is the authoritative source.
+	failed := fetchFailedScannerInfo(client, ctx, serverName)
+	return printReportTable(serverName, report, failed)
 }
 
-// fetchFailedScannerNames returns the IDs of scanners that did not complete
-// in the most recent scan job for `serverName`. Returns nil on any error so
-// the caller can render the report without per-scanner names.
-func fetchFailedScannerNames(client *cliclient.Client, ctx context.Context, serverName string) []string {
+// failedScannerInfo carries a failed scanner's ID and the error that the
+// scanner runtime recorded for it. The error is rendered in the human-readable
+// report so the user can tell e.g. that `ramparts` failed because of a glibc
+// version mismatch — previously the CLI showed only the scanner name and the
+// user had to dig into log files to find the cause.
+type failedScannerInfo struct {
+	ID    string
+	Error string
+}
+
+// fetchFailedScannerInfo returns information about scanners that did not
+// complete in the most recent scan job for `serverName`. Returns nil on any
+// error so the caller can render the report without per-scanner names.
+func fetchFailedScannerInfo(client *cliclient.Client, ctx context.Context, serverName string) []failedScannerInfo {
 	resp, err := client.DoRaw(ctx, http.MethodGet, "/api/v1/servers/"+serverName+"/scan/status", nil)
 	if err != nil {
 		return nil
@@ -1427,16 +1540,21 @@ func fetchFailedScannerNames(client *cliclient.Client, ctx context.Context, serv
 	if !ok {
 		return nil
 	}
-	var failed []string
+	var failed []failedScannerInfo
 	for _, s := range scannerStatuses {
 		ss, ok := s.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		if getMapString(ss, "status") == "failed" {
-			if name := getMapString(ss, "scanner_id"); name != "" {
-				failed = append(failed, name)
+			id := getMapString(ss, "scanner_id")
+			if id == "" {
+				continue
 			}
+			failed = append(failed, failedScannerInfo{
+				ID:    id,
+				Error: getMapString(ss, "error"),
+			})
 		}
 	}
 	return failed
@@ -1705,17 +1823,19 @@ func printScanSummary(client *cliclient.Client, ctx context.Context, serverName 
 	}
 
 	fmt.Printf("Scan completed for %q.\n\n", serverName)
-	failedNames := fetchFailedScannerNames(client, ctx, serverName)
-	return printReportTable(serverName, report, failedNames)
+	failed := fetchFailedScannerInfo(client, ctx, serverName)
+	return printReportTable(serverName, report, failed)
 }
 
 // printReportTable prints a human-readable report with two-pass scan support.
 //
-// failedScannerNames (F-10) is the list of scanner IDs that failed in the most
-// recent scan job, sourced from /scan/status (the report itself only carries
-// counts). When non-empty, the table shows a "Scanners: X run, Y failed" line
-// and a yellow warn line about incomplete coverage.
-func printReportTable(serverName string, report map[string]interface{}, failedScannerNames []string) error {
+// failedScanners (F-10) is the list of scanner IDs+errors that failed in the
+// most recent scan job, sourced from /scan/status (the report itself only
+// carries counts). When non-empty, the table shows a "Scanners: X run, Y
+// failed" line, a yellow warn line about incomplete coverage, and per-scanner
+// error reasons so the user can see WHY a scanner failed without grepping
+// log files.
+func printReportTable(serverName string, report map[string]interface{}, failedScanners []failedScannerInfo) error {
 	riskScore := "?"
 	if rs, ok := report["risk_score"].(float64); ok {
 		riskScore = fmt.Sprintf("%d", int(rs))
@@ -1724,27 +1844,55 @@ func printReportTable(serverName string, report map[string]interface{}, failedSc
 	scannedAt := getMapString(report, "scanned_at")
 	jobID := getMapString(report, "job_id")
 
+	// F-10 / MCP-2401: scanner coverage. Read counts up front so the risk-score
+	// line can flag low confidence when part of the fleet never ran.
+	scannersRun := int(getMapFloat(report, "scanners_run"))
+	scannersFailed := int(getMapFloat(report, "scanners_failed"))
+	scannersTotal := int(getMapFloat(report, "scanners_total"))
+
 	fmt.Printf("Security Report: %s\n", serverName)
 	if jobID != "" {
 		fmt.Printf("Scan ID:     %s\n", jobID)
 	}
-	fmt.Printf("Risk Score:  %s/100\n", riskScore)
+	riskLine := fmt.Sprintf("Risk Score:  %s/100", riskScore)
+	if scannersFailed > 0 && scannersTotal > 0 {
+		// MCP-2401: the score was computed from an incomplete scan. Flag the
+		// degraded confidence on the number itself, not only in the warning
+		// block below, so a glance at "0/100" isn't read as an all-clear.
+		riskLine += fmt.Sprintf(" (degraded — %d of %d scanners did not run)", scannersFailed, scannersTotal)
+	}
+	fmt.Println(riskLine)
 	if scannedAt != "" {
 		fmt.Printf("Scanned:     %s\n", formatTimestamp(scannedAt))
 	}
 
-	// F-10: scanner coverage line. Pull counts from the aggregated report.
-	scannersRun := int(getMapFloat(report, "scanners_run"))
-	scannersFailed := int(getMapFloat(report, "scanners_failed"))
-	scannersTotal := int(getMapFloat(report, "scanners_total"))
 	if scannersTotal > 0 {
 		line := fmt.Sprintf("Scanners:    %d run, %d failed", scannersRun, scannersFailed)
-		if scannersFailed > 0 && len(failedScannerNames) > 0 {
-			line += " (" + strings.Join(failedScannerNames, ", ") + ")"
+		if scannersFailed > 0 && len(failedScanners) > 0 {
+			names := make([]string, 0, len(failedScanners))
+			for _, f := range failedScanners {
+				names = append(names, f.ID)
+			}
+			line += " (" + strings.Join(names, ", ") + ")"
 		}
 		line += fmt.Sprintf(" of %d", scannersTotal)
 		fmt.Println(line)
 	}
+
+	// Per-scanner wall-clock timing, so users can see which scanner dominated
+	// the scan time. Sourced from scanner_statuses; silently skipped when the
+	// report carries no per-scanner status data.
+	printScannerTimings(report)
+
+	// Scan context: show the user what was actually scanned. Without this the
+	// terse "0 findings" / "1 finding" output gives no signal as to whether
+	// the scan looked at real source code (docker_extract), a working_dir
+	// fallback, or just the synthetic tool definitions (tool_definitions_only).
+	// That distinction is critical when triaging a finding — a "Malicious
+	// Code" hit located at tools.json:85 means something very different from
+	// the same hit located at server.py:42.
+	printScanContextSection(report)
+
 	fmt.Println()
 
 	// F-10: warn the user when coverage is incomplete so they don't approve
@@ -1756,6 +1904,21 @@ func printReportTable(serverName string, report map[string]interface{}, failedSc
 			warn = "\x1b[33m" + warn + "\x1b[0m"
 		}
 		fmt.Println(warn)
+		// Show the actual error message for each failed scanner so users can
+		// diagnose without digging through ~/Library/Logs/mcpproxy/main.log.
+		for _, f := range failedScanners {
+			if f.Error == "" {
+				continue
+			}
+			msg := f.Error
+			if len(msg) > 240 {
+				msg = msg[:240] + "..."
+			}
+			// Single-line: replace newlines so a multi-line stderr capture
+			// doesn't break the indented layout.
+			msg = strings.ReplaceAll(msg, "\n", " ")
+			fmt.Printf("  - %s: %s\n", f.ID, msg)
+		}
 		fmt.Println()
 	}
 
@@ -1813,6 +1976,52 @@ func printReportTable(serverName string, report map[string]interface{}, failedSc
 	return nil
 }
 
+// printScanContextSection renders a one-block summary of *what* the scanners
+// looked at (source method, files, container, tool definitions exported).
+// This is the most important context for triaging a finding: a HIGH-severity
+// finding located at tools.json from a tool_definitions_only scan is a very
+// different signal from the same finding located at server.py from a
+// docker_extract scan.
+func printScanContextSection(report map[string]interface{}) {
+	ctx, ok := report["scan_context"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	method := getMapString(ctx, "source_method")
+	if method == "" && getMapString(ctx, "server_protocol") == "" {
+		return // nothing useful to render
+	}
+
+	fmt.Println()
+	fmt.Println("Scan Context")
+	if method != "" {
+		fmt.Printf("  Source:           %s\n", method)
+	}
+	if path := getMapString(ctx, "source_path"); path != "" {
+		fmt.Printf("  Path:             %s\n", path)
+	}
+	if proto := getMapString(ctx, "server_protocol"); proto != "" {
+		fmt.Printf("  Protocol:         %s\n", proto)
+	}
+	if di, ok := ctx["docker_isolation"].(bool); ok {
+		fmt.Printf("  Docker isolation: %t\n", di)
+	}
+	if cid := getMapString(ctx, "container_id"); cid != "" {
+		// Truncate full SHA256 container IDs to 12 chars (docker's standard).
+		short := cid
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		fmt.Printf("  Container:        %s\n", short)
+	}
+	if tf, ok := ctx["total_files"].(float64); ok && int(tf) > 0 {
+		fmt.Printf("  Files scanned:    %d\n", int(tf))
+	}
+	if te, ok := ctx["tools_exported"].(float64); ok && int(te) > 0 {
+		fmt.Printf("  Tools analyzed:   %d\n", int(te))
+	}
+}
+
 // printFindingsList prints a list of findings in the CLI report format.
 func printFindingsList(findings []interface{}) {
 	for _, f := range findings {
@@ -1823,12 +2032,16 @@ func printFindingsList(findings []interface{}) {
 		severity := strings.ToUpper(getMapString(finding, "severity"))
 		ruleID := getMapString(finding, "rule_id")
 		title := getMapString(finding, "title")
+		description := getMapString(finding, "description")
 		location := getMapString(finding, "location")
 		scannerName := getMapString(finding, "scanner")
 		helpURI := getMapString(finding, "help_uri")
 		pkg := getMapString(finding, "package_name")
 		installed := getMapString(finding, "installed_version")
 		fixed := getMapString(finding, "fixed_version")
+		threatLevel := getMapString(finding, "threat_level")
+		threatType := getMapString(finding, "threat_type")
+		category := getMapString(finding, "category")
 
 		// Main line: [SEVERITY] CVE-ID: title (scanner)
 		label := title
@@ -1836,14 +2049,72 @@ func printFindingsList(findings []interface{}) {
 			label = ruleID
 		}
 		line := fmt.Sprintf("  [%s] %s", severity, label)
+		if cvss, ok := finding["cvss_score"].(float64); ok && cvss > 0 {
+			line += fmt.Sprintf(" CVSS=%.1f", cvss)
+		}
 		if scannerName != "" {
 			line += " (" + scannerName + ")"
 		}
 		fmt.Println(line)
 
+		// Title (when ruleID is the headline label)
+		if title != "" && label == ruleID {
+			fmt.Println("         Title:    " + title)
+		}
+
+		// Description: this is the long-form rule explanation. Previously the
+		// CLI rendered ONLY the rule ID, leaving users to look up what e.g.
+		// "MCP-MC-001" meant. Showing the description here mirrors the Web UI.
+		if description != "" && description != title {
+			desc := description
+			if len(desc) > 240 {
+				desc = desc[:240] + "..."
+			}
+			desc = strings.ReplaceAll(desc, "\n", " ")
+			fmt.Println("         What:     " + desc)
+		}
+
+		// Threat classification context (already used in the Web UI but absent
+		// from CLI output until now). Helps users distinguish a tool-poisoning
+		// finding from an obfuscated-code finding from a CVE.
+		if threatType != "" || threatLevel != "" || category != "" {
+			parts := []string{}
+			if threatLevel != "" {
+				parts = append(parts, threatLevel)
+			}
+			if threatType != "" {
+				parts = append(parts, threatType)
+			}
+			if category != "" && category != threatType {
+				parts = append(parts, "category="+category)
+			}
+			if len(parts) > 0 {
+				fmt.Println("         Threat:   " + strings.Join(parts, " · "))
+			}
+		}
+
+		// Deterministic-scanner transparency (Spec 076 US4): the combined
+		// confidence and the independent checks that contributed to this
+		// finding, so an operator can see WHY a tool was flagged and that
+		// agreement among checks raised its score.
+		if conf, ok := finding["confidence"].(float64); ok && conf > 0 {
+			fmt.Printf("         Confidence: %.2f\n", conf)
+		}
+		if rawSignals, ok := finding["signals"].([]interface{}); ok && len(rawSignals) > 0 {
+			names := make([]string, 0, len(rawSignals))
+			for _, s := range rawSignals {
+				if name, ok := s.(string); ok && name != "" {
+					names = append(names, name)
+				}
+			}
+			if len(names) > 0 {
+				fmt.Println("         Signals:  " + strings.Join(names, ", "))
+			}
+		}
+
 		// Package info
 		if pkg != "" {
-			pkgLine := "         Package: " + pkg
+			pkgLine := "         Package:  " + pkg
 			if installed != "" {
 				pkgLine += " v" + installed
 			}
@@ -1860,7 +2131,7 @@ func printFindingsList(findings []interface{}) {
 
 		// Link to advisory
 		if helpURI != "" {
-			fmt.Println("         Details: " + helpURI)
+			fmt.Println("         Details:  " + helpURI)
 		}
 
 		// Evidence (triggering content)

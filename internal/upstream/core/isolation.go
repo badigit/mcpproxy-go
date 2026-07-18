@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"math/big"
 	"path/filepath"
-	"regexp"
 	"strings"
+	"sync"
+
+	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/dockernaming"
 )
 
 // Command and package manager constants
@@ -44,13 +47,37 @@ const (
 // IsolationManager handles Docker isolation logic for MCP servers
 type IsolationManager struct {
 	globalConfig *config.DockerIsolationConfig
+	logger       *zap.Logger
+
+	// warnedServers dedups the "per-server isolation enabled but global is
+	// off" warning so we don't spam the log on every ShouldIsolate() call
+	// (which runs on each tool dispatch). Keyed by server name.
+	warnedServers sync.Map
 }
 
-// NewIsolationManager creates a new isolation manager
+// NewIsolationManager creates a new isolation manager.
 func NewIsolationManager(globalConfig *config.DockerIsolationConfig) *IsolationManager {
 	return &IsolationManager{
 		globalConfig: globalConfig,
 	}
+}
+
+// NewIsolationManagerWithLogger creates a new isolation manager with a
+// structured logger. The logger is optional — when nil, warnings about
+// ignored per-server isolation opt-ins are silently dropped (callers that
+// care about those warnings should pass a logger).
+func NewIsolationManagerWithLogger(globalConfig *config.DockerIsolationConfig, logger *zap.Logger) *IsolationManager {
+	return &IsolationManager{
+		globalConfig: globalConfig,
+		logger:       logger,
+	}
+}
+
+// SetLogger sets the logger on an existing IsolationManager. Intended for
+// call sites that build the manager before a logger is available (e.g. in
+// config-time code) but want per-server warnings at runtime.
+func (im *IsolationManager) SetLogger(logger *zap.Logger) {
+	im.logger = logger
 }
 
 // HasLocalFilePath checks if server arguments contain local file paths
@@ -126,32 +153,101 @@ func (im *IsolationManager) GetDockerIsolationWarning(serverConfig *config.Serve
 	return ""
 }
 
-// ShouldIsolate determines if a server should be isolated based on global and server config
+// ShouldIsolate determines if a server should be isolated via Docker, based on
+// global and server config. It is the legacy boolean view of ResolveMode and
+// stays in lockstep with it: it returns true iff the resolved mode is "docker".
+// Callers that need to distinguish sandbox/none should call ResolveMode.
 func (im *IsolationManager) ShouldIsolate(serverConfig *config.ServerConfig) bool {
-	// Check if global isolation is disabled
-	if im.globalConfig == nil || !im.globalConfig.Enabled {
-		return false
+	return im.ResolveMode(serverConfig) == config.IsolationModeDocker
+}
+
+// ResolveMode resolves the effective isolation mode for a server (MCP-34.2),
+// combining the global config (with legacy Enabled⇒docker back-compat), an
+// optional per-server override, and structural gates.
+//
+// Precedence:
+//  1. A per-server explicit Mode wins outright (even over a disabled global) —
+//     mirroring how other per-server overrides (image, network) take priority.
+//  2. Otherwise, when the global mode resolves to none, per-server bool opt-ins
+//     are ignored (and warned about once), preserving the pre-mode behavior.
+//  3. When the global mode is active, a per-server bool opt-out (enabled:false)
+//     downgrades the server to none.
+//
+// Structural gates then apply to ALL non-none modes: HTTP servers (no command)
+// and servers that already invoke docker are never isolated.
+func (im *IsolationManager) ResolveMode(serverConfig *config.ServerConfig) config.IsolationMode {
+	mode := im.resolveConfiguredMode(serverConfig)
+	if mode == config.IsolationModeNone {
+		return config.IsolationModeNone
 	}
 
-	// Check if server has isolation config and it's explicitly disabled
-	// With *bool: nil means "inherit global", explicit false means "disabled"
-	if serverConfig.Isolation != nil && serverConfig.Isolation.Enabled != nil && !*serverConfig.Isolation.Enabled {
-		return false
+	// Only isolate stdio servers (HTTP servers don't need a sandbox/container).
+	if serverConfig == nil || serverConfig.Command == "" {
+		return config.IsolationModeNone
 	}
 
-	// Only isolate stdio servers (HTTP servers don't need Docker isolation)
-	if serverConfig.Command == "" {
-		return false
-	}
-
-	// Skip isolation for servers that are already using Docker
-	// These are typically pre-configured Docker containers that don't need additional isolation
+	// Skip isolation for servers that already invoke Docker — these are
+	// typically pre-configured containers, and wrapping them (in a container
+	// or a Landlock sandbox) would break their access to the Docker socket.
 	cmdName := filepath.Base(serverConfig.Command)
 	if cmdName == "docker" || strings.Contains(serverConfig.Command, "docker") {
-		return false
+		return config.IsolationModeNone
 	}
 
-	return true
+	return mode
+}
+
+// resolveConfiguredMode applies the global + per-server config precedence to
+// produce the desired mode, before the structural gates in ResolveMode.
+func (im *IsolationManager) resolveConfiguredMode(serverConfig *config.ServerConfig) config.IsolationMode {
+	globalMode := im.globalConfig.ResolvedMode() // nil-safe; returns none for nil
+
+	// (1) A per-server explicit Mode override wins outright.
+	if serverConfig != nil && serverConfig.Isolation != nil && serverConfig.Isolation.Mode != nil {
+		return *serverConfig.Isolation.Mode
+	}
+
+	// (2) Global isolation off: per-server bool opt-ins are ignored (warn once).
+	if globalMode == config.IsolationModeNone {
+		if im.hasExplicitPerServerOptIn(serverConfig) {
+			im.warnPerServerIgnoredOnce(serverConfig.Name)
+		}
+		return config.IsolationModeNone
+	}
+
+	// (3) Global isolation active: honor a per-server bool opt-out.
+	if serverConfig != nil && serverConfig.Isolation != nil &&
+		serverConfig.Isolation.Enabled != nil && !*serverConfig.Isolation.Enabled {
+		return config.IsolationModeNone
+	}
+
+	return globalMode
+}
+
+// hasExplicitPerServerOptIn returns true when the server config explicitly
+// sets isolation.enabled = true. Nil / missing means "inherit global" —
+// that's NOT an opt-in for our warning purposes.
+func (im *IsolationManager) hasExplicitPerServerOptIn(serverConfig *config.ServerConfig) bool {
+	if serverConfig == nil || serverConfig.Isolation == nil {
+		return false
+	}
+	return serverConfig.Isolation.Enabled != nil && *serverConfig.Isolation.Enabled
+}
+
+// warnPerServerIgnoredOnce emits a one-time warning (deduped by server name)
+// when a per-server isolation opt-in is being ignored because the global
+// flag is off.
+func (im *IsolationManager) warnPerServerIgnoredOnce(serverName string) {
+	if im.logger == nil {
+		return
+	}
+	if _, loaded := im.warnedServers.LoadOrStore(serverName, struct{}{}); loaded {
+		return
+	}
+	im.logger.Warn("per-server docker isolation opt-in ignored: global docker_isolation.enabled is false",
+		zap.String("server", serverName),
+		zap.String("hint", "set docker_isolation.enabled=true in your config (or toggle it in the Web UI Security page) to honor per-server isolation settings"),
+	)
 }
 
 // DetectRuntimeType detects the runtime type based on the command
@@ -223,6 +319,75 @@ func (im *IsolationManager) GetDockerImage(serverConfig *config.ServerConfig, ru
 
 	// Fallback to alpine for unknown runtime types
 	return im.buildFullImageName("alpine:3.18"), nil
+}
+
+// ResolvedIsolationDefaults captures the per-runtime default values that
+// would be used for a server when no per-server overrides are set. It is
+// used by the REST API to expose contextual placeholders to UI clients
+// (notably the macOS tray) so users can see exactly what an "empty"
+// override field will resolve to before deciding whether to override it.
+type ResolvedIsolationDefaults struct {
+	// RuntimeType is the runtime detected from the server command (e.g.
+	// "uvx", "npx", "python"). Useful for diagnostic display.
+	RuntimeType string
+
+	// Image is the fully-qualified Docker image that would be used,
+	// already including registry prefixes via buildFullImageName.
+	Image string
+
+	// NetworkMode is the network mode that would be used (typically
+	// inherited from the global DockerIsolationConfig).
+	NetworkMode string
+
+	// ExtraArgs is the global extra args list that the server would
+	// inherit. Per-server extra_args are appended on top, so this
+	// communicates the baseline.
+	ExtraArgs []string
+
+	// ContainerWorkingDir is the working directory that would be used
+	// inside the container. Empty when the global config does not
+	// specify one (Docker default applies).
+	ContainerWorkingDir string
+}
+
+// ResolveDefaults returns the resolved default isolation values for the
+// given server, computed from the detected runtime type and global
+// DockerIsolationConfig — without applying any per-server overrides.
+//
+// This intentionally does NOT short-circuit when isolation is disabled
+// for the server: the result describes what would be used if isolation
+// were active, which is what UI placeholders need to surface.
+//
+// Returns nil if the global config is missing (degenerate state).
+func (im *IsolationManager) ResolveDefaults(serverConfig *config.ServerConfig) *ResolvedIsolationDefaults {
+	if im == nil || im.globalConfig == nil || serverConfig == nil {
+		return nil
+	}
+
+	runtimeType := im.DetectRuntimeType(serverConfig.Command)
+
+	// Compute the default image without consulting per-server overrides.
+	// We deliberately avoid calling GetDockerImage(serverConfig, ...)
+	// because that prefers the override; here we want the *baseline*.
+	var image string
+	if img, exists := im.globalConfig.DefaultImages[runtimeType]; exists {
+		image = im.buildFullImageName(img)
+	} else {
+		image = im.buildFullImageName("alpine:3.18")
+	}
+
+	defaults := &ResolvedIsolationDefaults{
+		RuntimeType:         runtimeType,
+		Image:               image,
+		NetworkMode:         im.globalConfig.NetworkMode,
+		ContainerWorkingDir: "", // No global default for working dir
+	}
+
+	if len(im.globalConfig.ExtraArgs) > 0 {
+		defaults.ExtraArgs = append([]string(nil), im.globalConfig.ExtraArgs...)
+	}
+
+	return defaults
 }
 
 // buildFullImageName constructs the full image name with registry if needed
@@ -403,43 +568,12 @@ func generateContainerName(serverName string) string {
 	return fmt.Sprintf("mcpproxy-%s-%s", sanitized, suffix)
 }
 
-// sanitizeServerNameForContainer converts server name to valid Docker container name
+// sanitizeServerNameForContainer converts server name to valid Docker container
+// name. It delegates to the shared dockernaming package so the scanner, which
+// looks containers up by this exact name prefix, can never drift from the rule
+// used to NAME the container here (MCP-2123).
 func sanitizeServerNameForContainer(name string) string {
-	// Replace invalid characters with hyphens
-	// Docker container names can contain: [a-zA-Z0-9][a-zA-Z0-9_.-]*
-	reg := regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
-	sanitized := reg.ReplaceAllString(name, "-")
-
-	// Remove multiple consecutive hyphens
-	for strings.Contains(sanitized, "--") {
-		sanitized = strings.ReplaceAll(sanitized, "--", "-")
-	}
-
-	// Ensure it starts with alphanumeric character
-	if sanitized != "" && !regexp.MustCompile(`^[a-zA-Z0-9]`).MatchString(sanitized) {
-		sanitized = "server-" + sanitized
-		// Remove consecutive hyphens that might have been created by the prefix addition
-		for strings.Contains(sanitized, "--") {
-			sanitized = strings.ReplaceAll(sanitized, "--", "-")
-		}
-	}
-
-	// Remove trailing hyphens/dots
-	sanitized = strings.TrimRight(sanitized, "-.")
-
-	// Ensure minimum length
-	if sanitized == "" {
-		sanitized = "server"
-	}
-
-	// Truncate if too long (Docker limit is 253 chars, leave room for prefix and suffix)
-	maxLen := 200 // mcpproxy- (9) + sanitized (200) + - (1) + suffix (4) = 214 chars
-	if len(sanitized) > maxLen {
-		sanitized = sanitized[:maxLen]
-		sanitized = strings.TrimRight(sanitized, "-.")
-	}
-
-	return sanitized
+	return dockernaming.SanitizeServerName(name)
 }
 
 // generateRandomSuffix generates a 4-character random alphanumeric suffix

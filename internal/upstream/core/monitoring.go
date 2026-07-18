@@ -4,26 +4,54 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
 )
 
+const (
+	// maxRecentStderrLines bounds the per-client ring buffer of recent
+	// stderr output. Kept small because this is meant for the last few
+	// lines before a failure — not a log archive.
+	maxRecentStderrLines = 20
+	// maxStderrLineLen truncates individual lines stored in the ring
+	// buffer to protect memory against a misbehaving child that spews
+	// huge single lines (e.g. a base64-encoded traceback).
+	maxStderrLineLen = 512
+)
+
 // StartStderrMonitoring starts monitoring stderr output and logging it
 func (c *Client) StartStderrMonitoring() {
+	c.monitoringMu.Lock()
+	defer c.monitoringMu.Unlock()
+
 	if c.stderr == nil || c.transportType != transportStdio {
 		return
 	}
 
-	// Create context for stderr monitoring
-	c.stderrMonitoringCtx, c.stderrMonitoringCancel = context.WithCancel(context.Background())
+	// Capture the stderr reader as a local under monitoringMu. connectStdio
+	// reassigns c.stderr on every (re)connect (connection_stdio.go:217); passing
+	// the reader as a goroutine arg keeps monitorStderr from reading the shared
+	// field, so a later reconnect's write never races a lingering monitor's read
+	// (the connectStdio↔monitorStderr data race, MCP-816).
+	stderr := c.stderr
 
-	c.stderrMonitoringWG.Add(1)
+	// Create context for stderr monitoring. The monitor goroutine receives the
+	// context, stderr reader, and its done channel as locals so an abandoned
+	// (timed-out) goroutine never reads the shared fields a later Start may
+	// overwrite.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	c.stderrMonitoringCtx, c.stderrMonitoringCancel = ctx, cancel
+	c.stderrMonitoringDone = done
+
 	go func() {
-		defer c.stderrMonitoringWG.Done()
-		c.monitorStderr()
+		defer close(done)
+		c.monitorStderr(ctx, stderr)
 	}()
 
 	c.logger.Debug("Started stderr monitoring",
@@ -32,41 +60,55 @@ func (c *Client) StartStderrMonitoring() {
 
 // StopStderrMonitoring stops stderr monitoring
 func (c *Client) StopStderrMonitoring() {
-	if c.stderrMonitoringCancel != nil {
-		c.stderrMonitoringCancel()
+	c.monitoringMu.Lock()
+	defer c.monitoringMu.Unlock()
 
-		// Use a timeout for the wait to prevent hanging
-		done := make(chan struct{})
-		go func() {
-			c.stderrMonitoringWG.Wait()
-			close(done)
-		}()
+	if c.stderrMonitoringCancel == nil {
+		return
+	}
 
-		select {
-		case <-done:
-			c.logger.Debug("Stopped stderr monitoring",
-				zap.String("server", c.config.Name))
-		case <-time.After(500 * time.Millisecond):
-			c.logger.Warn("Stderr monitoring stop timed out after 500ms, forcing shutdown",
-				zap.String("server", c.config.Name))
-		}
+	c.stderrMonitoringCancel()
+	done := c.stderrMonitoringDone
+	c.stderrMonitoringCancel = nil
+	c.stderrMonitoringDone = nil
+	if done == nil {
+		return
+	}
+
+	// Wait for the monitor goroutine directly under monitoringMu (no detached
+	// waiter that could outlive the lock). On timeout the goroutine is abandoned;
+	// it closes its own done channel and touches only its captured ctx, so it
+	// cannot race a subsequent Start.
+	select {
+	case <-done:
+		c.logger.Debug("Stopped stderr monitoring",
+			zap.String("server", c.config.Name))
+	case <-time.After(500 * time.Millisecond):
+		c.logger.Warn("Stderr monitoring stop timed out after 500ms, forcing shutdown",
+			zap.String("server", c.config.Name))
 	}
 }
 
 // StartProcessMonitoring starts monitoring the underlying process
 func (c *Client) StartProcessMonitoring() {
+	c.monitoringMu.Lock()
+	defer c.monitoringMu.Unlock()
+
 	// Start monitoring even if processCmd is nil for Docker containers
 	if c.processCmd == nil && !c.isDockerCommand {
 		return
 	}
 
-	// Create context for process monitoring
-	c.processMonitorCtx, c.processMonitorCancel = context.WithCancel(context.Background())
+	// Create context for process monitoring (ctx + done passed as locals; see
+	// StartStderrMonitoring for the abandoned-goroutine rationale).
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	c.processMonitorCtx, c.processMonitorCancel = ctx, cancel
+	c.processMonitorDone = done
 
-	c.processMonitorWG.Add(1)
 	go func() {
-		defer c.processMonitorWG.Done()
-		c.monitorProcess()
+		defer close(done)
+		c.monitorProcess(ctx)
 	}()
 
 	if c.processCmd != nil {
@@ -83,29 +125,33 @@ func (c *Client) StartProcessMonitoring() {
 
 // StopProcessMonitoring stops process monitoring
 func (c *Client) StopProcessMonitoring() {
-	if c.processMonitorCancel != nil {
-		c.processMonitorCancel()
+	c.monitoringMu.Lock()
+	defer c.monitoringMu.Unlock()
 
-		// Use a timeout for the wait to prevent hanging
-		done := make(chan struct{})
-		go func() {
-			c.processMonitorWG.Wait()
-			close(done)
-		}()
+	if c.processMonitorCancel == nil {
+		return
+	}
 
-		select {
-		case <-done:
-			c.logger.Debug("Stopped process monitoring",
-				zap.String("server", c.config.Name))
-		case <-time.After(500 * time.Millisecond):
-			c.logger.Warn("Process monitoring stop timed out after 500ms, forcing shutdown",
-				zap.String("server", c.config.Name))
-		}
+	c.processMonitorCancel()
+	done := c.processMonitorDone
+	c.processMonitorCancel = nil
+	c.processMonitorDone = nil
+	if done == nil {
+		return
+	}
+
+	select {
+	case <-done:
+		c.logger.Debug("Stopped process monitoring",
+			zap.String("server", c.config.Name))
+	case <-time.After(500 * time.Millisecond):
+		c.logger.Warn("Process monitoring stop timed out after 500ms, forcing shutdown",
+			zap.String("server", c.config.Name))
 	}
 }
 
 // monitorProcess monitors the underlying process health
-func (c *Client) monitorProcess() {
+func (c *Client) monitorProcess(ctx context.Context) {
 	// Only return early if we have neither processCmd nor Docker command
 	if c.processCmd == nil && !c.isDockerCommand {
 		return
@@ -119,7 +165,7 @@ func (c *Client) monitorProcess() {
 
 	for {
 		select {
-		case <-c.processMonitorCtx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if isDocker {
@@ -129,12 +175,15 @@ func (c *Client) monitorProcess() {
 	}
 }
 
-// monitorStderr monitors stderr output and logs it to both main and server-specific logs
-func (c *Client) monitorStderr() {
-	scanner := bufio.NewScanner(c.stderr)
+// monitorStderr monitors stderr output and logs it to both main and server-specific logs.
+// The stderr reader is passed as an argument (captured under monitoringMu by the
+// caller) rather than read from c.stderr, so a concurrent connectStdio reassigning
+// the shared field cannot race this goroutine's read (MCP-816).
+func (c *Client) monitorStderr(ctx context.Context, stderr io.Reader) {
+	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
 		select {
-		case <-c.stderrMonitoringCtx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			line := strings.TrimSpace(scanner.Text())
@@ -151,6 +200,8 @@ func (c *Client) monitorStderr() {
 			if c.upstreamLogger != nil {
 				c.upstreamLogger.Info("stderr", zap.String("message", line))
 			}
+
+			c.recordRecentStderr(line)
 		}
 	}
 
@@ -242,6 +293,121 @@ waitLoop:
 	c.logger.Debug("Docker logs monitoring ended",
 		zap.String("server", c.config.Name),
 		zap.String("container_id", shortContainerID(containerID)))
+}
+
+// recordRecentStderr appends a stderr line to the bounded ring buffer.
+func (c *Client) recordRecentStderr(line string) {
+	if line == "" {
+		return
+	}
+	if len(line) > maxStderrLineLen {
+		line = line[:maxStderrLineLen] + "…"
+	}
+	c.recentStderrMu.Lock()
+	defer c.recentStderrMu.Unlock()
+	c.recentStderr = append(c.recentStderr, line)
+	if overflow := len(c.recentStderr) - maxRecentStderrLines; overflow > 0 {
+		c.recentStderr = append([]string(nil), c.recentStderr[overflow:]...)
+	}
+}
+
+// RecentStderrSnapshot returns a copy of the recent stderr lines captured
+// from the child process. Returns nil if nothing has been captured yet.
+func (c *Client) RecentStderrSnapshot() []string {
+	c.recentStderrMu.Lock()
+	defer c.recentStderrMu.Unlock()
+	if len(c.recentStderr) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.recentStderr))
+	copy(out, c.recentStderr)
+	return out
+}
+
+// formatRecentStderr returns a human-readable, indented block of recent
+// stderr lines suitable for embedding in an error message. Empty when no
+// stderr has been captured.
+//
+// Two readability transforms are applied (#696): a "command not found"
+// actionable hint is led when the child failed to resolve a binary (notably
+// docker), and runs of identical consecutive lines are collapsed into a single
+// "… (repeated N×)" entry so a process that prints the same error on each of
+// its ~20 connection retries produces one readable line instead of a wall.
+func (c *Client) formatRecentStderr() string {
+	lines := c.RecentStderrSnapshot()
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if hint := commandNotFoundHint(lines); hint != "" {
+		b.WriteString(hint)
+		b.WriteByte('\n')
+	}
+	for _, l := range collapseRepeatedLines(lines) {
+		b.WriteString("  | ")
+		b.WriteString(l)
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// collapseRepeatedLines collapses runs of identical consecutive lines into a
+// single "<line> (repeated N×)" entry. Non-repeated lines pass through verbatim.
+func collapseRepeatedLines(lines []string) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); {
+		j := i + 1
+		for j < len(lines) && lines[j] == lines[i] {
+			j++
+		}
+		if n := j - i; n > 1 {
+			out = append(out, fmt.Sprintf("%s (repeated %d×)", lines[i], n))
+		} else {
+			out = append(out, lines[i])
+		}
+		i = j
+	}
+	return out
+}
+
+var (
+	// cmdNotFoundZshRe matches zsh's form: "zsh:1: command not found: docker".
+	cmdNotFoundZshRe = regexp.MustCompile(`command not found: (\S+)`)
+	// cmdNotFoundBashRe matches bash/sh's form: "bash: docker: command not found".
+	cmdNotFoundBashRe = regexp.MustCompile(`([^\s:]+): command not found`)
+)
+
+// extractMissingCommand returns the name of a binary the shell could not find
+// in a stderr line, or "" if the line is not a "command not found" error.
+func extractMissingCommand(line string) string {
+	if m := cmdNotFoundZshRe.FindStringSubmatch(line); m != nil {
+		return strings.Trim(m[1], `"'`)
+	}
+	if m := cmdNotFoundBashRe.FindStringSubmatch(line); m != nil {
+		return strings.Trim(m[1], `"'`)
+	}
+	return ""
+}
+
+// commandNotFoundHint scans captured stderr for a shell "command not found"
+// error and returns a single actionable message, or "" if none is present. The
+// docker-specific case (#696) points the user at the app-bundle binary that
+// Docker Desktop ships even when the optional CLI-tools step was skipped.
+func commandNotFoundHint(lines []string) string {
+	for _, l := range lines {
+		cmd := extractMissingCommand(l)
+		if cmd == "" {
+			continue
+		}
+		if cmd == "docker" {
+			return "Docker CLI not found on PATH. Install Docker Desktop CLI tools, or it is bundled at /Applications/Docker.app/Contents/Resources/bin/docker — restart the affected servers."
+		}
+		return fmt.Sprintf("Command %q not found on the spawn PATH. Ensure it is installed and on PATH, then restart the affected servers.", cmd)
+	}
+	return ""
 }
 
 func shortContainerID(id string) string {

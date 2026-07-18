@@ -10,7 +10,7 @@
         class="border-b border-base-300 flex items-center"
         :class="collapsed ? 'px-2 py-4 justify-center' : 'px-4 py-4 justify-between'"
       >
-        <router-link to="/" class="flex items-center gap-2 min-w-0" :title="collapsed ? 'MCPProxy' : ''">
+        <router-link to="/" class="flex items-center gap-2 min-w-0" :title="logoTitle">
           <img src="/src/assets/logo.svg" alt="MCPProxy Logo" class="w-8 h-8 shrink-0" />
           <div v-show="!collapsed" class="min-w-0">
             <span class="text-lg font-bold truncate block leading-tight">MCPProxy</span>
@@ -42,6 +42,50 @@
         </svg>
       </button>
 
+      <!-- Version + Check for updates (expanded sidebar only). Single-line layout:
+           version on the left, action on the right. In collapsed mode the
+           version appears in the logo tooltip instead. -->
+      <div
+        v-if="!collapsed && systemStore.version"
+        class="px-3 py-2 border-b border-base-300 flex items-center gap-2"
+        data-testid="sidebar-version-block"
+      >
+        <span
+          class="font-mono text-xs text-base-content/60 shrink-0"
+          data-testid="sidebar-version"
+        >
+          v{{ displayVersion }}
+        </span>
+        <span
+          v-if="systemStore.updateAvailable"
+          class="badge badge-xs badge-primary shrink-0"
+          :title="latestVersionTitle"
+        >
+          update
+        </span>
+        <button
+          type="button"
+          @click="handleCheckForUpdates"
+          :disabled="systemStore.checkingForUpdates"
+          class="btn btn-ghost btn-xs ml-auto gap-1 px-1.5 font-normal text-[11px] text-base-content/70 hover:text-base-content"
+          data-testid="sidebar-check-updates"
+          :title="updateStatusTitle"
+          :aria-label="updateButtonLabel"
+        >
+          <svg
+            v-if="!systemStore.checkingForUpdates"
+            class="w-3.5 h-3.5"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0A8.003 8.003 0 014.582 15H9" />
+          </svg>
+          <span v-else class="loading loading-spinner loading-xs"></span>
+          <span class="truncate">{{ updateCompactLabel }}</span>
+        </button>
+      </div>
+
       <!-- Navigation Menu -->
       <nav
         class="flex-1 overflow-y-auto overflow-x-hidden"
@@ -49,7 +93,7 @@
       >
         <!-- Server Edition: User Menu -->
         <template v-if="authStore.isTeamsEdition">
-          <ul class="menu menu-sm gap-0.5 p-0">
+          <ul class="menu menu-sm w-full gap-0.5 p-0">
             <li v-if="authStore.isAdmin && !collapsed" class="menu-title px-3 !py-1">
               <span class="text-[10px] font-semibold uppercase tracking-[0.12em] text-base-content/40">My Workspace</span>
             </li>
@@ -67,7 +111,7 @@
 
           <template v-if="authStore.isAdmin">
             <div class="divider my-2 px-2"></div>
-            <ul class="menu menu-sm gap-0.5 p-0">
+            <ul class="menu menu-sm w-full gap-0.5 p-0">
               <li v-if="!collapsed" class="menu-title px-3 !py-1">
                 <span class="text-[10px] font-semibold uppercase tracking-[0.12em] text-base-content/40">Administration</span>
               </li>
@@ -87,8 +131,54 @@
 
         <!-- Personal Edition: Grouped Menu -->
         <template v-else>
+          <!-- Spec 046 v2: top-pinned Setup entry (above Dashboard).
+               Shows badge with count of incomplete tabs while > 0; collapses
+               to a quiet checkmark when all three tabs (clients/servers/verify)
+               are satisfied. Click reopens the wizard at the first
+               incomplete tab. -->
+          <ul class="menu menu-sm w-full gap-0.5 p-0 mb-1">
+            <li>
+              <a
+                href="#"
+                class="rounded-lg font-medium relative group"
+                :class="setupIncomplete
+                  ? 'bg-gradient-to-r from-primary/10 to-secondary/10 hover:from-primary/15 hover:to-secondary/15'
+                  : 'text-base-content/60'"
+                :title="collapsed ? setupTitleAttr : ''"
+                data-test="sidebar-setup"
+                @click.prevent="onClickSetup"
+              >
+                <span class="relative inline-flex items-center justify-center">
+                  <IconSparkles
+                    class="w-5 h-5 shrink-0"
+                    :class="setupIncomplete ? 'text-primary' : 'text-base-content/40'"
+                  />
+                  <!-- Pulse halo when incomplete -->
+                  <span
+                    v-if="setupIncomplete"
+                    class="absolute inline-flex h-5 w-5 rounded-full bg-primary opacity-30 animate-ping"
+                    aria-hidden="true"
+                  ></span>
+                </span>
+                <span v-show="!collapsed" class="flex-1">
+                  <span v-if="setupIncomplete">Setup</span>
+                  <span v-else class="inline-flex items-center gap-1">
+                    <span>Setup</span>
+                    <span class="text-success text-xs">✓</span>
+                  </span>
+                </span>
+                <span
+                  v-if="setupIncomplete && setupCount > 0"
+                  class="badge badge-primary badge-sm"
+                  :class="collapsed ? 'absolute -top-1 -right-1 badge-xs' : ''"
+                  data-test="sidebar-setup-badge"
+                >{{ setupCount }}</span>
+              </a>
+            </li>
+          </ul>
+
           <!-- Dashboard (solo top row, no section label) -->
-          <ul class="menu menu-sm gap-0.5 p-0">
+          <ul class="menu menu-sm w-full gap-0.5 p-0">
             <li>
               <router-link
                 to="/"
@@ -111,7 +201,7 @@
           </div>
           <div v-else class="mt-3 mb-1 mx-auto w-6 h-px bg-base-300"></div>
 
-          <ul class="menu menu-sm gap-0.5 p-0">
+          <ul class="menu menu-sm w-full gap-0.5 p-0">
             <li>
               <router-link
                 to="/servers"
@@ -121,6 +211,25 @@
               >
                 <IconServers class="w-5 h-5 shrink-0" />
                 <span v-show="!collapsed">Servers</span>
+                <span
+                  v-if="!collapsed && serverCount > 0"
+                  class="badge badge-sm badge-ghost ml-auto tabular-nums"
+                >{{ serverCount }}</span>
+              </router-link>
+            </li>
+            <li>
+              <router-link
+                to="/tools"
+                :class="{ 'active': isActiveRoute('/tools') }"
+                class="rounded-lg font-medium"
+                :title="collapsed ? 'Tools' : ''"
+              >
+                <IconTools class="w-5 h-5 shrink-0" />
+                <span v-show="!collapsed">Tools</span>
+                <span
+                  v-if="!collapsed && toolCount > 0"
+                  class="badge badge-sm badge-ghost ml-auto tabular-nums"
+                >{{ toolCount }}</span>
               </router-link>
             </li>
             <li>
@@ -132,6 +241,10 @@
               >
                 <IconSecrets class="w-5 h-5 shrink-0" />
                 <span v-show="!collapsed">Secrets</span>
+                <span
+                  v-if="!collapsed && secretCount > 0"
+                  class="badge badge-sm badge-ghost ml-auto tabular-nums"
+                >{{ secretCount }}</span>
               </router-link>
             </li>
             <!-- Sub-item: Agent Tokens nested under Secrets.
@@ -150,6 +263,21 @@
                 <span v-show="!collapsed">Agent Tokens</span>
               </router-link>
             </li>
+          </ul>
+
+          <!-- Section: Observability
+               Workspace is what you CONFIGURE (servers, tools, secrets);
+               these are what you OBSERVE. Keeping them apart stops the two
+               kinds of page reading as one undifferentiated list. -->
+          <div
+            v-if="!collapsed"
+            class="mt-5 mb-1 px-3 text-[10px] font-semibold uppercase tracking-[0.12em] text-base-content/40"
+          >
+            Observability
+          </div>
+          <div v-else class="mt-3 mb-1 mx-auto w-6 h-px bg-base-300"></div>
+
+          <ul class="menu menu-sm w-full gap-0.5 p-0">
             <li>
               <router-link
                 to="/activity"
@@ -159,6 +287,18 @@
               >
                 <IconActivity class="w-5 h-5 shrink-0" />
                 <span v-show="!collapsed">Activity Log</span>
+              </router-link>
+            </li>
+            <li>
+              <router-link
+                to="/sessions"
+                :class="{ 'active': isActiveRoute('/sessions') }"
+                class="rounded-lg font-medium"
+                :title="collapsed ? 'Sessions' : ''"
+                data-test="sidebar-sessions"
+              >
+                <IconSessions class="w-5 h-5 shrink-0" />
+                <span v-show="!collapsed">Sessions</span>
               </router-link>
             </li>
             <li>
@@ -183,7 +323,7 @@
           </div>
           <div v-else class="mt-3 mb-1 mx-auto w-6 h-px bg-base-300"></div>
 
-          <ul class="menu menu-sm gap-0.5 p-0">
+          <ul class="menu menu-sm w-full gap-0.5 p-0">
             <li>
               <router-link
                 to="/repositories"
@@ -232,26 +372,20 @@
         </div>
       </div>
 
-      <!-- Footer: version + theme + feedback -->
+      <!-- Footer: theme + feedback (version is shown under the logo at the top) -->
       <div class="border-t border-base-300 py-2" :class="collapsed ? 'px-1' : 'px-3'">
-        <!-- Version (hidden when collapsed) -->
-        <div
-          v-if="!collapsed && systemStore.version"
-          class="px-2 pt-1 pb-2 text-[11px] text-base-content/50 flex items-center gap-1.5"
-        >
-          <span class="font-mono">{{ systemStore.version }}</span>
-          <span v-if="systemStore.updateAvailable" class="badge badge-xs badge-primary">update</span>
-        </div>
-
         <!-- Action row: Theme + Feedback -->
         <div
           class="flex items-stretch gap-1"
           :class="collapsed ? 'flex-col' : ''"
         >
           <!-- Theme dropdown -->
+          <!-- Sidebar sits at the left edge, so the theme menu must open rightward
+               (start-aligned). dropdown-end would anchor the menu's right edge to the
+               button and push a ~288px menu off the left of the viewport. -->
           <div
             class="dropdown dropdown-top"
-            :class="collapsed ? '' : 'dropdown-end flex-1'"
+            :class="collapsed ? '' : 'flex-1'"
           >
             <div
               tabindex="0"
@@ -265,7 +399,7 @@
               </svg>
               <span v-show="!collapsed">Theme</span>
             </div>
-            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow-2xl bg-base-300 rounded-box w-64 max-h-96 overflow-y-auto mb-2">
+            <ul tabindex="0" class="dropdown-content z-[1] menu flex-nowrap p-2 shadow-2xl bg-base-300 rounded-box w-72 max-h-96 overflow-y-auto mb-2">
               <li class="menu-title">
                 <span>Choose theme</span>
               </li>
@@ -307,17 +441,103 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, type FunctionalComponent } from 'vue'
+import { computed, h, onMounted, ref, type FunctionalComponent } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSystemStore } from '@/stores/system'
 import { useAuthStore } from '@/stores/auth'
+import { useOnboardingStore } from '@/stores/onboarding'
+import api from '@/services/api'
 
 const route = useRoute()
 const router = useRouter()
 const systemStore = useSystemStore()
 const authStore = useAuthStore()
+const onboardingStore = useOnboardingStore()
+
+// Spec 046 v2: badge count drives the sidebar Setup entry's pulse + count.
+// Refetched on mount; the wizard itself drives subsequent updates while open.
+//
+// Pulse is also gated on `!isEngaged` so that headless / LAN-server installs
+// (where HasConnectedClient and FirstMCPClientEver are structurally false —
+// there's no local AI client and no GUI to install one) can quiet the badge
+// by clicking "Close for now". The Setup entry itself remains in the sidebar
+// so the user can re-open the wizard, but it no longer pulses or shows a
+// count after engagement.
+const setupCount = computed(() => onboardingStore.incompleteTabCount)
+const setupIncomplete = computed(
+  () => setupCount.value > 0 && !onboardingStore.isEngaged
+)
+const setupTitleAttr = computed(() =>
+  setupIncomplete.value
+    ? `Setup (${setupCount.value} step${setupCount.value === 1 ? '' : 's'} remaining)`
+    : 'Setup ✓'
+)
+
+function onClickSetup() {
+  // Open the wizard via the store. If the user is on a deep route, they stay
+  // there — the wizard is a modal and renders above whatever view is mounted.
+  if (route.path !== '/') {
+    router.push('/').then(() => onboardingStore.openWizard())
+  } else {
+    onboardingStore.openWizard()
+  }
+}
+
+onMounted(() => {
+  // Pull initial state so the badge is correct on first render. Personal-
+  // edition only — the surrounding template gates this for personal users.
+  if (!authStore.isTeamsEdition) {
+    void onboardingStore.fetchState()
+    void fetchToolCount()
+    void fetchSecretCount()
+  }
+})
 
 const collapsed = computed(() => systemStore.sidebarCollapsed)
+
+// Strip a leading "v" so the template can format consistently as `v<version>`.
+const displayVersion = computed(() => systemStore.version.replace(/^v/i, ''))
+
+// Tooltip shown on hover over the logo/home link. In collapsed sidebar mode
+// this is the only surface that communicates the running version.
+const logoTitle = computed(() => {
+  const v = systemStore.version
+  return v ? `MCPProxy ${v}` : 'MCPProxy'
+})
+
+const latestVersionTitle = computed(() => {
+  const latest = systemStore.latestVersion
+  return latest ? `Latest release: ${latest}` : 'Update available'
+})
+
+// Full button label, used as aria-label and full tooltip state.
+const updateButtonLabel = computed(() =>
+  systemStore.updateAvailable ? 'Update available — view release' : 'Check for updates'
+)
+
+// Compact label used in the sidebar row so the button fits on the same line
+// as the version string.
+const updateCompactLabel = computed(() => {
+  if (systemStore.checkingForUpdates) return 'Checking…'
+  return systemStore.updateAvailable ? 'View release' : 'Check'
+})
+
+const updateStatusTitle = computed(() => {
+  const ts = systemStore.updateCheckedAt
+  if (!ts) return 'Check for updates on GitHub'
+  const d = new Date(ts)
+  return `Last checked ${d.toLocaleString()}`
+})
+
+async function handleCheckForUpdates() {
+  // If an update is already known, open the release page instead of re-checking.
+  const releaseUrl = systemStore.info?.update?.release_url
+  if (systemStore.updateAvailable && releaseUrl) {
+    window.open(releaseUrl, '_blank', 'noopener,noreferrer')
+    return
+  }
+  await systemStore.checkForUpdates()
+}
 
 // --- Inline SVG icon components (Heroicons outline style, stroke=currentColor) ---
 // Kept local to this file so the sidebar remains self-contained. Each icon is a
@@ -349,6 +569,10 @@ const IconTokens = makeIcon(
 const IconActivity = makeIcon(
   'M4 12h3l3-8 4 16 3-8h3'
 )
+// Two chat bubbles — a session is one AI client's conversation with the proxy.
+const IconSessions = makeIcon(
+  'M8 10h8M8 14h5M4 5a1 1 0 011-1h14a1 1 0 011 1v10a1 1 0 01-1 1H9l-5 4V5z'
+)
 const IconShield = makeIcon(
   'M12 3l8 3v6c0 5-3.5 8.5-8 9-4.5-.5-8-4-8-9V6l8-3zm-3 9l2 2 4-4'
 )
@@ -358,6 +582,50 @@ const IconRepo = makeIcon(
 const IconSettings = makeIcon(
   'M10.3 3.6a1.5 1.5 0 013.4 0l.2 1.1a7 7 0 011.9.8l1-.6a1.5 1.5 0 012.1 2.1l-.6 1a7 7 0 01.8 1.9l1.1.2a1.5 1.5 0 010 3.4l-1.1.2a7 7 0 01-.8 1.9l.6 1a1.5 1.5 0 01-2.1 2.1l-1-.6a7 7 0 01-1.9.8l-.2 1.1a1.5 1.5 0 01-3.4 0l-.2-1.1a7 7 0 01-1.9-.8l-1 .6a1.5 1.5 0 01-2.1-2.1l.6-1a7 7 0 01-.8-1.9l-1.1-.2a1.5 1.5 0 010-3.4l1.1-.2a7 7 0 01.8-1.9l-.6-1a1.5 1.5 0 012.1-2.1l1 .6a7 7 0 011.9-.8l.2-1.1zM12 9a3 3 0 100 6 3 3 0 000-6z'
 )
+// Spec 046 v2: sparkles icon for the top-pinned Setup entry.
+const IconSparkles = makeIcon(
+  'M12 3l1.6 4.6L18 9l-4.4 1.4L12 15l-1.6-4.6L6 9l4.4-1.4L12 3zm6 11l.8 2.4L21 17l-2.2.6L18 20l-.8-2.4L15 17l2.2-.6L18 14zM6 14l.8 2.4L9 17l-2.2.6L6 20l-.8-2.4L3 17l2.2-.6L6 14z'
+)
+// Spec 050: wrench/tool icon for the global Tools nav entry.
+const IconTools = makeIcon(
+  'M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3-3a1 1 0 000-1.4l-1.6-1.6a1 1 0 00-1.4 0l-1 1L15 3l-5 5-1.3-1.3a1 1 0 00-1.4 0l-3 3a1 1 0 000 1.4L6 13l-3 3a1 1 0 000 1.4l2.6 2.6a1 1 0 001.4 0l3-3a1 1 0 000-1.4L8.7 14l5-5 1.6 1.6z'
+)
+
+// Spec 050: live tool count for the sidebar badge.
+const toolCount = ref(0)
+
+async function fetchToolCount() {
+  try {
+    const resp = await api.getGlobalTools()
+    if (resp.success && resp.data) {
+      toolCount.value = resp.data.stats.total
+    }
+  } catch {
+    // Silently ignore — badge is non-critical
+  }
+}
+
+// Sidebar badge parity with Tools: show total server + secret counts so the
+// WORKSPACE section reads consistently. Server count is already reactive via
+// the status SSE; secrets need a one-shot fetch on mount.
+const serverCount = computed(() => systemStore.upstreamStats.total_servers ?? 0)
+const secretCount = ref(0)
+
+async function fetchSecretCount() {
+  try {
+    // Use the same source as the Secrets page (total_secrets from
+    // /secrets/config) so the badge matches what the user sees there.
+    // /secrets/refs is NOT equivalent — it counts every config reference
+    // including ${env:...} placeholders (TERM_SESSION_ID etc.), not stored
+    // keyring secrets.
+    const resp = await api.getConfigSecrets()
+    if (resp.success && resp.data) {
+      secretCount.value = resp.data.total_secrets ?? 0
+    }
+  } catch {
+    // Silently ignore — badge is non-critical
+  }
+}
 
 // Server edition menus (unchanged behavior)
 const teamsUserMenu = [

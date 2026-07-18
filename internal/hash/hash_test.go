@@ -136,6 +136,27 @@ func TestComputeToolHash_FallbackOnMarshalError(t *testing.T) {
 	assert.NotEmpty(t, hash, "Should return fallback hash on marshal error")
 }
 
+func TestComputeToolHashWithOutputSchema_CanonicalizesOutputSchemaJSON(t *testing.T) {
+	inputSchema := map[string]interface{}{"type": "object"}
+
+	hash1 := ComputeToolHashWithOutputSchema("server", "tool", "desc", inputSchema, `{"type":"object","properties":{"url":{"type":"string"}}}`)
+	hash2 := ComputeToolHashWithOutputSchema("server", "tool", "desc", inputSchema, `{
+		"properties": {"url": {"type": "string"}},
+		"type": "object"
+	}`)
+
+	assert.Equal(t, hash1, hash2, "Semantically identical output schemas should hash the same")
+}
+
+func TestToolHashWithOutputSchema_UsesStructuredEncoding(t *testing.T) {
+	hash1, err := ToolHashWithOutputSchema("ab", "c", "d", map[string]interface{}{"type": "object"}, `{"type":"object"}`)
+	require.NoError(t, err)
+	hash2, err := ToolHashWithOutputSchema("a", "bc", "d", map[string]interface{}{"type": "object"}, `{"type":"object"}`)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, hash1, hash2, "Different contract field tuples must not collide through string concatenation")
+}
+
 func TestComputeToolHash_DescriptionOnlyChange(t *testing.T) {
 	schema := map[string]interface{}{
 		"type": "object",
@@ -192,4 +213,17 @@ func TestBytesHash(t *testing.T) {
 	assert.Equal(t, hash1, hash2, "Same input should produce same hash")
 	assert.NotEqual(t, hash1, hash3, "Different input should produce different hash")
 	assert.Len(t, hash1, 64, "SHA-256 hex string should be 64 characters")
+}
+
+func TestNormalizeJSON(t *testing.T) {
+	// Empty and non-JSON inputs pass through unchanged.
+	assert.Equal(t, "", NormalizeJSON(""))
+	assert.Equal(t, "not json", NormalizeJSON("not json"))
+
+	// Object keys are sorted, whitespace collapsed, so semantically identical
+	// JSON normalizes to one stable string.
+	a := NormalizeJSON(`{"type":"object","properties":{"url":{"type":"string"}}}`)
+	b := NormalizeJSON("{\n  \"properties\": {\"url\": {\"type\": \"string\"}},\n  \"type\": \"object\"\n}")
+	assert.Equal(t, a, b)
+	assert.Equal(t, `{"properties":{"url":{"type":"string"}},"type":"object"}`, a)
 }

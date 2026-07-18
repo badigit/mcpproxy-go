@@ -18,11 +18,62 @@ func TestRegistryListBundledScanners(t *testing.T) {
 		t.Errorf("expected %d bundled scanners, got %d", len(bundledScanners), len(scanners))
 	}
 
-	// All should be "available"
+	// Docker-backed scanners start "available"; in-process scanners (no image
+	// to pull) start "installed" so they always run (MCP-2082).
 	for _, s := range scanners {
-		if s.Status != ScannerStatusAvailable {
-			t.Errorf("scanner %s: expected status %q, got %q", s.ID, ScannerStatusAvailable, s.Status)
+		want := ScannerStatusAvailable
+		if s.InProcess {
+			want = ScannerStatusInstalled
 		}
+		if s.Status != want {
+			t.Errorf("scanner %s: expected status %q, got %q", s.ID, want, s.Status)
+		}
+	}
+}
+
+// TestRampartsV08Invariants guards the v0.8.x URL/stdio scanning contract
+// (MCP-2422). Ramparts dropped directory scanning, so the registry entry must
+// run via the entrypoint (Command nil) and needs no container network — the
+// stdio replay shim is local-only and YARA runs offline. A regression here
+// (e.g. someone restoring a CLI Command or flipping NetworkReq back to true)
+// would silently break offline scanning or re-introduce a stale invocation.
+func TestRampartsV08Invariants(t *testing.T) {
+	r := NewRegistry(t.TempDir(), zap.NewNop())
+
+	s, err := r.Get("ramparts")
+	if err != nil {
+		t.Fatalf("Get ramparts: %v", err)
+	}
+	if s.Command != nil {
+		t.Errorf("ramparts Command should be nil (entrypoint-driven), got %v", s.Command)
+	}
+	if s.NetworkReq {
+		t.Errorf("ramparts should not require network: replay shim is local and YARA is offline")
+	}
+	if s.InProcess {
+		t.Errorf("ramparts is a Docker-backed scanner, should not be InProcess")
+	}
+	if s.DockerImage == "" {
+		t.Errorf("ramparts must declare a Docker image")
+	}
+}
+
+func TestRegistryInProcessScannerInstalledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir, zap.NewNop())
+
+	s, err := r.Get(inProcessTPAScannerID)
+	if err != nil {
+		t.Fatalf("Get %s: %v", inProcessTPAScannerID, err)
+	}
+	if !s.InProcess {
+		t.Errorf("scanner %s should be marked InProcess", inProcessTPAScannerID)
+	}
+	if s.Status != ScannerStatusInstalled {
+		t.Errorf("in-process scanner status = %q, want %q", s.Status, ScannerStatusInstalled)
+	}
+	if s.DockerImage != "" {
+		t.Errorf("in-process scanner should have no Docker image, got %q", s.DockerImage)
 	}
 }
 
@@ -129,6 +180,30 @@ func TestRegistryUserOverride(t *testing.T) {
 	s, _ := r.Get("mcp-scan")
 	if s.Name != "My Custom MCP Scan" {
 		t.Errorf("user override should win, got name %q", s.Name)
+	}
+}
+
+// TestBundledScannerDefaultEnablement locks Spec 077 FR-018: the in-process
+// baseline scanner loads enabled ("installed") while every Docker-backed scanner
+// loads disabled ("available"). This is the default-safe posture — the heavy
+// deep-scan layer is off until explicitly enabled.
+func TestBundledScannerDefaultEnablement(t *testing.T) {
+	r := NewRegistry(t.TempDir(), zap.NewNop())
+	var sawInProcess bool
+	for _, s := range r.List() {
+		if s.InProcess {
+			sawInProcess = true
+			if s.Status != ScannerStatusInstalled {
+				t.Errorf("in-process scanner %s must default to %q (enabled), got %q", s.ID, ScannerStatusInstalled, s.Status)
+			}
+			continue
+		}
+		if s.Status != ScannerStatusAvailable {
+			t.Errorf("Docker scanner %s must default to %q (disabled), got %q", s.ID, ScannerStatusAvailable, s.Status)
+		}
+	}
+	if !sawInProcess {
+		t.Fatalf("expected at least one in-process (baseline) scanner in the bundled registry")
 	}
 }
 

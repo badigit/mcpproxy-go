@@ -112,7 +112,7 @@ enum HealthAction: String, Codable, CaseIterable {
     /// Human-readable button label.
     var label: String {
         switch self {
-        case .login:      return "Log In"
+        case .login:      return "Sign in"
         case .restart:    return "Restart"
         case .enable:     return "Enable"
         case .approve:    return "Approve"
@@ -193,7 +193,84 @@ struct QuarantineStats: Codable, Equatable {
     }
 }
 
+// MARK: - Diagnostics (Spec 044)
+
+/// REST-API representation of one fix step attached to a DiagnosticPayload.
+struct DiagnosticFixStep: Codable, Equatable {
+    let type: String       // "link" | "command" | "button"
+    let label: String
+    let command: String?
+    let url: String?
+    let fixerKey: String?
+    let destructive: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case type, label, command, url
+        case fixerKey = "fixer_key"
+        case destructive
+    }
+}
+
+/// Structured diagnostic error carried on each server record when the
+/// server is in a failed state. `code` is a stable identifier such as
+/// MCPX_STDIO_SPAWN_ENOENT that the tray can key off without parsing
+/// free-text error messages.
+struct DiagnosticPayload: Codable, Equatable {
+    let code: String
+    let severity: String   // "info" | "warn" | "error"
+    let cause: String?
+    let userMessage: String?
+    let fixSteps: [DiagnosticFixStep]?
+    let docsURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case code, severity, cause
+        case userMessage = "user_message"
+        case fixSteps = "fix_steps"
+        case docsURL = "docs_url"
+    }
+}
+
 // MARK: - Server Status
+
+/// Per-server Docker isolation overrides, surfaced by the API so the
+/// tray can both display and edit them. Mirrors the
+/// `contracts.IsolationConfig` struct on the Go side.
+struct IsolationConfigStatus: Codable, Equatable {
+    let enabled: Bool
+    let image: String?
+    let networkMode: String?
+    let extraArgs: [String]?
+    let workingDir: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, image
+        case networkMode = "network_mode"
+        case extraArgs = "extra_args"
+        case workingDir = "working_dir"
+    }
+}
+
+/// Resolved baseline isolation values for a server's detected runtime,
+/// computed by the backend from the global DockerIsolationConfig + the
+/// server's command. The tray uses these as field placeholders so the
+/// user can see exactly what an empty/cleared override resolves to.
+/// Mirrors `contracts.IsolationDefaults` on the Go side.
+struct IsolationDefaultsStatus: Codable, Equatable {
+    let runtimeType: String?
+    let image: String?
+    let networkMode: String?
+    let extraArgs: [String]?
+    let workingDir: String?
+
+    enum CodingKeys: String, CodingKey {
+        case runtimeType = "runtime_type"
+        case image
+        case networkMode = "network_mode"
+        case extraArgs = "extra_args"
+        case workingDir = "working_dir"
+    }
+}
 
 /// Represents an upstream MCP server's configuration and runtime status.
 /// Matches the Go `contracts.Server` struct serialized by `/api/v1/servers`.
@@ -204,6 +281,18 @@ struct ServerStatus: Codable, Identifiable, Equatable {
     let command: String?
     let args: [String]?
     let workingDir: String?
+    /// HTTP headers attached to every request to this server (HTTP /
+    /// streamable-http only). Sensitive values are redacted to
+    /// `***REDACTED***` by the backend unless `reveal_secret_headers:
+    /// true` is set in the loaded config (see
+    /// internal/httpapi/server.go:redactServerHeaders). Edit-mode preserves
+    /// the user-supplied values via the PATCH endpoint regardless.
+    let headers: [String: String]?
+    /// Environment variables attached to stdio servers. The Web UI's
+    /// Edit Config screen has full round-trip support; this field lets
+    /// the Swift tray display and pre-populate them on its own edit form
+    /// rather than starting from an empty textarea.
+    let env: [String: String]?
     let `protocol`: String
     let enabled: Bool
     let connected: Bool
@@ -222,11 +311,20 @@ struct ServerStatus: Codable, Identifiable, Equatable {
     let userLoggedOut: Bool?
     let health: HealthStatus?
     let quarantine: QuarantineStats?
+    let isolation: IsolationConfigStatus?
+    let isolationDefaults: IsolationDefaultsStatus?
     let error: String?
+    /// Spec 044 — stable error code (e.g. MCPX_STDIO_SPAWN_ENOENT) and the
+    /// structured diagnostic payload. Present only when the server has an
+    /// active, classified failure.
+    let errorCode: String?
+    let diagnostic: DiagnosticPayload?
 
     enum CodingKeys: String, CodingKey {
         case id, name, url, command, args
         case workingDir = "working_dir"
+        case headers
+        case env
         case `protocol` = "protocol"
         case enabled, connected, connecting, quarantined
         case status
@@ -242,7 +340,26 @@ struct ServerStatus: Codable, Identifiable, Equatable {
         case userLoggedOut = "user_logged_out"
         case health
         case quarantine
+        case isolation
+        case isolationDefaults = "isolation_defaults"
         case error
+        case errorCode = "error_code"
+        case diagnostic
+    }
+
+    /// True when the server has an attached diagnostic with warn/error severity.
+    var hasAttentionDiagnostic: Bool {
+        guard let d = diagnostic, !(d.code).isEmpty else { return false }
+        return d.severity == "warn" || d.severity == "error"
+    }
+
+    /// True when the server is in the OAuth login-required state (MCP-1819/T3).
+    /// `health.action == "login"` is the stable, cross-surface contract that
+    /// CLI/REST/Web-UI/tray all key off. In this state the server needs a calm,
+    /// actionable "Sign in" affordance — NOT hard-error framing — even when the
+    /// backend also attaches an error-severity diagnostic for the failed connect.
+    var isOAuthLoginRequired: Bool {
+        health?.action == "login"
     }
 
     /// Number of tools awaiting approval (pending + changed), or 0 if quarantine stats are absent.
@@ -273,6 +390,33 @@ struct ServerStatus: Codable, Identifiable, Equatable {
         default: return connected ? .systemGreen : .systemGray
         }
     }
+
+    /// AppKit tray-menu dot color (MCP-1822). The OAuth login-required state is
+    /// calm and actionable, not a failure: it gets the system accent tint rather
+    /// than the red/error `statusNSColor` that previously read as a hard error.
+    /// Genuine errors (any non-login state) keep `statusNSColor`.
+    var menuStatusNSColor: NSColor {
+        isOAuthLoginRequired ? .controlAccentColor : statusNSColor
+    }
+}
+
+// MARK: - SSE Event Envelopes
+
+/// Inner payload of a `servers.changed` SSE event after spec 047. The Go core
+/// embeds the full post-redaction server list and aggregate stats so the tray
+/// can update local state without round-tripping `GET /api/v1/servers`. Older
+/// cores publish only `reason`; both fields are optional for forward-/back-
+/// compat. The outer envelope (`{"payload": {...}, "timestamp": N}`) is
+/// produced by the SSE writer in `internal/httpapi/server.go`.
+struct ServersChangedPayload: Codable {
+    let reason: String?
+    let servers: [ServerStatus]?
+    let stats: UpstreamStats?
+}
+
+struct ServersChangedEnvelope: Codable {
+    let payload: ServersChangedPayload
+    let timestamp: Int64?
 }
 
 // MARK: - Upstream Stats
@@ -623,11 +767,19 @@ struct SSEEvent: Equatable {
     }
 
     /// Convenience: decode the data payload as a JSON dictionary.
+    ///
+    /// Always throws `SSEError.invalidData` on bad input. The `try` on
+    /// JSONSerialization used to let Foundation's own NSError escape — so an
+    /// event with an empty or malformed payload threw a raw Cocoa error instead
+    /// of the SSEError this function documents, and any caller matching on
+    /// SSEError missed it.
     func decodePayload() throws -> [String: Any] {
-        guard let jsonData = data.data(using: .utf8) else {
+        guard let jsonData = data.data(using: .utf8), !jsonData.isEmpty else {
             throw SSEError.invalidData
         }
-        guard let dict = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+        guard let object = try? JSONSerialization.jsonObject(with: jsonData),
+              let dict = object as? [String: Any]
+        else {
             throw SSEError.invalidData
         }
         return dict
@@ -706,6 +858,39 @@ struct APIErrorResponse: Codable {
 /// Response wrapper for `GET /api/v1/servers`.
 struct ServersListResponse: Codable {
     let servers: [ServerStatus]
+}
+
+// MARK: - Profiles (Profiles v2 T5)
+
+/// One configured profile, matching `httpapi.ProfileSummary` from
+/// `GET /api/v1/profiles`. A profile scopes tool discovery to a named subset of
+/// upstream servers.
+struct ProfileSummary: Codable, Identifiable, Equatable {
+    let name: String
+    let servers: [String]
+    let toolCount: Int
+
+    var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case servers
+        case toolCount = "tool_count"
+    }
+}
+
+/// Response wrapper for `GET /api/v1/profiles`.
+struct ProfilesListResponse: Codable {
+    let profiles: [ProfileSummary]
+}
+
+/// Response wrapper for `GET|PUT /api/v1/profiles/active`.
+struct ActiveProfileResponse: Codable {
+    let activeProfile: String
+
+    enum CodingKeys: String, CodingKey {
+        case activeProfile = "active_profile"
+    }
 }
 
 // MARK: - Server Action Response

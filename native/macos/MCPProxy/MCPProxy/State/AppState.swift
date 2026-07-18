@@ -46,6 +46,19 @@ final class AppState: ObservableObject {
     @Published var totalServers: Int = 0
     @Published var totalTools: Int = 0
 
+    // MARK: - Profiles (Profiles v2 T5)
+    /// Configured profiles for the tray profile switcher.
+    @Published var profiles: [ProfileSummary] = []
+    /// Server-level default active profile slug; empty means "all servers".
+    @Published var activeProfile: String = ""
+
+    /// Set to true once the tray has received its first response from
+    /// `/api/v1/servers`. Used by `statusSummary` to distinguish "haven't
+    /// fetched yet" from "fetched and the list is genuinely empty", so the
+    /// menu shows "Loading…" instead of misleading "No servers configured"
+    /// during the cold-start window after the core becomes reachable.
+    @Published var serversLoaded: Bool = false
+
     // MARK: Activity & security (ActivityEntry from Models.swift)
 
     @Published var recentActivity: [ActivityEntry] = []
@@ -86,7 +99,22 @@ final class AppState: ObservableObject {
     @Published var webUIBaseURL: String = "http://127.0.0.1:8080"
 
     /// Whether the user has explicitly stopped MCPProxy (distinct from idle/error states).
+    /// Session-only by design (GH #410): the persistent choice is `startCoreOnLaunch`,
+    /// so stopping the core to debug something does not silently leave the tray
+    /// dead after the next reboot.
     @Published var isStopped: Bool = false
+
+    /// GH #410 — whether the tray may start a core when it opens. The one piece of
+    /// launcher state the tray persists; it says nothing about whether a core is
+    /// running (that is always discovered live from the socket). Mirrors
+    /// CoreLaunchPolicy so SwiftUI can bind to it.
+    @Published var startCoreOnLaunch: Bool = CoreLaunchPolicy().startCoreOnLaunch {
+        didSet { CoreLaunchPolicy().startCoreOnLaunch = startCoreOnLaunch }
+    }
+
+    /// True when MCPPROXY_TRAY_SKIP_CORE pins core autostart off, so the Settings
+    /// toggle can render disabled instead of disagreeing with actual behaviour.
+    let coreLaunchPinnedOffByEnvironment: Bool = CoreLaunchPolicy().isPinnedOffByEnvironment
 
     /// User-adjustable font scale (1.0 = default, persisted in UserDefaults).
     /// Standard macOS Cmd+/Cmd- changes this by 0.1 increments.
@@ -105,6 +133,35 @@ final class AppState: ObservableObject {
             // "enable" means disabled by user — intentional, not attention-worthy
             return action != "enable"
         }
+    }
+
+    /// Spec 044 — servers that have an attached, classified diagnostic with
+    /// warn/error severity. These drive the "Fix issues" menu group and the
+    /// tray badge tint.
+    ///
+    /// MCP-1819/T3: OAuth login-required servers are excluded. Pre-T1 the
+    /// backend classifies that state as an error-severity
+    /// MCPX_UNKNOWN_UNCLASSIFIED diagnostic, which would otherwise read as a
+    /// "file a bug" hard error. A server that just needs sign-in is surfaced
+    /// calmly via `serversNeedingAttention` (the "Sign in" affordance) instead.
+    var serversWithDiagnostic: [ServerStatus] {
+        servers.filter { $0.hasAttentionDiagnostic && !$0.isOAuthLoginRequired }
+    }
+
+    /// Highest-severity diagnostic across enabled servers. Returns nil when
+    /// no diagnostics are attached. Used by TrayIcon to colour the badge.
+    ///
+    /// MCP-1819/T3: OAuth login-required servers are skipped so a server that
+    /// merely needs sign-in does not tint the tray icon badge red/orange — the
+    /// calm "Needs Attention / Sign in" path owns that state instead.
+    var worstDiagnosticSeverity: String? {
+        var sawWarn = false
+        for srv in servers where srv.enabled && !srv.isOAuthLoginRequired {
+            guard let d = srv.diagnostic else { continue }
+            if d.severity == "error" { return "error" }
+            if d.severity == "warn" { sawWarn = true }
+        }
+        return sawWarn ? "warn" : nil
     }
 
     /// Aggregate health indicator for the tray icon badge.
@@ -146,6 +203,9 @@ final class AppState: ObservableObject {
         if isStopped { return "Stopped" }
         switch coreState {
         case .connected:
+            if !serversLoaded {
+                return "Loading…"
+            }
             if totalServers == 0 {
                 return "No servers configured"
             }
@@ -176,6 +236,7 @@ final class AppState: ObservableObject {
         if connectedCount != newConnected { connectedCount = newConnected }
         if totalTools != newTools { totalTools = newTools }
         if quarantinedToolsCount != newQuarantined { quarantinedToolsCount = newQuarantined }
+        if !serversLoaded { serversLoaded = true }
     }
 
     /// Replace the recent activity list.

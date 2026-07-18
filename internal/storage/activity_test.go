@@ -71,40 +71,70 @@ func TestActivityRecord_MarshalUnmarshal(t *testing.T) {
 	assert.Equal(t, record.Response, result.Response)
 }
 
+// TestActivityRecord_ByteFieldsRoundTrip verifies RequestBytes/ResponseBytes survive
+// JSON round-trip and that legacy records (missing fields) decode to 0. T001 Spec 069.
+func TestActivityRecord_ByteFieldsRoundTrip(t *testing.T) {
+	record := &ActivityRecord{
+		ID:            "01HQWX1Y2Z3A4B5C6D7E8F9G0H",
+		Type:          ActivityTypeToolCall,
+		ServerName:    "test-server",
+		ToolName:      "test-tool",
+		Status:        "success",
+		Timestamp:     time.Now().UTC(),
+		RequestBytes:  1234,
+		ResponseBytes: 5678,
+	}
+
+	data, err := record.MarshalBinary()
+	require.NoError(t, err)
+
+	var got ActivityRecord
+	require.NoError(t, got.UnmarshalBinary(data))
+	assert.Equal(t, 1234, got.RequestBytes)
+	assert.Equal(t, 5678, got.ResponseBytes)
+
+	// Legacy record (no byte fields) must decode to 0.
+	legacyJSON := []byte(`{"id":"abc","type":"tool_call","status":"success","timestamp":"2024-01-01T00:00:00Z"}`)
+	var legacy ActivityRecord
+	require.NoError(t, legacy.UnmarshalBinary(legacyJSON))
+	assert.Equal(t, 0, legacy.RequestBytes, "legacy record: RequestBytes must default to 0")
+	assert.Equal(t, 0, legacy.ResponseBytes, "legacy record: ResponseBytes must default to 0")
+}
+
 func TestActivityFilter_Validate(t *testing.T) {
 	tests := []struct {
-		name     string
-		filter   ActivityFilter
+		name       string
+		filter     ActivityFilter
 		wantLimit  int
 		wantOffset int
 	}{
 		{
-			name:     "default values",
-			filter:   ActivityFilter{},
+			name:       "default values",
+			filter:     ActivityFilter{},
 			wantLimit:  50,
 			wantOffset: 0,
 		},
 		{
-			name:     "negative limit becomes default",
-			filter:   ActivityFilter{Limit: -5},
+			name:       "negative limit becomes default",
+			filter:     ActivityFilter{Limit: -5},
 			wantLimit:  50,
 			wantOffset: 0,
 		},
 		{
-			name:     "limit over 100 capped",
-			filter:   ActivityFilter{Limit: 200},
+			name:       "limit over 100 capped",
+			filter:     ActivityFilter{Limit: 200},
 			wantLimit:  100,
 			wantOffset: 0,
 		},
 		{
-			name:     "negative offset becomes 0",
-			filter:   ActivityFilter{Limit: 50, Offset: -10},
+			name:       "negative offset becomes 0",
+			filter:     ActivityFilter{Limit: 50, Offset: -10},
 			wantLimit:  50,
 			wantOffset: 0,
 		},
 		{
-			name:     "valid values unchanged",
-			filter:   ActivityFilter{Limit: 25, Offset: 10},
+			name:       "valid values unchanged",
+			filter:     ActivityFilter{Limit: 25, Offset: 10},
 			wantLimit:  25,
 			wantOffset: 10,
 		},
@@ -195,30 +225,30 @@ func TestActivityFilter_Matches(t *testing.T) {
 			matches: false,
 		},
 		{
-			name:    "time range matches",
-			filter:  ActivityFilter{
+			name: "time range matches",
+			filter: ActivityFilter{
 				StartTime: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
 				EndTime:   time.Date(2024, 6, 30, 0, 0, 0, 0, time.UTC),
 			},
 			matches: true,
 		},
 		{
-			name:    "before start time",
-			filter:  ActivityFilter{
+			name: "before start time",
+			filter: ActivityFilter{
 				StartTime: time.Date(2024, 6, 20, 0, 0, 0, 0, time.UTC),
 			},
 			matches: false,
 		},
 		{
-			name:    "after end time",
-			filter:  ActivityFilter{
+			name: "after end time",
+			filter: ActivityFilter{
 				EndTime: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
 			},
 			matches: false,
 		},
 		{
-			name:    "multiple filters all match",
-			filter:  ActivityFilter{
+			name: "multiple filters all match",
+			filter: ActivityFilter{
 				Types:  []string{"tool_call"},
 				Server: "github",
 				Status: "success",
@@ -226,8 +256,8 @@ func TestActivityFilter_Matches(t *testing.T) {
 			matches: true,
 		},
 		{
-			name:    "multiple filters one fails",
-			filter:  ActivityFilter{
+			name: "multiple filters one fails",
+			filter: ActivityFilter{
 				Types:  []string{"tool_call"},
 				Server: "gitlab", // does not match
 				Status: "success",
@@ -859,4 +889,77 @@ func TestCalculateMaxSeverity_Storage(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestAggregateToolUsage(t *testing.T) {
+	t.Run("empty bucket returns empty map", func(t *testing.T) {
+		manager, cleanup := setupTestStorageForActivity(t)
+		defer cleanup()
+
+		got, err := manager.AggregateToolUsage(time.Now().Add(-30 * 24 * time.Hour))
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("counts per server+tool and tracks last used", func(t *testing.T) {
+		manager, cleanup := setupTestStorageForActivity(t)
+		defer cleanup()
+
+		base := time.Now().UTC().Add(-1 * time.Hour)
+		recs := []*ActivityRecord{
+			{Type: ActivityTypeToolCall, ServerName: "github", ToolName: "create_issue", Status: "success", Timestamp: base},
+			{Type: ActivityTypeToolCall, ServerName: "github", ToolName: "create_issue", Status: "error", Timestamp: base.Add(10 * time.Minute)},
+			{Type: ActivityTypeToolCall, ServerName: "github", ToolName: "list_repos", Status: "success", Timestamp: base.Add(5 * time.Minute)},
+			{Type: ActivityTypeToolCall, ServerName: "memory", ToolName: "create_issue", Status: "success", Timestamp: base.Add(2 * time.Minute)},
+		}
+		for _, r := range recs {
+			require.NoError(t, manager.SaveActivity(r))
+		}
+
+		got, err := manager.AggregateToolUsage(base.Add(-time.Hour))
+		require.NoError(t, err)
+
+		gh := got["github\x00create_issue"]
+		assert.Equal(t, 2, gh.Count)
+		assert.Equal(t, base.Add(10*time.Minute).Unix(), gh.LastUsed.Unix())
+		// Same tool name on a different server must NOT collide.
+		assert.Equal(t, 1, got["memory\x00create_issue"].Count)
+		assert.Equal(t, 1, got["github\x00list_repos"].Count)
+	})
+
+	t.Run("window boundary: at-since included, before-since excluded", func(t *testing.T) {
+		manager, cleanup := setupTestStorageForActivity(t)
+		defer cleanup()
+
+		since := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
+		require.NoError(t, manager.SaveActivity(&ActivityRecord{
+			Type: ActivityTypeToolCall, ServerName: "s", ToolName: "at", Status: "success", Timestamp: since,
+		}))
+		require.NoError(t, manager.SaveActivity(&ActivityRecord{
+			Type: ActivityTypeToolCall, ServerName: "s", ToolName: "before", Status: "success", Timestamp: since.Add(-time.Second),
+		}))
+
+		got, err := manager.AggregateToolUsage(since)
+		require.NoError(t, err)
+		assert.Equal(t, 1, got["s\x00at"].Count, "record exactly at since must be included")
+		_, ok := got["s\x00before"]
+		assert.False(t, ok, "record before since must be excluded")
+	})
+
+	t.Run("never-used tool absent and non-tool_call ignored", func(t *testing.T) {
+		manager, cleanup := setupTestStorageForActivity(t)
+		defer cleanup()
+
+		require.NoError(t, manager.SaveActivity(&ActivityRecord{
+			Type: ActivityType("oauth_login"), ServerName: "s", ToolName: "ignored", Status: "success",
+			Timestamp: time.Now().UTC(),
+		}))
+
+		got, err := manager.AggregateToolUsage(time.Now().Add(-30 * 24 * time.Hour))
+		require.NoError(t, err)
+		_, ok := got["s\x00ignored"]
+		assert.False(t, ok, "non tool_call records must not be counted")
+		_, ok = got["s\x00nonexistent"]
+		assert.False(t, ok, "never-used tools must be absent from the map")
+	})
 }

@@ -54,8 +54,11 @@ mcp-scan             Snyk Agent Scan          Snyk (Invariant Labs)   available 
 nova-proximity       Nova Proximity           MCPProxy                available    source
 ramparts             Ramparts MCP Scanner     Javelin                 available    source
 semgrep-mcp          Semgrep MCP Rules        Semgrep                 available    source
+tpa-descriptions     Tool Description Analy... MCPProxy                installed    source
 trivy-mcp            Trivy Vulnerability...   Aqua Security           available    source, container_image
 ```
+
+> `tpa-descriptions` is a built-in, **Docker-less** scanner and is `installed` (always on) out of the box — there is no image to pull. It analyzes a connected server's tool descriptions/schemas in-process, so it runs even for **remote `http`/`sse` servers** that have no source files or Docker container.
 
 ### 2. Enable scanners
 
@@ -66,6 +69,16 @@ mcpproxy security enable mcp-ai-scanner
 ```
 
 (`install` is a hidden alias for `enable`, kept for backward compatibility.)
+
+> **Docker-based scanners belong to the opt-in deep-scan layer (Spec 077).**
+> Enabling a Docker scanner pulls its image but does **not** by itself make it
+> run: the whole deep-scan layer is gated behind `security.deep_scan.enabled`
+> (default `false`). While that switch is off, `security enable <docker-scanner>`
+> prints a reminder — `scanner enabled, but it will not run until
+> security.deep_scan.enabled=true` — and only the built-in, Docker-less
+> `tpa-descriptions` baseline scanner actually runs. Set
+> `security.deep_scan.enabled: true` to turn the layer on. See
+> [Configuration](#configuration) below.
 
 ### 3. Configure API keys (if the scanner needs them)
 
@@ -105,7 +118,7 @@ mcpproxy security reject github-server
 
 ## Scanner registry
 
-MCPProxy ships with a bundled registry of 7 scanners. The bundled list lives in [`internal/security/scanner/registry_bundled.go`](https://github.com/smart-mcp-proxy/mcpproxy-go/blob/main/internal/security/scanner/registry_bundled.go).
+MCPProxy ships with a bundled registry of 8 scanners. The bundled list lives in [`internal/security/scanner/registry_bundled.go`](https://github.com/smart-mcp-proxy/mcpproxy-go/blob/main/internal/security/scanner/registry_bundled.go).
 
 | Scanner | Vendor | Inputs | Required env | Notes |
 |---------|--------|--------|--------------|-------|
@@ -113,8 +126,9 @@ MCPProxy ships with a bundled registry of 7 scanners. The bundled list lives in 
 | `mcp-ai-scanner` | MCPProxy | source | — (optional `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`) | Agent-based AI analysis with a pattern-only fallback. Lives in a [separate repo](https://github.com/smart-mcp-proxy/mcp-scanner). |
 | `mcp-scan` | Snyk (Invariant Labs) | source | `SNYK_TOKEN` | Tool poisoning, prompt injection, tool shadowing, toxic flows, secrets, rug pulls. |
 | `nova-proximity` | MCPProxy (NOVA-inspired rules) | source | — | Keyword-based, fully offline. Very fast. |
-| `ramparts` | Javelin | source | — | Rust-based YARA scanner. *(Known upstream issue on arm64 macOS — see [Scanner Images](/features/scanner-images).)* |
+| `ramparts` | Javelin | source | — | Rust-based YARA scanner. Runs fully offline: v0.8.x scans a live MCP endpoint, so MCPProxy replays the captured tool definitions to it over stdio (the upstream is never re-executed). *(`amd64`-only image; runs under emulation on arm64 — see [Scanner Images](/features/scanner-images).)* |
 | `semgrep-mcp` | Semgrep | source | — | Static analysis with MCP-specific rules. Uses the upstream `returntocorp/semgrep:latest` image. |
+| `tpa-descriptions` | MCPProxy | source | — | **Built-in, Docker-less, always on.** In-process analysis of tool descriptions/schemas via the deterministic offline [detect engine (Spec 076/077)](/features/tool-scanner): seven checks across two tiers — **hard** (hidden-Unicode smuggling, cross-server shadowing, decode-to-shell payloads, curated injection/exfiltration phrases) auto-quarantine and block approval; **soft** (prompt-injection directives, capability-mismatch, embedded secrets) raise a review item. Each finding carries a `confidence` score and the contributing check `signals`. Since Spec 077 the detect engine is the **sole in-process detector** — the duplicated legacy TPA keyword rules were removed and their approval-blocking posture folded into the hard-tier `phrase.injection` check. Fully offline (no network/filesystem/Docker), deterministic, and runs for any connected server — including remote `http`/`sse` servers with no source or Docker. See [Tool Scanner](/features/tool-scanner) for the full rule reference and the CI eval gate. |
 | `trivy-mcp` | Aqua Security | source, container_image | — | Filesystem + CVE scan. Uses the upstream `ghcr.io/aquasecurity/trivy:latest` image. |
 
 See [Scanner Images](/features/scanner-images) for the image sources and why vendor images are preferred over custom wrappers.
@@ -237,10 +251,31 @@ Scanners communicate results via SARIF 2.1.0. Exit code `0` indicates "scan comp
 2. Package cache (npx/uvx/pipx/bunx) — PREFERRED for package runners
 3. WorkingDir (from server config)
 4. Arg-scan fallback — accepts only directories containing source markers
-5. Tool definitions only — last resort (HTTP / SSE / unresolvable)
+5. Published package fetch (npx/uvx) — download & unpack real source, no execution
+6. Tool definitions only — last resort (HTTP / SSE / unresolvable)
 ```
 
-The resolved method and path are recorded on the scan job and visible via both the text and JSON report. See [Security Commands → scan](/cli/security-commands#security-scan) for more.
+For `uvx` servers the package cache lookup (step 2) covers persistent `uv tool install`
+locations, git checkouts, **and** the ephemeral `~/.cache/uv/archive-v0` wheel
+cache that a plain `uvx <pkg>` populates — so a locally-run Python MCP server
+resolves to its real source from the local cache (no network) before step 5's
+published fetch is reached, and works in air-gapped deployments.
+
+The resolved method and path are recorded on the scan job and visible via both the text and JSON report. The `source_method` field reports how source was obtained: `docker_extract`, `npx_cache`, `uvx_cache`, `working_dir`, `npm_pack`, `pip_download`, `url`, or `tool_definitions_only`. See [Security Commands → scan](/cli/security-commands#security-scan) for more.
+
+#### Published package fetch (npx / uvx)
+
+Package-runner servers (`npx`, `uvx`, plus `pnpm dlx` / `yarn dlx`, `pipx run`, and `bunx`) are the **primary** quarantine/scan target, but a server quarantined on add has never run locally — so the local package cache (step 2) misses and, before this fallback existed, the scan degraded to **tool definitions only** (no real source-level analysis). Step 5 closes that gap by downloading the *published* package source so the AI and supply-chain scanners run against real code. The target package is parsed from the launch command — subcommand runners (`pipx run X`, `pnpm dlx X`), package-naming flags (`npx --package X`, `uvx --from X`), and extra-dependency flags (`uvx --with <dep> X`, which names `X`, not the dep) are all handled. When the spec carries an exact version pin (`pkg@1.2.3`, `pkg==1.2.3`), the local-cache lookups (steps 2–4) prefer the cache entry matching that version rather than the newest one.
+
+**The source is fetched but never executed.** A scanner must not run the untrusted code it is scanning. The fetch only ever downloads and unpacks archives:
+
+- **Registry name required.** Only a server whose configured spec is a **bare registry name** (PEP 503 for PyPI, npm package name — optionally version-pinned) is fetched. Local-path, `file:`, URL, and VCS (`git+…`, `[email protected]:…`) specs are **rejected** and fall back to tool definitions only. This is mandatory: for a non-registry spec, `pip download` / `uv pip download` still invokes the package's `setup.py` / PEP 517 build backend to resolve metadata **even with `--only-binary=:all:`** — executing untrusted code on the (static) scan path. `--only-binary=:all:` alone protects only bare registry names. Validation covers the **whole spec including the `@`-tail**: a PEP 508 / npm direct reference such as `pkg@./local`, `pkg@/abs/path`, or `pkg@git+https://…` is rejected (the `name@<ref>` tail must be a bare version specifier, not a path/URL/VCS); for PyPI, any `@` is treated as a direct reference and refused.
+- **npm (`npx`)** — `npm pack <pkg>@<version> --ignore-scripts` downloads the published tarball without running any lifecycle scripts (`install`/`postinstall`), then it is extracted (`source_method=npm_pack`).
+- **PyPI (`uvx`)** — `uv pip download <pkg>==<version> --no-deps --only-binary=:all:` (falling back to `pip download`) fetches **only a prebuilt wheel**, which is unpacked without building or running `setup.py` (`source_method=pip_download`). `--only-binary=:all:` is mandatory: downloading an sdist would invoke the package's PEP 517 build backend (`setup.py egg_info`) to resolve metadata, executing the untrusted code. A package that ships **no wheel** therefore fails the fetch and falls back to tool definitions only — sdists are never built or extracted.
+
+Extraction is hardened against path traversal (zip-slip), symlink escape, and decompression bombs (bounded file count and total size). The whole fetch (download + extract) is bounded by a timeout, so a hung or throttled registry cannot stall the scan. If the toolchain is missing, the host is offline, or the fetch fails or times out, resolution falls through to **tool definitions only** with no regression.
+
+**This fallback runs only under the opt-in deep-scan layer (Spec 077).** Published-package fetch — like every Docker-based scanner — is part of the heavy deep-scan layer, so it runs only when `security.deep_scan.enabled: true`. With deep scan off (the default), package-runner servers without local source scan **tool definitions only**, and no network fetch is attempted. When deep scan is on, the fetch is enabled by default and can be turned off (for air-gapped deployments that must forbid the scanner's network egress) with `security.deep_scan.fetch_package_source: false`. The deprecated top-level `security.scanner_fetch_package_source` key still parses and is migrated into `security.deep_scan.fetch_package_source` on load.
 
 ## SARIF normalization
 
@@ -262,26 +297,45 @@ MCPProxy also augments each finding with a user-facing `threat_type` (`tool_pois
 ```json
 {
   "security": {
-    "auto_scan_quarantined": false,
     "scan_timeout_default": "60s",
     "integrity_check_interval": "1h",
     "integrity_check_on_restart": false,
     "scanner_registry_url": "",
     "runtime_read_only": false,
-    "runtime_tmpfs_size": "100M"
+    "runtime_tmpfs_size": "100M",
+    "deep_scan": {
+      "enabled": false,
+      "fetch_package_source": true,
+      "disable_no_new_privileges": false,
+      "scanners": []
+    }
   }
 }
 ```
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `auto_scan_quarantined` | `false` | Auto-scan newly quarantined servers as soon as they're added. |
 | `scan_timeout_default` | `60s` | Per-scanner timeout. The blocking CLI `security scan` computes a hard ceiling as `scan_timeout_default × scanner_count + 30s`, clamped between 15 and 30 minutes. |
 | `integrity_check_interval` | `1h` | Periodic integrity check interval (when running as a daemon with integrity checks enabled). |
 | `integrity_check_on_restart` | `false` | Re-verify integrity baseline every time an approved server is restarted. |
 | `scanner_registry_url` | `""` | Remote scanner registry URL (opt-in). When empty, only the bundled registry is used. |
 | `runtime_read_only` | `false` | Run approved server containers with `--read-only` and a tmpfs overlay. (P2 feature, requires Docker isolation.) |
 | `runtime_tmpfs_size` | `100M` | Tmpfs size for read-only runtime containers. |
+
+### The `security.deep_scan` block (Spec 077)
+
+The deterministic, offline `tpa-descriptions` baseline scanner always runs and is the sole source of the approval verdict. **Every heavier scan capability — the Docker-based scanner plugins and published-package-source extraction — lives behind the opt-in `security.deep_scan` block.** The whole layer is off by default; a deep-scan failure is surfaced as an informational note and **never** blocks approval or degrades the baseline verdict (FR-007/FR-008).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `deep_scan.enabled` | `false` | Master opt-in for the heavy layer. When `false`, no Docker scanner runs and no source extraction is attempted — only the in-process baseline scanner executes. |
+| `deep_scan.fetch_package_source` | `true` (when deep scan is on) | Whether the scanner fetches (never executes) the published source of `npx`/`uvx` package-runner servers when no local source is available. Set `false` for air-gapped deployments. Only consulted when `deep_scan.enabled` is `true`. |
+| `deep_scan.disable_no_new_privileges` | `false` | Omits `--security-opt no-new-privileges` from scanner container runs — the snap-docker/AppArmor escape hatch for hosts where the default flag makes every scanner fail with EPERM. |
+| `deep_scan.scanners` | `[]` | Optional allow-list restricting which deep scanners may run (by scanner id). Empty ⇒ all enabled deep scanners are eligible. |
+
+**Deprecated-key migration.** Configs that still carry the old top-level `security.scanner_fetch_package_source` or `security.scanner_disable_no_new_privileges` keys continue to parse and are folded into `deep_scan.fetch_package_source` / `deep_scan.disable_no_new_privileges` on load (then cleared, so the config serializes only `deep_scan.*`). The old `security.auto_scan_quarantined` key was removed; a config still carrying it loads without error and the key is ignored.
+
+The block is hot-reloaded: toggling `deep_scan.enabled` in `mcp_config.json` takes effect on the next scan without a restart.
 
 ### Environment variables
 
@@ -312,12 +366,13 @@ The Security page at `/security` in the Web UI mirrors the CLI and provides:
 
 ## Known limitations
 
-- **Ramparts on arm64 macOS** — the upstream scanner image ships a binary linked against a newer GLIBC than the image base and fails every run on arm64. Track the [scanner-ramparts image rebuild](https://github.com/smart-mcp-proxy/mcpproxy-go/issues) for a fix. Other 6 of 7 scanners work out of the box on arm64 macOS.
-- **Cisco scanner output has a hardcoded `server_url`** header in its stdout (`https://mcp.deepwiki.com/mcp`). Cosmetic, does not affect findings.
+- **Ramparts is `amd64`-only and runs emulated on arm64** — the GLIBC build break is fixed (builder pinned to bookworm, MCP-2395/#665) and the v0.8.x URL-based invocation is wired via a static stdio replay shim (MCP-2422), but the image is published for `linux/amd64` only because the arm64 Rust build exhausts the CI runner budget. On arm64 hosts (e.g. Apple Silicon) it runs under emulation — functional but slower. See [Scanner Images](/features/scanner-images) for the design.
+- **Cisco scanner is static-analysis only — coverage caveat.** The bundled `cisco-mcp-scanner` runs `static --tools tools.json` (YARA + readiness rules over the exported tool definitions). It **never connects to or probes the live server endpoint and makes no network request**, so an `is_safe`/`SAFE` result reflects the analyzed tool definitions, not the server's live runtime behavior — do not read a clean Cisco result for a remote/URL server as proof the live endpoint was exercised. mcpproxy prepends this caveat to every Cisco execution log. Relatedly, the upstream tool hardcodes a placeholder `server_url` header (`https://mcp.deepwiki.com/mcp`) in its stdout; this is cosmetic and does not affect findings, and since #383 mcpproxy strips that line from the user-visible execution log and replaces it with an annotation explaining no network request was made.
 - **Pass 2 (supply-chain audit)** currently requires Docker isolation to be enabled, otherwise it fails source resolution. The UI doesn't yet surface this precondition.
 
 ## Related reading
 
+- [Tool Scanner (Spec 076/077)](/features/tool-scanner) — the built-in offline detect engine behind `tpa-descriptions`: the seven checks, two-tier model, and CI eval gate
 - [Security Commands](/cli/security-commands) — exhaustive CLI reference
 - [Scanner Images](/features/scanner-images) — where each Docker image comes from
 - [Security Quarantine](/features/security-quarantine) — the underlying quarantine mechanism that scanners gate

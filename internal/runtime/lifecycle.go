@@ -9,7 +9,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/supervisor"
@@ -85,6 +84,10 @@ func (r *Runtime) StartBackgroundInitialization() {
 
 		// Set up reactive tool discovery callback with deduplication
 		r.supervisor.SetOnServerConnectedCallback(func(serverName string) {
+			// Spec 044 (T040): activation funnel — mark first-ever successful
+			// upstream connect. Monotonic; cheap; safe to call on every event.
+			r.MarkFirstConnectedServerForActivation()
+
 			// Deduplication: Check if discovery is already in progress for this server
 			if _, loaded := r.discoveryInProgress.LoadOrStore(serverName, struct{}{}); loaded {
 				r.logger.Debug("Tool discovery already in progress for server, skipping duplicate",
@@ -218,6 +221,26 @@ func (r *Runtime) connectAllWithRetry(ctx context.Context) {
 	}
 }
 
+// toolDiscoveryDisabledRecheckInterval is how long the indexing loop sleeps
+// between re-checks when the periodic sweep is disabled (resolved interval
+// <= 0). It is NOT a sweep — connect-time discovery and reactive
+// notifications/tools/list_changed still keep the index fresh; this only lets a
+// later config hot-reload re-enable the sweep without a restart (spec 074).
+const toolDiscoveryDisabledRecheckInterval = 5 * time.Minute
+
+// planToolDiscoveryCycle decides one iteration of the indexing loop: whether to
+// run a periodic sweep and how long to wait first. When at least one server (or
+// the global default) has a positive resolved interval the loop ticks at the
+// smallest such cadence (tick) and sweeps; when every interval is disabled
+// (anyEnabled=false) the loop waits the re-check window without sweeping so a
+// later hot-reload can re-enable it.
+func planToolDiscoveryCycle(tick time.Duration, anyEnabled bool, disabledRecheck time.Duration) (sweep bool, wait time.Duration) {
+	if !anyEnabled || tick <= 0 {
+		return false, disabledRecheck
+	}
+	return true, tick
+}
+
 func (r *Runtime) backgroundToolIndexing(ctx context.Context) {
 	r.cleanupOrphanedIndexEntries()
 
@@ -229,14 +252,25 @@ func (r *Runtime) backgroundToolIndexing(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
+	// Re-resolve the tool-discovery cadence every cycle so a config hot-reload
+	// changes the sweep interval (or disables it) without a restart (spec 074,
+	// FR-012). The loop ticks at the smallest per-server cadence and the sweep
+	// itself (DiscoverToolsDue) only re-lists servers whose own interval has
+	// elapsed, so per-server overrides take effect (US3/SC-006/FR-005). The tick
+	// is resolved from the upstream manager's thread-safe per-client config
+	// snapshots — iterating r.Config().Servers here would race in-place config
+	// mutation (the shared snapshot is copy-on-write; see runtime.Config()).
 	for {
+		tick, anyEnabled := r.upstreamManager.ResolveToolDiscoverySweepTick(r.Config())
+		sweep, wait := planToolDiscoveryCycle(tick, anyEnabled, toolDiscoveryDisabledRecheckInterval)
+		timer := time.NewTimer(wait)
 		select {
-		case <-ticker.C:
-			_ = r.DiscoverAndIndexTools(ctx)
+		case <-timer.C:
+			if sweep {
+				_ = r.discoverAndIndexTools(ctx, true)
+			}
 		case <-ctx.Done():
+			timer.Stop()
 			r.logger.Info("Background tool indexing stopped due to context cancellation")
 			return
 		}
@@ -275,15 +309,31 @@ func (r *Runtime) backgroundSessionCleanup(ctx context.Context) {
 	}
 }
 
-// DiscoverAndIndexTools discovers tools from upstream servers and indexes them.
+// DiscoverAndIndexTools discovers tools from ALL connected upstream servers and
+// indexes them. Used by event-driven callers (boot, server reload, manual
+// refresh) that want a full sweep regardless of per-server cadence.
 func (r *Runtime) DiscoverAndIndexTools(ctx context.Context) error {
+	return r.discoverAndIndexTools(ctx, false)
+}
+
+// discoverAndIndexTools discovers tools and updates the index. When dueOnly is
+// true (the periodic spec-074 sweep) only servers whose per-server
+// tool_discovery_interval has elapsed are re-listed; servers omitted from the
+// sweep keep their last-good index snapshot, so the index does not shrink.
+func (r *Runtime) discoverAndIndexTools(ctx context.Context, dueOnly bool) error {
 	if r.upstreamManager == nil || r.indexManager == nil {
 		return fmt.Errorf("runtime managers not initialized")
 	}
 
-	r.logger.Info("Discovering and indexing tools...")
+	r.logger.Info("Discovering and indexing tools...", zap.Bool("due_only", dueOnly))
 
-	tools, err := r.upstreamManager.DiscoverTools(ctx)
+	var tools []*config.ToolMetadata
+	var err error
+	if dueOnly {
+		tools, err = r.upstreamManager.DiscoverToolsDue(ctx)
+	} else {
+		tools, err = r.upstreamManager.DiscoverTools(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to discover tools: %w", err)
 	}
@@ -299,13 +349,71 @@ func (r *Runtime) DiscoverAndIndexTools(ctx context.Context) error {
 		toolsByServer[tool.ServerName] = append(toolsByServer[tool.ServerName], tool)
 	}
 
-	// Apply differential update for each server
+	// Snapshot the set of currently-known servers so we can prune entries for
+	// servers that have been removed from config and avoid an unbounded map.
+	knownServers := r.upstreamManager.GetAllServerNames()
+	knownServerSet := make(map[string]struct{}, len(knownServers))
+	for _, name := range knownServers {
+		knownServerSet[name] = struct{}{}
+	}
+
+	// Persist fresh snapshots for discovered servers and prune stale entries.
+	// ToolMetadata values are treated as immutable post-discovery; if that ever
+	// changes, switch to a deep copy here.
+	r.lastGoodToolsMu.Lock()
 	for serverName, serverTools := range toolsByServer {
+		cp := make([]*config.ToolMetadata, len(serverTools))
+		copy(cp, serverTools)
+		r.lastGoodTools[serverName] = cp
+	}
+	for serverName := range r.lastGoodTools {
+		if _, ok := knownServerSet[serverName]; !ok {
+			delete(r.lastGoodTools, serverName)
+		}
+	}
+	r.lastGoodToolsMu.Unlock()
+
+	// Apply differential update for each server with fallback to last-good snapshots
+	processedServers := make(map[string]struct{}, len(toolsByServer))
+	for serverName, serverTools := range toolsByServer {
+		processedServers[serverName] = struct{}{}
 		if err := r.applyDifferentialToolUpdate(ctx, serverName, serverTools); err != nil {
 			r.logger.Error("Failed to apply differential update for server",
 				zap.String("server", serverName),
 				zap.Error(err))
 			// Continue with other servers instead of failing completely
+		}
+	}
+
+	// For connected servers that were temporarily missing from discovery results,
+	// re-apply last-good snapshot to avoid transient index shrink.
+	for _, serverName := range knownServers {
+		if _, ok := processedServers[serverName]; ok {
+			continue
+		}
+
+		client, ok := r.upstreamManager.GetClient(serverName)
+		if !ok || client == nil || !client.IsConnected() {
+			continue
+		}
+
+		r.lastGoodToolsMu.RLock()
+		snapshot, hasSnapshot := r.lastGoodTools[serverName]
+		r.lastGoodToolsMu.RUnlock()
+		if !hasSnapshot || len(snapshot) == 0 {
+			continue
+		}
+
+		// Logged at Info: this can fire repeatedly during reconnect storms and
+		// is benign self-healing, not a warning condition.
+		r.logger.Info("Server missing from discovery result; reusing last-good tool snapshot",
+			zap.String("server", serverName),
+			zap.Int("snapshot_tools", len(snapshot)))
+
+		if err := r.applyDifferentialToolUpdate(ctx, serverName, snapshot); err != nil {
+			r.logger.Error("Failed to apply last-good snapshot for server",
+				zap.String("server", serverName),
+				zap.Error(err))
 		}
 	}
 
@@ -321,6 +429,11 @@ func (r *Runtime) DiscoverAndIndexTools(ctx context.Context) error {
 			r.logger.Debug("Successfully refreshed tools in StateView", zap.Int("tool_count", len(tools)))
 		}
 	}
+
+	// Profiles v2 (Spec 057, T1): reconcile per-profile indexes against the
+	// current config — build new profiles, rebuild those whose membership changed
+	// and drop removed ones. Unchanged profiles are left untouched.
+	r.reconcileProfileIndexes()
 
 	r.logger.Info("Successfully indexed tools", zap.Int("count", len(tools)))
 	return nil
@@ -444,7 +557,14 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Error(err))
 		// Filter out blocked tools before full batch index
 		allowedTools := filterBlockedTools(newTools, approvalResult.BlockedTools)
-		return r.indexManager.BatchIndexToolsWithAliases(allowedTools, r.buildAliasesMap(serverName, allowedTools))
+		if err := r.indexManager.BatchIndexTools(allowedTools); err != nil {
+			return err
+		}
+		r.warmSignatureCache(allowedTools)
+		// The shared index changed for this server; refresh dependent profiles.
+		r.reindexAffectedProfiles(serverName)
+		r.reconcileSignatureCache()
+		return nil
 	}
 
 	// Build maps for efficient lookup
@@ -565,9 +685,10 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Int("count", len(allowedAddedTools)),
 			zap.Int("blocked", len(addedTools)-len(allowedAddedTools)))
 
-		if err := r.indexManager.BatchIndexToolsWithAliases(allowedAddedTools, r.buildAliasesMap(serverName, allowedAddedTools)); err != nil {
+		if err := r.indexManager.BatchIndexTools(allowedAddedTools); err != nil {
 			return fmt.Errorf("failed to index added tools: %w", err)
 		}
+		r.warmSignatureCache(allowedAddedTools)
 	}
 
 	// 4. Re-index modified tools (excluding blocked)
@@ -586,62 +707,82 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 				zap.String("new_hash", tool.Hash))
 		}
 
-		if err := r.indexManager.BatchIndexToolsWithAliases(allowedModifiedTools, r.buildAliasesMap(serverName, allowedModifiedTools)); err != nil {
+		if err := r.indexManager.BatchIndexTools(allowedModifiedTools); err != nil {
 			return fmt.Errorf("failed to re-index modified tools: %w", err)
 		}
+		r.warmSignatureCache(allowedModifiedTools)
+	}
+
+	// If the shared index changed for this server, refresh the per-profile indexes
+	// that include it (Profiles v2, Spec 057). Profiles without this server are
+	// untouched. Skipped when nothing changed to avoid churn on idle sweeps.
+	changed := len(addedTools) > 0 || len(modifiedTools) > 0 || len(removedTools) > 0 ||
+		len(approvalResult.BlockedTools) > 0
+	if changed {
+		r.reindexAffectedProfiles(serverName)
+		// Evict signature-cache entries orphaned by removed/redefined tools —
+		// warming above only ever ADDS entries.
+		r.reconcileSignatureCache()
 	}
 
 	return nil
 }
 
-// buildAliasesMap returns a per-tool aliases string keyed by the tool's
-// full name ("<server>:<tool>") for use with BatchIndexToolsWithAliases.
-// Looks up the server's ServerConfig for manual search_aliases/tool_aliases/
-// domain_tags, and (when enabled) merges any cached LLM enrichment.
-// Returns nil when neither source contributes anything — callers can pass
-// nil directly and BatchIndexToolsWithAliases will skip alias work.
-func (r *Runtime) buildAliasesMap(serverName string, tools []*config.ToolMetadata) map[string]string {
-	if len(tools) == 0 {
-		return nil
+// warmSignatureCache pre-compiles compact signatures for freshly indexed
+// tools (Spec 085 US1 T024, FR-008: signatures are compiled at index time
+// into the ONE Runtime-owned cache, keyed by the Spec-032 tool hash), so a
+// later compact retrieve_tools is a pure cache read — never a per-request
+// compile. Hashless tools are skipped: warming them would memoize distinct
+// schemas under one "" key (indexed tools always carry a hash).
+func (r *Runtime) warmSignatureCache(tools []*config.ToolMetadata) {
+	if r.sigCache == nil {
+		return
 	}
+	for _, tool := range tools {
+		if tool == nil || tool.Hash == "" {
+			continue
+		}
+		r.sigCache.Warm(tool.Hash, tool.ParamsJSON, tool.Description)
+	}
+}
 
-	// Locate the server's config. Runtime holds the current config snapshot
-	// in r.cfg; reads here are racy by design (indexing is driven by config
-	// changes and a concurrent config reload will just retrigger indexing).
-	var serverCfg *config.ServerConfig
-	if r.cfg != nil {
-		for _, s := range r.cfg.Servers {
-			if s != nil && s.Name == serverName {
-				serverCfg = s
-				break
+// reconcileSignatureCache evicts signature-cache entries whose hash no longer
+// backs any indexed tool (Spec 085 FR-008 hygiene). warmSignatureCache only
+// ever ADDS entries, so after tool removals/redefinitions the dead hashes
+// would otherwise accumulate for the life of the process. Called after index
+// rebuilds and differential updates; enumerates the SHARED index only —
+// per-profile indexes hold subsets of the same tools, hence the same hashes.
+func (r *Runtime) reconcileSignatureCache() {
+	if r.sigCache == nil || r.indexManager == nil {
+		return
+	}
+	serverNames, err := r.indexManager.GetAllIndexedServerNames()
+	if err != nil {
+		r.logger.Debug("signature cache reconcile skipped: cannot enumerate indexed servers", zap.Error(err))
+		return
+	}
+	live := make(map[string]struct{})
+	for _, serverName := range serverNames {
+		tools, err := r.indexManager.GetToolsByServer(serverName)
+		if err != nil {
+			// Fail open (skip the sweep) rather than evict entries we could not
+			// enumerate: a lingering stale entry is harmless memory, an evicted
+			// live one costs a recompile on the next compact retrieve.
+			r.logger.Debug("signature cache reconcile skipped: cannot enumerate server tools",
+				zap.String("server", serverName), zap.Error(err))
+			return
+		}
+		for _, tool := range tools {
+			if tool != nil && tool.Hash != "" {
+				live[tool.Hash] = struct{}{}
 			}
 		}
 	}
-
-	if serverCfg == nil && r.storageManager == nil {
-		return nil
+	if evicted := r.sigCache.RetainHashes(live); evicted > 0 {
+		r.logger.Debug("evicted stale signature cache entries",
+			zap.Int("evicted", evicted),
+			zap.Int("live", len(live)))
 	}
-
-	out := make(map[string]string, len(tools))
-	for _, t := range tools {
-		toolBaseName := t.Name
-		if idx := strings.Index(t.Name, ":"); idx != -1 {
-			toolBaseName = t.Name[idx+1:]
-		}
-
-		// LLM enrichment lookup is wired here but intentionally left
-		// unused in Commit B — Commit C populates the cache and this
-		// call returns (nil, false, nil) until then.
-		aliases := index.CollectAliases(serverCfg, toolBaseName, nil)
-		if aliases == "" {
-			continue
-		}
-		out[t.Name] = aliases
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // filterBlockedTools removes tools that are blocked by quarantine from the list.
@@ -702,6 +843,23 @@ func (r *Runtime) LoadConfiguredServers(cfg *config.Config) error {
 
 	for _, storedServer := range storedServers {
 		storedServerMap[storedServer.Name] = storedServer
+	}
+
+	// GC orphaned tool-approval records (MCP-1002): drop approvals whose server
+	// is no longer configured. Configured-but-disabled servers are preserved so
+	// a later re-enable doesn't re-quarantine their previously-approved tools.
+	// Guard against a transient empty config nuking every approval — explicit
+	// server deletion already cleans up via DeleteServerToolApprovals.
+	if len(configuredServers) > 0 {
+		configuredNames := make([]string, 0, len(configuredServers))
+		for name := range configuredServers {
+			configuredNames = append(configuredNames, name)
+		}
+		if pruned, perr := r.storageManager.PruneOrphanToolApprovals(configuredNames); perr != nil {
+			r.logger.Warn("Failed to prune orphan tool approvals", zap.Error(perr))
+		} else if pruned > 0 {
+			r.logger.Info("Pruned orphan tool-approval records", zap.Int("removed", pruned))
+		}
 	}
 
 	// Add/remove servers asynchronously to prevent blocking on slow connections
@@ -954,6 +1112,18 @@ func (r *Runtime) ReloadConfiguration() error {
 		return fmt.Errorf("failed to reload servers: %w", err)
 	}
 
+	// MCP-2482: detect a telemetry enabled->disabled flip across the reload and
+	// fire the one-time opt-out beacon. This covers config changes that arrive
+	// via a disk reload (there is no fsnotify auto-watcher, so this is the
+	// manual/triggered-reload path). nil-safe + fire-and-forget.
+	if r.telemetryService != nil {
+		r.telemetryService.NotifyConfigChanged(newSnapshot.Config)
+	}
+
+	// Spec 079 FR-012: re-gate the update checker on the disk-reload path too
+	// (ApplyConfig covers the API path). SetConfig no-ops when unchanged.
+	r.applyUpdateCheckConfig(newSnapshot.Config)
+
 	go r.postConfigReload()
 
 	r.logger.Info("Configuration reload completed",
@@ -1036,6 +1206,8 @@ func (r *Runtime) EnableServer(serverName string, enabled bool) error {
 			} else {
 				r.logger.Info("Removed disabled server tools from search index",
 					zap.String("server", serverName))
+				// Refresh per-profile indexes that include this now-disabled server.
+				r.reindexAffectedProfiles(serverName)
 			}
 		}
 
@@ -1074,6 +1246,8 @@ func (r *Runtime) QuarantineServer(serverName string, quarantined bool) error {
 		} else {
 			r.logger.Info("Removed quarantined server tools from index",
 				zap.String("server", serverName))
+			// Refresh per-profile indexes that include this now-quarantined server.
+			r.reindexAffectedProfiles(serverName)
 		}
 	}
 
@@ -1087,6 +1261,21 @@ func (r *Runtime) QuarantineServer(serverName string, quarantined bool) error {
 	if err := r.LoadConfiguredServers(nil); err != nil {
 		r.logger.Error("Failed to synchronize runtime after quarantine toggle", zap.Error(err))
 		return fmt.Errorf("failed to reload configuration: %w", err)
+	}
+
+	// On unquarantine/approval, baseline-trust the server's CURRENT tool
+	// snapshot: promote its pending (never-reviewed) tool records to approved.
+	// Tool-level quarantine then guards only status=changed (rug-pull) records.
+	// (Spec 032, MCP-2100; trust model confirmed in MCP-2081.) Done before the
+	// re-index in HandleUpstreamServerChange so the newly-trusted tools become
+	// immediately searchable. Best-effort: a promotion failure must not abort
+	// the unquarantine the user already requested and that is already persisted.
+	if !quarantined {
+		if err := r.approveBaselineToolsForServer(serverName); err != nil {
+			r.logger.Warn("Failed to baseline-approve tools on server unquarantine",
+				zap.String("server", serverName),
+				zap.Error(err))
+		}
 	}
 
 	r.emitServersChanged("quarantine_toggle", map[string]any{
@@ -1172,26 +1361,74 @@ func (r *Runtime) BulkEnableServers(serverNames []string, enabled bool) (map[str
 	return resultErrs, nil
 }
 
+// lookupServerConfigForRestart returns the named server's config, preferring
+// the on-disk mcp_config.json over the BoltDB cache. Falls back to BoltDB
+// when the disk file is unreadable, malformed, or missing the named server.
+//
+// On a successful disk read, the resolved config is also written back to
+// BoltDB so subsequent restarts (and any other read-from-storage code path)
+// see the same value. Without this, only the synchronous restart that did
+// the disk read would see the edit; the next one would replay storage and
+// regress. See issue #467 for context.
+func (r *Runtime) lookupServerConfigForRestart(serverName string) *config.ServerConfig {
+	r.mu.RLock()
+	cfgPath := r.cfgPath
+	r.mu.RUnlock()
+
+	if cfgPath != "" {
+		diskCfg, err := config.LoadFromFile(cfgPath)
+		if err != nil {
+			r.logger.Warn("Failed to re-read config from disk during restart, falling back to storage",
+				zap.String("path", cfgPath),
+				zap.String("server", serverName),
+				zap.Error(err))
+		} else {
+			for _, srv := range diskCfg.Servers {
+				if srv != nil && srv.Name == serverName {
+					if r.storageManager != nil {
+						if saveErr := r.storageManager.SaveUpstreamServer(srv); saveErr != nil {
+							r.logger.Warn("Failed to persist disk-loaded config to storage during restart",
+								zap.String("server", serverName),
+								zap.Error(saveErr))
+						}
+					}
+					return srv
+				}
+			}
+		}
+	}
+
+	if r.storageManager == nil {
+		return nil
+	}
+	servers, err := r.storageManager.ListUpstreamServers()
+	if err != nil {
+		r.logger.Error("Failed to list servers during restart fallback",
+			zap.String("server", serverName),
+			zap.Error(err))
+		return nil
+	}
+	for _, srv := range servers {
+		if srv.Name == serverName {
+			return srv
+		}
+	}
+	return nil
+}
+
 // RestartServer restarts an upstream server by disconnecting and reconnecting it.
 // Validation and disconnect are synchronous; reconnection and reindexing happen
 // asynchronously so the caller (HTTP handler) returns immediately.
 func (r *Runtime) RestartServer(serverName string) error {
 	r.logger.Info("Request to restart server", zap.String("server", serverName))
 
-	// Check if server exists in storage (config)
-	servers, err := r.storageManager.ListUpstreamServers()
-	if err != nil {
-		return fmt.Errorf("failed to list servers: %w", err)
-	}
-
-	var serverConfig *config.ServerConfig
-	for _, srv := range servers {
-		if srv.Name == serverName {
-			serverConfig = srv
-			break
-		}
-	}
-
+	// Issue #467: pull the latest server config from disk before falling
+	// back to BoltDB. There is no fsnotify-style auto file-watcher, so a
+	// user who edits mcp_config.json and then triggers a restart would
+	// otherwise replay stale env / headers / args / isolation data — only
+	// the live REST PATCH path used to update them. Disk-first here closes
+	// that gap for the (much more common) edit-then-restart UX.
+	serverConfig := r.lookupServerConfigForRestart(serverName)
 	if serverConfig == nil {
 		return fmt.Errorf("server '%s' not found in configuration", serverName)
 	}
@@ -1364,6 +1601,11 @@ func (r *Runtime) cleanupOrphanedIndexEntries() {
 		zap.Int("active_servers", len(activeServers)),
 		zap.Int("indexed_servers", len(indexedServers)),
 		zap.Int("orphans_removed", removedCount))
+
+	if removedCount > 0 {
+		// Removed servers' tools leave the index; their signatures leave too.
+		r.reconcileSignatureCache()
+	}
 }
 
 // supervisorEventForwarder subscribes to supervisor events and emits runtime events

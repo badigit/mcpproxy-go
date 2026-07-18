@@ -153,6 +153,32 @@ actor APIClient {
         try await postAction(path: "/api/v1/servers/\(id)/login")
     }
 
+    // MARK: - Profiles (Profiles v2 T5)
+
+    /// List configured profiles from `GET /api/v1/profiles`.
+    func profiles() async throws -> [ProfileSummary] {
+        let response: ProfilesListResponse = try await fetchWrapped(path: "/api/v1/profiles")
+        return response.profiles
+    }
+
+    /// Get the server-level default active profile from
+    /// `GET /api/v1/profiles/active`. An empty string means "all servers".
+    func activeProfile() async throws -> String {
+        let response: ActiveProfileResponse = try await fetchWrapped(path: "/api/v1/profiles/active")
+        return response.activeProfile
+    }
+
+    /// Set the server-level default active profile via
+    /// `PUT /api/v1/profiles/active`. An empty slug clears the selection.
+    func setActiveProfile(_ slug: String) async throws {
+        let bodyData = try JSONSerialization.data(withJSONObject: ["profile": slug])
+        let (data, response) = try await performRequest(path: "/api/v1/profiles/active", method: "PUT", body: bodyData)
+        if let errorResponse = try? JSONDecoder().decode(APIErrorResponse.self, from: data),
+           !errorResponse.success, let message = errorResponse.error {
+            throw APIClientError.httpError(statusCode: response.statusCode, message: message)
+        }
+    }
+
     /// Quarantine a server via `POST /api/v1/servers/{id}/quarantine`.
     func quarantineServer(_ id: String) async throws {
         try await postAction(path: "/api/v1/servers/\(id)/quarantine")
@@ -181,6 +207,32 @@ actor APIClient {
            !errorResponse.success, let message = errorResponse.error {
             throw APIClientError.httpError(statusCode: response.statusCode, message: message)
         }
+    }
+
+    /// Store a value in the OS keyring under `name` and return the
+    /// `${keyring:name}` reference string. Kept for callers that have
+    /// the plaintext on the client side; the Headers / Environment
+    /// Variables "Convert to secret" flow uses the atomic
+    /// `convertConfigToSecret` below instead.
+    func storeSecret(name: String, value: String) async throws -> String {
+        _ = try await postAction(
+            path: "/api/v1/secrets",
+            body: ["name": name, "value": value, "type": "keyring"]
+        )
+        return "${keyring:\(name)}"
+    }
+
+    /// Atomically move a header / env value out of `mcp_config.json` and
+    /// into the OS keyring. The backend reads the real value from the
+    /// loaded config (so the client never has to possess it — useful
+    /// when the API redacts what we see), stores it in keyring under
+    /// `secretName`, and rewrites the config field with the
+    /// `${keyring:<name>}` reference.
+    func convertConfigToSecret(serverName: String, scope: String, key: String, secretName: String) async throws {
+        _ = try await postAction(
+            path: "/api/v1/servers/\(serverName)/config-to-secret",
+            body: ["scope": scope, "key": key, "secret_name": secretName]
+        )
     }
 
     // MARK: - Connect (Client Registration)
@@ -514,6 +566,40 @@ actor APIClient {
         return data
     }
 
+    // MARK: - Configuration (Spec 060)
+
+    /// Fetch the full server configuration as a JSON dictionary.
+    /// GET /api/v1/config → { success, data: { config: {...} } }.
+    func getConfig() async throws -> [String: Any] {
+        let (data, response) = try await performRequest(path: "/api/v1/config", method: "GET")
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw APIClientError.httpError(statusCode: response.statusCode, message: "Malformed config response")
+        }
+        if let inner = root["data"] as? [String: Any], let cfg = inner["config"] as? [String: Any] {
+            return cfg
+        }
+        // Some builds may return the config object directly.
+        if let cfg = root["config"] as? [String: Any] { return cfg }
+        throw APIClientError.httpError(statusCode: response.statusCode, message: "Config not found in response")
+    }
+
+    /// Apply a partial config update (only the changed fields) via the
+    /// deep-merge PATCH endpoint, so unrelated settings and redacted secrets are
+    /// never clobbered. Returns the apply-result dictionary (success,
+    /// applied_immediately, requires_restart, restart_reason, changed_fields,
+    /// validation_errors).
+    @discardableResult
+    func patchConfig(_ partial: [String: Any]) async throws -> [String: Any] {
+        let bodyData = try JSONSerialization.data(withJSONObject: partial)
+        let (data, response) = try await performRequest(path: "/api/v1/config", method: "PATCH", body: bodyData)
+        let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        if let success = root["success"] as? Bool, !success {
+            let msg = (root["error"] as? String) ?? "Failed to apply configuration"
+            throw APIClientError.httpError(statusCode: response.statusCode, message: msg)
+        }
+        return (root["data"] as? [String: Any]) ?? [:]
+    }
+
     // MARK: - Private Helpers
 
     /// Fetch a resource wrapped in the standard `APIResponse` envelope.
@@ -558,8 +644,11 @@ actor APIClient {
         return data
     }
 
-    /// Low-level request execution with HTTP status validation.
-    private func performRequest(
+    /// Low-level request execution WITHOUT HTTP status validation. Returns the
+    /// raw body and response for any status. Callers that need to inspect error
+    /// bodies (e.g. the registry add-source flow, which reads a stable `code`)
+    /// use this directly; most callers use `performRequest`, which validates.
+    private func rawRequest(
         path: String,
         method: String,
         body: Data? = nil
@@ -593,6 +682,17 @@ actor APIClient {
             throw APIClientError.noData
         }
 
+        return (data, httpResponse)
+    }
+
+    /// Low-level request execution with HTTP status validation.
+    private func performRequest(
+        path: String,
+        method: String,
+        body: Data? = nil
+    ) async throws -> (Data, HTTPURLResponse) {
+        let (data, httpResponse) = try await rawRequest(path: path, method: method, body: body)
+
         // 2xx is success; for readiness we also treat the response as-is
         guard (200...299).contains(httpResponse.statusCode) else {
             // Try to extract error message from body
@@ -605,5 +705,148 @@ actor APIClient {
         }
 
         return (data, httpResponse)
+    }
+
+    // MARK: - Registries (MCP-866 / MCP-902)
+
+    /// List configured registries from `GET /api/v1/registries`, each tagged
+    /// with provenance/trust so the UI can flag official vs custom sources.
+    func registries() async throws -> [Registry] {
+        let response: GetRegistriesResponse = try await fetchWrapped(path: "/api/v1/registries")
+        return response.registries
+    }
+
+    /// Add a user-supplied registry source via `POST /api/v1/registries`. The
+    /// server always tags an added source "custom" (provenance is NOT part of
+    /// the request); provenance is informational only (MCP-1072) and servers
+    /// follow the global quarantine default. Returns a structured result carrying
+    /// the stable error `code` instead of throwing, mirroring the Web UI.
+    func addRegistrySource(
+        url: String,
+        protocol proto: String? = nil,
+        id: String? = nil,
+        name: String? = nil
+    ) async -> AddRegistrySourceResult {
+        var body: [String: Any] = ["url": url]
+        if let proto, !proto.isEmpty { body["protocol"] = proto }
+        if let id, !id.isEmpty { body["id"] = id }
+        if let name, !name.isEmpty { body["name"] = name }
+
+        do {
+            let bodyData = try JSONSerialization.data(withJSONObject: body)
+            let (data, response) = try await rawRequest(path: "/api/v1/registries", method: "POST", body: bodyData)
+            let decoder = JSONDecoder()
+
+            if (200...299).contains(response.statusCode),
+               let wrapper = try? decoder.decode(APIResponse<AddRegistrySourceData>.self, from: data),
+               wrapper.success {
+                return .ok(wrapper.data?.registry)
+            }
+
+            let errBody = try? decoder.decode(RegistryAddErrorBody.self, from: data)
+            return .failure(
+                code: errBody?.code,
+                error: errBody?.error ?? "HTTP \(response.statusCode): \(HTTPURLResponse.localizedString(forStatusCode: response.statusCode))"
+            )
+        } catch {
+            return .failure(code: nil, error: error.localizedDescription)
+        }
+    }
+
+    /// Edit a user-added custom registry via `PUT /api/v1/registries/{id}`
+    /// (MCP-1072). All fields are optional — an empty field leaves the existing
+    /// value unchanged; the id is immutable. Returns a structured result carrying
+    /// the stable error `code` (e.g. `registry_not_found`, `invalid_registry_url`,
+    /// `registry_shadows_builtin`, `registries_locked`) instead of throwing.
+    func editRegistrySource(
+        id: String,
+        url: String? = nil,
+        name: String? = nil,
+        serversURL: String? = nil
+    ) async -> AddRegistrySourceResult {
+        var body: [String: Any] = [:]
+        if let url, !url.isEmpty { body["url"] = url }
+        if let name, !name.isEmpty { body["name"] = name }
+        if let serversURL, !serversURL.isEmpty { body["servers_url"] = serversURL }
+
+        do {
+            let bodyData = try JSONSerialization.data(withJSONObject: body)
+            let (data, response) = try await rawRequest(
+                path: "/api/v1/registries/\(id.uriComponentEncoded)", method: "PUT", body: bodyData)
+            let decoder = JSONDecoder()
+
+            if (200...299).contains(response.statusCode),
+               let wrapper = try? decoder.decode(APIResponse<AddRegistrySourceData>.self, from: data),
+               wrapper.success {
+                return .ok(wrapper.data?.registry)
+            }
+
+            let errBody = try? decoder.decode(RegistryAddErrorBody.self, from: data)
+            return .failure(
+                code: errBody?.code,
+                error: errBody?.error ?? "HTTP \(response.statusCode): \(HTTPURLResponse.localizedString(forStatusCode: response.statusCode))"
+            )
+        } catch {
+            return .failure(code: nil, error: error.localizedDescription)
+        }
+    }
+
+    /// Remove a user-added custom registry via `DELETE /api/v1/registries/{id}`
+    /// (MCP-1057). Built-in registries cannot be removed (the backend returns
+    /// `registry_not_found` / a locked error). Returns a structured result
+    /// carrying the stable error `code` instead of throwing.
+    func removeRegistrySource(id: String) async -> AddRegistrySourceResult {
+        do {
+            let (data, response) = try await rawRequest(
+                path: "/api/v1/registries/\(id.uriComponentEncoded)", method: "DELETE")
+            let decoder = JSONDecoder()
+
+            if (200...299).contains(response.statusCode),
+               let wrapper = try? decoder.decode(APIResponse<AddRegistrySourceData>.self, from: data),
+               wrapper.success {
+                return .ok(wrapper.data?.registry)
+            }
+
+            let errBody = try? decoder.decode(RegistryAddErrorBody.self, from: data)
+            return .failure(
+                code: errBody?.code,
+                error: errBody?.error ?? "HTTP \(response.statusCode): \(HTTPURLResponse.localizedString(forStatusCode: response.statusCode))"
+            )
+        } catch {
+            return .failure(code: nil, error: error.localizedDescription)
+        }
+    }
+
+    /// Search a single registry's servers via
+    /// `GET /api/v1/registries/{id}/servers?q=&limit=`. Throws on transport/HTTP
+    /// errors; a 200 with an `unavailable` marker (e.g. key required) is a
+    /// normal, non-throwing result that the browse view surfaces per-registry.
+    func searchRegistryServers(registryID: String, query: String, limit: Int = 20) async throws -> SearchRegistryServersResponse {
+        var params: [String] = ["limit=\(limit)"]
+        if !query.isEmpty { params.insert("q=\(query.uriComponentEncoded)", at: 0) }
+        let path = "/api/v1/registries/\(registryID.uriComponentEncoded)/servers?\(params.joined(separator: "&"))"
+        return try await fetchWrapped(path: path)
+    }
+
+    /// Add a server discovered through a registry via
+    /// `POST /api/v1/registries/{id}/servers/{serverId}/add`. Returns a
+    /// structured result (does not throw) carrying `missingInputs` when the
+    /// server needs env values the caller hasn't supplied yet.
+    func addServerFromRegistry(registryID: String, serverID: String, env: [String: String]? = nil) async -> AddServerResult {
+        var body: [String: Any] = [:]
+        if let env, !env.isEmpty { body["env"] = env }
+        let path = "/api/v1/registries/\(registryID.uriComponentEncoded)/servers/\(serverID.uriComponentEncoded)/add"
+        do {
+            let bodyData = try JSONSerialization.data(withJSONObject: body)
+            let (data, response) = try await rawRequest(path: path, method: "POST", body: bodyData)
+            if (200...299).contains(response.statusCode) { return .ok() }
+            let err = try? JSONDecoder().decode(RegistryAddServerErrorBody.self, from: data)
+            return .failure(
+                message: err?.message ?? "HTTP \(response.statusCode): \(HTTPURLResponse.localizedString(forStatusCode: response.statusCode))",
+                missingInputs: err?.missingInputs
+            )
+        } catch {
+            return .failure(message: error.localizedDescription)
+        }
     }
 }

@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,7 +25,9 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/management"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
@@ -65,6 +70,10 @@ type ServerController interface {
 	RestartServer(serverName string) error
 	ForceReconnectAllServers(reason string) error
 	GetDockerRecoveryStatus() *storage.DockerRecoveryState
+	// IsDockerAvailable reports genuine Docker daemon reachability via a real
+	// probe (not the synthetic recovery-state value returned when isolation is
+	// off). Used by /api/v1/docker/status — see MCP-2478.
+	IsDockerAvailable() bool
 	QuarantineServer(serverName string, quarantined bool) error
 	GetQuarantinedServers() ([]map[string]interface{}, error)
 	UnquarantineServer(serverName string) error
@@ -104,6 +113,10 @@ type ServerController interface {
 	ValidateConfig(cfg *config.Config) ([]config.ValidationError, error)
 	ApplyConfig(cfg *config.Config, cfgPath string) (*internalRuntime.ConfigApplyResult, error)
 	GetConfig() (*config.Config, error)
+	// DefaultInstructions returns the built-in default MCP instructions text
+	// (independent of any user-configured custom value), so /api/v1/status can
+	// surface it to the Web UI as the instructions placeholder (MCP-2176).
+	DefaultInstructions() string
 
 	// Token statistics
 	GetTokenSavings() (*contracts.ServerTokenMetrics, error)
@@ -113,7 +126,32 @@ type ServerController interface {
 
 	// Registry browsing (Phase 7)
 	ListRegistries() ([]interface{}, error)
-	SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, error)
+	// SearchRegistryServers returns the registry's servers plus a cache
+	// freshness indicator (spec 070 FR-007). A registry requiring an
+	// unconfigured key surfaces as a wrapped registries.ErrRegistryKeyMissing.
+	SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, *contracts.RegistryCacheInfo, error)
+	// RefreshRegistryCache drops a registry's cached server lists (FR-007).
+	RefreshRegistryCache(registryID string) (int, error)
+	// AddServerFromRegistryRef resolves a registry reference server-side and
+	// persists it quarantined (spec 070 keystone). On failure it returns a
+	// stable cross-surface error code (*contracts.RegistryAddError) alongside
+	// the raw error so the handler can map code → HTTP status.
+	AddServerFromRegistryRef(ctx context.Context, registryID, serverID, name string, env map[string]string, enabled *bool) (*config.ServerConfig, *contracts.RegistryAddError, error)
+	// AddRegistrySourceRef adds a user-supplied generic registry source
+	// (MCP-866), always tagged custom/unverified. On failure it returns a stable
+	// cross-surface error code alongside the raw error.
+	AddRegistrySourceRef(url, protocol, id, name string) (*config.RegistryEntry, *contracts.RegistryAddError, error)
+	// RemoveRegistrySourceRef removes a user-added custom registry source
+	// (MCP-1057). Built-ins are refused (registry_shadows_builtin) and an unknown
+	// id yields registry_not_found. On failure it returns a stable cross-surface
+	// error code alongside the raw error.
+	RemoveRegistrySourceRef(id string) (*config.RegistryEntry, *contracts.RegistryAddError, error)
+	// EditRegistrySourceRef updates a user-added custom registry source
+	// (MCP-1072): name, url, servers-url. Built-ins are refused
+	// (registry_shadows_builtin), an unknown id yields registry_not_found, and a
+	// non-https url yields invalid_registry_url. On failure it returns a stable
+	// cross-surface error code alongside the raw error.
+	EditRegistrySourceRef(id, name, url, serversURL string) (*config.RegistryEntry, *contracts.RegistryAddError, error)
 
 	// Version and updates
 	GetVersionInfo() *updatecheck.VersionInfo
@@ -123,12 +161,33 @@ type ServerController interface {
 	ListActivities(filter storage.ActivityFilter) ([]*storage.ActivityRecord, int, error)
 	GetActivity(id string) (*storage.ActivityRecord, error)
 	StreamActivities(filter storage.ActivityFilter) <-chan *storage.ActivityRecord
+	// AggregateToolUsage rolls up tool_call activity per (server,tool) since the
+	// given time. Backs the global tools page usage columns (spec 050).
+	AggregateToolUsage(since time.Time) (map[string]storage.ToolUsageStat, error)
+	// UsageSnapshot returns the actor-owned in-memory usage aggregate snapshot
+	// (spec 069 A2). The /api/v1/activity/usage endpoint reads it without a
+	// full-log scan (SC-005). May be nil before the activity service is ready.
+	UsageSnapshot() *internalRuntime.UsageAggregate
 
 	// Tool-level quarantine (Spec 032)
 	ListToolApprovals(serverName string) ([]*storage.ToolApprovalRecord, error)
 	ApproveTools(serverName string, toolNames []string, approvedBy string) error
 	ApproveAllTools(serverName string, approvedBy string) (int, error)
+	// BlockTools / BlockAllTools atomically approve+disable tools (MCP-2198):
+	// all-or-nothing so a tool is never left approved+enabled.
+	BlockTools(serverName string, toolNames []string, blockedBy string) (int, error)
+	BlockAllTools(serverName string, blockedBy string) (int, error)
 	GetToolApproval(serverName, toolName string) (*storage.ToolApprovalRecord, error)
+
+	// Onboarding wizard (Spec 046)
+	GetOnboardingState() (*storage.OnboardingState, error)
+	SaveOnboardingState(state *storage.OnboardingState) error
+
+	// Activation state (Spec 044) — read-only access used by the v2
+	// onboarding wizard's Verify tab to detect whether any MCP client has
+	// successfully called this mcpproxy. Returns FirstMCPClientEver and
+	// MCPClientsSeenEver from the activation bucket.
+	GetActivationFirstMCPClient() (firstEver bool, seen []string)
 }
 
 // Server provides HTTP API endpoints with chi router
@@ -154,6 +213,57 @@ type Server struct {
 	// with runtime stats attached. May be nil before SetTelemetryPayloadProvider
 	// is called.
 	telemetryPayloadProvider func() *telemetry.Service
+
+	// usageCache is the short-TTL read cache for GET /api/v1/activity/usage
+	// (Spec 069 FR-005). Keyed by the request's query params; entries expire
+	// after the configured usage_cache_ttl so wide-window reads are cheap and
+	// staleness is bounded.
+	usageCacheMu sync.Mutex
+	usageCache   map[string]usageCacheEntry
+
+	// activeProfile is the server-level default active profile surfaced to UI
+	// clients (Web UI / tray) via GET/PUT /api/v1/profiles/active (Profiles v2
+	// T2). Empty means "all servers". It is a UI-facing default and does not
+	// override a live MCP session's set_profile selection.
+	activeProfileMu sync.RWMutex
+	activeProfile   string
+}
+
+// usageCacheEntry is one cached usage response with its expiry.
+type usageCacheEntry struct {
+	resp    *contracts.UsageAggregateResponse
+	expires time.Time
+}
+
+// usageCacheMaxEntries bounds the usage cache; on overflow it is cleared
+// wholesale (entries are short-lived and the working set is tiny in practice).
+const usageCacheMaxEntries = 64
+
+// getUsageCache returns a non-expired cached response for key, or nil.
+func (s *Server) getUsageCache(key string, ttl time.Duration) *contracts.UsageAggregateResponse {
+	if ttl <= 0 {
+		return nil
+	}
+	s.usageCacheMu.Lock()
+	defer s.usageCacheMu.Unlock()
+	entry, ok := s.usageCache[key]
+	if !ok || time.Now().After(entry.expires) {
+		return nil
+	}
+	return entry.resp
+}
+
+// putUsageCache stores resp under key for ttl.
+func (s *Server) putUsageCache(key string, resp *contracts.UsageAggregateResponse, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	s.usageCacheMu.Lock()
+	defer s.usageCacheMu.Unlock()
+	if s.usageCache == nil || len(s.usageCache) >= usageCacheMaxEntries {
+		s.usageCache = make(map[string]usageCacheEntry)
+	}
+	s.usageCache[key] = usageCacheEntry{resp: resp, expires: time.Now().Add(ttl)}
 }
 
 // SetTelemetryRegistry attaches the Tier 2 counter registry. Spec 042. Must
@@ -457,17 +567,23 @@ func (s *Server) setupRoutes() {
 		_, _ = w.Write([]byte(`{"ready":false}`))
 	}
 
-	// Observability endpoints (registered first to avoid conflicts)
+	// Observability /metrics endpoint (MCP-32). Independent of the health
+	// endpoints below: enabling metrics must not change readiness semantics.
 	if s.observability != nil {
-		if health := s.observability.Health(); health != nil {
-			s.router.Get("/healthz", health.HealthzHandler())
-			s.router.Get("/readyz", health.ReadyzHandler())
-		}
 		if metrics := s.observability.Metrics(); metrics != nil {
 			s.router.Handle("/metrics", metrics.Handler())
 		}
+	}
+
+	// Health and readiness endpoints. The observability health manager only
+	// takes over when it is actually enabled; otherwise the controller-backed
+	// handlers remain authoritative. A config-gated feature (metrics/tracing)
+	// must be a no-op for readiness when health is not enabled (MCP-32).
+	if s.observability != nil && s.observability.Health() != nil {
+		health := s.observability.Health()
+		s.router.Get("/healthz", health.HealthzHandler())
+		s.router.Get("/readyz", health.ReadyzHandler())
 	} else {
-		// Register custom health endpoints only if observability is not available
 		for _, path := range []string{"/livez", "/healthz", "/health"} {
 			s.router.Get(path, livenessHandler)
 		}
@@ -498,6 +614,11 @@ func (s *Server) setupRoutes() {
 		// Routing mode endpoint
 		r.Get("/routing", s.handleGetRouting)
 
+		// Profiles (Profiles v2 T2) — list + default active get/set for UI surfaces
+		r.Get("/profiles", s.handleListProfiles)
+		r.Get("/profiles/active", s.handleGetActiveProfile)
+		r.Put("/profiles/active", s.handleSetActiveProfile)
+
 		// Server management
 		r.Get("/servers", s.handleGetServers)
 		r.Post("/servers", s.handleAddServer)                           // T001: Add server
@@ -511,8 +632,18 @@ func (s *Server) setupRoutes() {
 		r.Post("/servers/enable_all", s.handleEnableAll)
 		r.Post("/servers/disable_all", s.handleDisableAll)
 		r.Route("/servers/{id}", func(r chi.Router) {
-			r.Patch("/", s.handlePatchServer)   // Partial update server config
-			r.Delete("/", s.handleRemoveServer) // T002: Remove server
+			// chi routes on RawPath, so the {id} param arrives percent-encoded.
+			// Official modelcontextprotocol/registry v0.1 ids are namespace/name,
+			// so the slash reaches handlers as %2F. Decode it once here so every
+			// /servers/{id}/* sub-resource handler (tools, logs, restart, approve,
+			// scan, …) does its exact-match server lookup against the real name
+			// rather than 404ing on the encoded literal (MCP-1118, same class as
+			// MCP-1056). Centralising the decode also prevents new sub-resource
+			// routes from silently reintroducing the gap.
+			r.Use(decodeServerIDParam)
+			r.Patch("/", s.handlePatchServer)                          // Partial update server config
+			r.Delete("/", s.handleRemoveServer)                        // T002: Remove server
+			r.Post("/config-to-secret", s.handleConvertConfigToSecret) // Move a header / env value into OS keyring
 			r.Post("/enable", s.handleEnableServer)
 			r.Post("/disable", s.handleDisableServer)
 			r.Post("/restart", s.handleRestartServer)
@@ -523,10 +654,20 @@ func (s *Server) setupRoutes() {
 			r.Post("/discover-tools", s.handleDiscoverServerTools)
 			r.Get("/tools", s.handleGetServerTools)
 			r.Get("/logs", s.handleGetServerLogs)
+			// Spec 044: per-server diagnostics with stable error_code.
+			r.Get("/diagnostics", s.handleGetServerDiagnostics)
 			r.Get("/tool-calls", s.handleGetServerToolCalls)
 
 			// Tool-level quarantine (Spec 032)
 			r.Post("/tools/approve", s.handleApproveTools)
+			// Atomic block = approve+disable (MCP-2198). Server-side so the
+			// pair is all-or-nothing — a tool is never left approved+enabled.
+			r.Post("/tools/block", s.handleBlockTools)
+			r.Post("/tools/{tool}/enabled", s.handleSetToolEnabled)
+			// Bulk per-tool enable/disable. Mirrors /servers/enable_all
+			// + /servers/disable_all but scoped to a single server's tools.
+			r.Post("/tools/enable_all", s.handleSetAllToolsEnabled(true))
+			r.Post("/tools/disable_all", s.handleSetAllToolsEnabled(false))
 			r.Get("/tools/{tool}/diff", s.handleGetToolDiff)
 			r.Get("/tools/export", s.handleExportToolDescriptions)
 
@@ -544,6 +685,9 @@ func (s *Server) setupRoutes() {
 		// Search
 		r.Get("/index/search", s.handleSearchTools)
 
+		// Global tools overview — every tool across all servers (spec 050, issue #437)
+		r.Get("/tools", s.handleGetGlobalTools)
+
 		// Docker recovery status
 		r.Get("/docker/status", s.handleGetDockerStatus)
 
@@ -559,6 +703,8 @@ func (s *Server) setupRoutes() {
 		// Diagnostics
 		r.Get("/diagnostics", s.handleGetDiagnostics)
 		r.Get("/doctor", s.handleGetDiagnostics) // Alias for consistency with CLI command
+		// Spec 044: per-server diagnostics + fix invocation.
+		r.Post("/diagnostics/fix", s.handleInvokeFix)
 
 		// Telemetry payload preview (Spec 042) — renders the next heartbeat
 		// payload with runtime stats attached. No network call is made.
@@ -586,14 +732,22 @@ func (s *Server) setupRoutes() {
 		r.Get("/config", s.handleGetConfig)
 		r.Post("/config/validate", s.handleValidateConfig)
 		r.Post("/config/apply", s.handleApplyConfig)
+		r.Patch("/config", s.handlePatchConfig)
+		r.Patch("/config/docker-isolation", s.handlePatchDockerIsolation)
 
 		// Registry browsing (Phase 7)
 		r.Get("/registries", s.handleListRegistries)
+		r.Post("/registries", s.handleAddRegistrySource)           // MCP-866 user-added registry source
+		r.Put("/registries/{id}", s.handleEditRegistrySource)      // MCP-1072 edit user-added source
+		r.Delete("/registries/{id}", s.handleRemoveRegistrySource) // MCP-1057 remove user-added source
 		r.Get("/registries/{id}/servers", s.handleSearchRegistryServers)
+		r.Post("/registries/{id}/refresh", s.handleRefreshRegistryCache)           // spec 070 FR-007
+		r.Post("/registries/{id}/servers/{serverId}/add", s.handleAddFromRegistry) // spec 070 keystone add
 
 		// Activity logging (RFC-003)
 		r.Get("/activity", s.handleListActivity)
 		r.Get("/activity/summary", s.handleActivitySummary)
+		r.Get("/activity/usage", s.handleActivityUsage)
 		r.Get("/activity/export", s.handleExportActivity)
 		r.Get("/activity/{id}", s.handleGetActivityDetail)
 
@@ -607,6 +761,7 @@ func (s *Server) setupRoutes() {
 			r.Route("/{name}", func(r chi.Router) {
 				r.Get("/", s.handleGetToken)
 				r.Delete("/", s.handleRevokeToken)
+				r.Delete("/permanent", s.handleDeleteToken)
 				r.Post("/regenerate", s.handleRegenerateToken)
 			})
 		})
@@ -616,8 +771,15 @@ func (s *Server) setupRoutes() {
 
 		// Client connect/disconnect
 		r.Get("/connect", s.handleGetConnectStatus)
+		r.Get("/connect/{client}", s.handleGetConnectClientStatus)
+		r.Get("/connect/{client}/preview", s.handleConnectClientPreview)
 		r.Post("/connect/{client}", s.handleConnectClient)
+		r.Post("/connect/{client}/undo", s.handleUndoConnectClient)
 		r.Delete("/connect/{client}", s.handleDisconnectClient)
+
+		// Onboarding wizard (Spec 046)
+		r.Get("/onboarding/state", s.handleGetOnboardingState)
+		r.Post("/onboarding/mark", s.handleMarkOnboardingState)
 
 		// Security scanner management routes (Spec 039)
 		r.Route("/security", func(r chi.Router) {
@@ -787,7 +949,42 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, _ *http.Request) {
 		"status":         s.controller.GetStatus(),
 		"routing_mode":   routingMode,
 		"timestamp":      time.Now().Unix(),
+		// MCP-2176: built-in default MCP instructions. The Web UI renders this
+		// as the instructions textarea placeholder so the displayed default
+		// never drifts from the backend's resolveInstructions("") value. Always
+		// the built-in default, never the user's current custom value.
+		"default_instructions": s.controller.DefaultInstructions(),
 	}
+
+	// Spec 044 (FR-018): expose process-level env_kind + env_markers so the
+	// tray and CLI can surface the classifier verdict without waiting for the
+	// next heartbeat. DetectEnvKindOnce is cached, so repeated calls are free.
+	envKind, envMarkers := telemetry.DetectEnvKindOnce()
+	response["env_kind"] = string(envKind)
+	response["env_markers"] = envMarkers
+
+	// Spec 044 (T041): expose the activation funnel snapshot alongside
+	// env_kind. Read-only — mutation happens on MCP/connect events, never
+	// through this endpoint. nil when the telemetry service (or activation
+	// store) is not wired (e.g. very early startup).
+	if s.telemetryPayloadProvider != nil {
+		if svc := s.telemetryPayloadProvider(); svc != nil {
+			if store := svc.ActivationStore(); store != nil {
+				if db := svc.ActivationDB(); db != nil {
+					if st, err := store.Load(db); err == nil {
+						response["activation"] = st
+					}
+				}
+			}
+		}
+	}
+
+	// Spec 044 (US3): expose launch_source + autostart_enabled. launch_source
+	// is the cached classifier result (no installer-clearing side-effect here
+	// — this endpoint is read-only). autostart_enabled reads the tray-owned
+	// sidecar with its 1h TTL; nil on Linux / tray not running / malformed.
+	response["launch_source"] = string(telemetry.DetectLaunchSourceOnce())
+	response["autostart_enabled"] = telemetry.DefaultAutostartReader().Read()
 
 	s.writeSuccess(w, response)
 }
@@ -859,6 +1056,23 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	// Get version from build info or environment
 	version := GetBuildVersion()
 
+	// Update information - refresh if requested
+	refresh := r.URL.Query().Get("refresh") == "true"
+	var versionInfo *updatecheck.VersionInfo
+	if refresh {
+		versionInfo = s.controller.RefreshVersionInfo()
+	} else {
+		versionInfo = s.controller.GetVersionInfo()
+	}
+	if versionInfo != nil && versionInfo.CurrentVersion != "" {
+		// The checker's current version is the ldflags build version for
+		// every packaged build, but for go-install builds it is promoted to
+		// the module version recorded in build info (Spec 079 US2) — the
+		// ldflags default would render "development" on the status/Web UI
+		// surfaces next to a real go-install update command.
+		version = versionInfo.CurrentVersion
+	}
+
 	response := map[string]interface{}{
 		"version":     version,
 		"web_ui_url":  webUIURL,
@@ -867,15 +1081,6 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 			"http":   listenAddr,
 			"socket": getSocketPath(), // Returns socket path if enabled, empty otherwise
 		},
-	}
-
-	// Add update information - refresh if requested
-	refresh := r.URL.Query().Get("refresh") == "true"
-	var versionInfo *updatecheck.VersionInfo
-	if refresh {
-		versionInfo = s.controller.RefreshVersionInfo()
-	} else {
-		versionInfo = s.controller.GetVersionInfo()
 	}
 	if versionInfo != nil {
 		response["update"] = versionInfo.ToAPIResponse()
@@ -924,7 +1129,7 @@ func (s *Server) buildWebUIURLWithAPIKey(listenAddr string, r *http.Request) str
 // buildVersion is set during build using -ldflags
 var buildVersion = "development"
 
-// editionValue identifies the MCPProxy edition (personal or teams).
+// editionValue identifies the MCPProxy edition (personal or server).
 var editionValue = "personal"
 
 // GetBuildVersion returns the build version from build-time variables.
@@ -985,26 +1190,20 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 		// Enrich with quarantine stats
 		s.enrichServersWithQuarantineStats(serverValues)
 
-		// Enrich with security scan summary (Spec 039)
-		if s.securityController != nil {
-			for i := range serverValues {
-				if summary := s.securityController.GetScanSummary(r.Context(), serverValues[i].Name); summary != nil {
-					serverValues[i].SecurityScan = &contracts.SecurityScanSummary{
-						LastScanAt: summary.LastScanAt,
-						RiskScore:  summary.RiskScore,
-						Status:     summary.Status,
-					}
-					if summary.FindingCounts != nil {
-						serverValues[i].SecurityScan.FindingCounts = &contracts.FindingCounts{
-							Dangerous: summary.FindingCounts.Dangerous,
-							Warning:   summary.FindingCounts.Warning,
-							Info:      summary.FindingCounts.Info,
-							Total:     summary.FindingCounts.Total,
-						}
-					}
-				}
-			}
-		}
+		// SecurityScan is now populated by management.ListServers via the
+		// SecurityScanEnricher wired in internal/server.NewServerWithConfigPath.
+		// Keeping the enrichment there means REST and the SSE servers.changed
+		// embed (which goes through runtime.buildServersChangedPayload →
+		// ListServers) share one site and can't drift out of parity.
+
+		// Redact sensitive header values unless explicitly opted out via
+		// `reveal_secret_headers: true` in config. The Web UI and macOS
+		// tray edit forms work without seeing the real values because
+		// PATCH /api/v1/servers/{id} deep-merges (omitted keys preserved),
+		// so they send only the diff — redacted-but-unchanged values
+		// stay out of the patch and the backend keeps the real string.
+		// See PR #425 for the original threat model.
+		s.redactServerHeaders(serverValues)
 
 		// Dereference stats pointer
 		var statsValue contracts.ServerStats
@@ -1034,6 +1233,9 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 	// Enrich with quarantine stats
 	s.enrichServersWithQuarantineStats(servers)
 
+	// See note above the management-service path for redaction rationale.
+	s.redactServerHeaders(servers)
+
 	stats := contracts.ConvertUpstreamStatsToServerStats(s.controller.GetUpstreamStats())
 
 	response := contracts.GetServersResponse{
@@ -1042,6 +1244,46 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeSuccess(w, response)
+}
+
+// flattenNullableMap turns a request-side `map[string]*string` (which uses
+// nil values to signal "delete" under JSON Merge Patch semantics) into the
+// `map[string]string` shape config.ServerConfig stores. Nil entries are
+// dropped — they have no meaning on POST (add) and are handled separately
+// by the deep-merge loop on PATCH.
+func flattenNullableMap(m map[string]*string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, vp := range m {
+		if vp != nil {
+			out[k] = *vp
+		}
+	}
+	return out
+}
+
+// redactServerHeaders walks each server in the slice and replaces sensitive
+// header values (Authorization, X-API-Key, Cookie, etc.) with `***REDACTED***`.
+// Skips redaction entirely when `reveal_secret_headers: true` is set in the
+// loaded config, matching the behaviour of the `upstream_servers` MCP tool.
+//
+// The UI edit-and-save flow works without seeing the real values because
+// PATCH /api/v1/servers/{id} deep-merges (omitted keys preserved), so the
+// client computes a diff and only sends the keys that actually changed.
+// Redacted-but-unchanged values never round-trip — the backend keeps the
+// real string on disk.
+func (s *Server) redactServerHeaders(servers []contracts.Server) {
+	cfg, err := s.controller.GetConfig()
+	if err == nil && cfg != nil && cfg.RevealSecretHeaders {
+		return
+	}
+	for i := range servers {
+		if len(servers[i].Headers) > 0 {
+			servers[i].Headers = oauth.RedactStringHeaders(servers[i].Headers)
+		}
+	}
 }
 
 // enrichServersWithQuarantineStats adds quarantine metrics (pending/changed tool counts)
@@ -1055,8 +1297,11 @@ func (s *Server) enrichServersWithQuarantineStats(servers []contracts.Server) {
 			continue
 		}
 
-		var pending, changed int
+		var pending, changed, blocked int
 		for _, rec := range records {
+			if rec.Disabled {
+				blocked++
+			}
 			switch rec.Status {
 			case storage.ToolApprovalStatusPending:
 				pending++
@@ -1065,28 +1310,108 @@ func (s *Server) enrichServersWithQuarantineStats(servers []contracts.Server) {
 			}
 		}
 
-		if pending > 0 || changed > 0 {
+		if pending > 0 || changed > 0 || blocked > 0 {
 			servers[i].Quarantine = &contracts.QuarantineStats{
 				PendingCount: pending,
 				ChangedCount: changed,
+				BlockedCount: blocked,
 			}
 		}
 	}
 }
 
-// AddServerRequest represents a request to add a new server
+// AddServerRequest represents a request to add a new server.
+//
+// PATCH semantics for the map-typed fields (`headers`, `env`) follow
+// JSON Merge Patch (RFC 7396):
+//   - A key present with a non-null value upserts that key on the
+//     stored map.
+//   - A key present with a JSON null value deletes that key.
+//   - A key absent from the request is preserved as-is.
+//
+// This lets the Web UI / macOS tray edit forms work without seeing
+// the real values of sensitive headers — the backend redacts them on
+// read, the client computes a diff against the redacted state, and
+// only keys that genuinely changed round-trip. Redacted-but-untouched
+// values stay out of the patch entirely, so the backend keeps the
+// real string on disk.
+//
+// The MCP `upstream_servers patch` tool uses the same `null = delete`
+// convention; the two interfaces are now in sync.
+//
+// `map[string]*string` is the canonical Go shape for this: encoding/json
+// decodes a missing key into no map entry, a present non-null value
+// into a non-nil `*string`, and a present `null` into a nil `*string`.
+//
+// POST (add) ignores nil entries — they have no meaning at create time.
 type AddServerRequest struct {
-	Name           string            `json:"name"`
-	URL            string            `json:"url,omitempty"`
-	Command        string            `json:"command,omitempty"`
-	Args           []string          `json:"args,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	WorkingDir     string            `json:"working_dir,omitempty"`
-	Protocol       string            `json:"protocol,omitempty"`
-	Enabled        *bool             `json:"enabled,omitempty"`
-	Quarantined    *bool             `json:"quarantined,omitempty"`
-	ReconnectOnUse *bool             `json:"reconnect_on_use,omitempty"`
+	Name           string             `json:"name"`
+	URL            string             `json:"url,omitempty"`
+	Command        string             `json:"command,omitempty"`
+	Args           []string           `json:"args,omitempty"`
+	Env            map[string]*string `json:"env,omitempty"`
+	Headers        map[string]*string `json:"headers,omitempty"`
+	WorkingDir     string             `json:"working_dir,omitempty"`
+	Protocol       string             `json:"protocol,omitempty"`
+	Enabled        *bool              `json:"enabled,omitempty"`
+	Quarantined    *bool              `json:"quarantined,omitempty"`
+	ReconnectOnUse *bool              `json:"reconnect_on_use,omitempty"`
+	// AutoApproveToolChanges is the per-server intent to auto-approve
+	// new/changed tools past the trust baseline (MCP-2930). Tri-state *bool:
+	// a nil pointer means "leave unchanged" on PATCH; a present value
+	// (including false) is applied. Mirrors config.ServerConfig's *bool
+	// semantics — do NOT collapse to a plain bool, or an omitted field would
+	// silently reset a previously-set value.
+	AutoApproveToolChanges *bool `json:"auto_approve_tool_changes,omitempty"`
+	// InitTimeout is the per-server MCP `initialize` handshake deadline override
+	// (MCP-3322 / GH #760), serialized as a duration string (e.g. "120s"). A nil
+	// pointer means "leave unchanged" on PATCH; a present value is applied.
+	// Mirrors config.ServerConfig.InitTimeout's *Duration tri-state.
+	InitTimeout *config.Duration `json:"init_timeout,omitempty" swaggertype:"string"`
+	// Isolation carries per-server Docker isolation overrides (image,
+	// network_mode, extra_args, working_dir, enabled). A nil pointer
+	// means "do not touch isolation config"; an empty-but-present
+	// object on PATCH intentionally clears the overrides.
+	Isolation *IsolationRequest `json:"isolation,omitempty"`
+}
+
+// IsolationRequest is the request-body representation of
+// config.IsolationConfig, using pointer fields for PATCH semantics:
+// a nil pointer means "leave this field alone", a present value
+// (including empty string or empty slice) means "set it".
+type IsolationRequest struct {
+	Enabled     *bool     `json:"enabled,omitempty"`
+	Image       *string   `json:"image,omitempty"`
+	NetworkMode *string   `json:"network_mode,omitempty"`
+	ExtraArgs   *[]string `json:"extra_args,omitempty"`
+	WorkingDir  *string   `json:"working_dir,omitempty"`
+}
+
+// toConfig materializes the request into a config.IsolationConfig.
+// Fields left nil on the request do not appear on the resulting struct
+// so UpdateServer's merge logic (in Controller) can distinguish them
+// from explicit clears.
+func (r *IsolationRequest) toConfig() *config.IsolationConfig {
+	if r == nil {
+		return nil
+	}
+	out := &config.IsolationConfig{}
+	if r.Enabled != nil {
+		out.Enabled = config.BoolPtr(*r.Enabled)
+	}
+	if r.Image != nil {
+		out.Image = *r.Image
+	}
+	if r.NetworkMode != nil {
+		out.NetworkMode = *r.NetworkMode
+	}
+	if r.ExtraArgs != nil {
+		out.ExtraArgs = append([]string(nil), (*r.ExtraArgs)...)
+	}
+	if r.WorkingDir != nil {
+		out.WorkingDir = *r.WorkingDir
+	}
+	return out
 }
 
 // handleAddServer godoc
@@ -1150,13 +1475,15 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 		quarantined = *req.Quarantined
 	}
 
+	// ADD ignores null entries — `null` is JSON Merge Patch's "delete"
+	// signal which has no meaning on create. Drop nils when flattening.
 	serverConfig := &config.ServerConfig{
 		Name:        req.Name,
 		URL:         req.URL,
 		Command:     req.Command,
 		Args:        req.Args,
-		Env:         req.Env,
-		Headers:     req.Headers,
+		Env:         flattenNullableMap(req.Env),
+		Headers:     flattenNullableMap(req.Headers),
 		WorkingDir:  req.WorkingDir,
 		Protocol:    protocol,
 		Enabled:     enabled,
@@ -1164,6 +1491,26 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ReconnectOnUse != nil {
 		serverConfig.ReconnectOnUse = *req.ReconnectOnUse
+	}
+	// MCP-2940: carry the per-server auto-approve intent through on create.
+	// *bool nil-preserve semantics: only set when the caller provided it.
+	if req.AutoApproveToolChanges != nil {
+		serverConfig.AutoApproveToolChanges = req.AutoApproveToolChanges
+	}
+	// MCP-3322: carry the per-server init_timeout override through on create.
+	if req.InitTimeout != nil {
+		serverConfig.InitTimeout = req.InitTimeout
+	}
+	// Carry the per-server Docker isolation override through on create. The
+	// AddServerRequest has always declared (and documented) an Isolation
+	// field, but only the PATCH/update path mapped it — on create it was
+	// silently dropped, so a caller could not, for example, opt a host-run
+	// stdio server OUT of isolation when global docker_isolation.enabled=true
+	// (the server would be forced into a container and fail to start). Mirror
+	// the update path's toConfig() mapping so the field means the same thing
+	// on both verbs.
+	if req.Isolation != nil {
+		serverConfig.Isolation = req.Isolation.toConfig()
 	}
 
 	// Add server via controller
@@ -1257,6 +1604,21 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-fetch existing server so we can preserve bool fields the request
+	// did not explicitly set. `config.ServerConfig` uses non-pointer bools
+	// whose zero value cannot be distinguished from "not set" by the time
+	// the update reaches the controller — without this, a PATCH body like
+	// `{"args": [...]}` silently disables a previously-enabled server.
+	var existingSrv *config.ServerConfig
+	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
+		for _, sc := range cfg.Servers {
+			if sc != nil && sc.Name == serverName {
+				existingSrv = sc
+				break
+			}
+		}
+	}
+
 	// Build partial update config - only set fields that were provided
 	updates := &config.ServerConfig{Name: serverName}
 	hasUpdates := false
@@ -1273,12 +1635,44 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		updates.Args = req.Args
 		hasUpdates = true
 	}
+	// PATCH semantics for headers and env follow JSON Merge Patch
+	// (RFC 7396): keys with a non-null value upsert, keys with a null
+	// value delete, omitted keys are preserved. This lets the Web UI /
+	// macOS tray / CLI send a minimal diff so redacted-but-unchanged
+	// values (returned by the GET path via `redactServerHeaders`)
+	// never round-trip through the client.
 	if req.Env != nil {
-		updates.Env = req.Env
+		merged := map[string]string{}
+		if existingSrv != nil {
+			for k, v := range existingSrv.Env {
+				merged[k] = v
+			}
+		}
+		for k, vp := range req.Env {
+			if vp == nil {
+				delete(merged, k)
+			} else {
+				merged[k] = *vp
+			}
+		}
+		updates.Env = merged
 		hasUpdates = true
 	}
 	if req.Headers != nil {
-		updates.Headers = req.Headers
+		merged := map[string]string{}
+		if existingSrv != nil {
+			for k, v := range existingSrv.Headers {
+				merged[k] = v
+			}
+		}
+		for k, vp := range req.Headers {
+			if vp == nil {
+				delete(merged, k)
+			} else {
+				merged[k] = *vp
+			}
+		}
+		updates.Headers = merged
 		hasUpdates = true
 	}
 	if req.WorkingDir != "" {
@@ -1292,13 +1686,43 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		updates.Enabled = *req.Enabled
 		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.Enabled = existingSrv.Enabled
 	}
 	if req.Quarantined != nil {
 		updates.Quarantined = *req.Quarantined
 		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.Quarantined = existingSrv.Quarantined
 	}
 	if req.ReconnectOnUse != nil {
 		updates.ReconnectOnUse = *req.ReconnectOnUse
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.ReconnectOnUse = existingSrv.ReconnectOnUse
+	}
+	// MCP-2940: auto_approve_tool_changes is a tri-state *bool, so unlike the
+	// non-pointer bools above we preserve the EXISTING POINTER (which may be
+	// nil = "never set") when the request omits the field — collapsing to a
+	// plain bool here would erase the unset/false distinction the trust-baseline
+	// logic (MCP-2931) relies on.
+	if req.AutoApproveToolChanges != nil {
+		updates.AutoApproveToolChanges = req.AutoApproveToolChanges
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.AutoApproveToolChanges = existingSrv.AutoApproveToolChanges
+	}
+	// MCP-3322: init_timeout is a tri-state *Duration — preserve the existing
+	// pointer when the request omits it so an unrelated PATCH doesn't wipe a
+	// configured deadline.
+	if req.InitTimeout != nil {
+		updates.InitTimeout = req.InitTimeout
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.InitTimeout = existingSrv.InitTimeout
+	}
+	if req.Isolation != nil {
+		updates.Isolation = req.Isolation.toConfig()
 		hasUpdates = true
 	}
 
@@ -1323,6 +1747,165 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	s.writeSuccess(w, map[string]interface{}{
 		"message":          fmt.Sprintf("Server '%s' updated successfully", serverName),
 		"restart_required": true,
+	})
+}
+
+// handleConvertConfigToSecret moves a literal header / env value out of
+// `mcp_config.json` and into the OS keyring, atomically. The client never
+// needs to see the real value — useful when the API redacts sensitive
+// header values on the GET path. The body is:
+//
+//	{"scope": "header" | "env", "key": "Authorization", "secret_name": "synapbus-auth"}
+//
+// On success the server config is updated with the reference string
+// `${keyring:<secret_name>}` and the response carries the same reference
+// so the UI can render the keyring chip immediately without a refetch.
+//
+// @Summary Convert a header / env value to a keyring secret
+// @Description Atomically reads the real value from the server config, stores it in the OS keyring, and rewrites the config field to `${keyring:<name>}`. Unblocks the UI's Convert-to-secret affordance for values the API redacts on the read path.
+// @Tags servers
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Param id path string true "Server ID or name"
+// @Success 200 {object} map[string]interface{} "Secret stored, config updated with reference"
+// @Failure 400 {object} contracts.ErrorResponse "Bad scope/key/secret_name, or value is already a reference / empty"
+// @Failure 404 {object} contracts.ErrorResponse "Server or key not found"
+// @Failure 500 {object} contracts.ErrorResponse "Secret resolver or config update failed"
+// @Router /api/v1/servers/{id}/config-to-secret [post]
+func (s *Server) handleConvertConfigToSecret(w http.ResponseWriter, r *http.Request) {
+	serverName := chi.URLParam(r, "id")
+	if serverName == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Server ID required")
+		return
+	}
+
+	var req struct {
+		Scope      string `json:"scope"`
+		Key        string `json:"key"`
+		SecretName string `json:"secret_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.Scope != "header" && req.Scope != "env" {
+		s.writeError(w, r, http.StatusBadRequest, `"scope" must be "header" or "env"`)
+		return
+	}
+	if req.Key == "" {
+		s.writeError(w, r, http.StatusBadRequest, `"key" is required`)
+		return
+	}
+	if req.SecretName == "" {
+		s.writeError(w, r, http.StatusBadRequest, `"secret_name" is required`)
+		return
+	}
+
+	// Look up the real value from the current loaded config — the
+	// API-redacted view that the client just saw is not the source of
+	// truth.
+	cfg, err := s.controller.GetConfig()
+	if err != nil || cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Configuration not available")
+		return
+	}
+	var sc *config.ServerConfig
+	for _, c := range cfg.Servers {
+		if c != nil && c.Name == serverName {
+			sc = c
+			break
+		}
+	}
+	if sc == nil {
+		s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("server %q not found", serverName))
+		return
+	}
+
+	var value string
+	var present bool
+	if req.Scope == "header" {
+		value, present = sc.Headers[req.Key]
+	} else {
+		value, present = sc.Env[req.Key]
+	}
+	if !present {
+		s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("%s %q not found on server %q", req.Scope, req.Key, serverName))
+		return
+	}
+	if value == "" {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("%s %q has no value to store", req.Scope, req.Key))
+		return
+	}
+	if strings.HasPrefix(value, "${keyring:") || strings.HasPrefix(value, "${env:") {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("%s %q is already a reference (%s); nothing to convert", req.Scope, req.Key, value))
+		return
+	}
+
+	resolver := s.controller.GetSecretResolver()
+	if resolver == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Secret resolver not available")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	// Store first, then patch. If the keyring write fails, the config is
+	// unchanged. If the keyring write succeeds and the patch fails, the
+	// secret is in the keyring under a name that's not yet referenced —
+	// the operator can either delete it or retry. We log the partial
+	// state so it's traceable.
+	ref := secret.Ref{Type: secretTypeKeyring, Name: req.SecretName}
+	if err := resolver.Store(ctx, ref, value); err != nil {
+		s.logger.Error("config-to-secret: keyring store failed",
+			"server", serverName, "scope", req.Scope, "key", req.Key, "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("failed to store secret: %v", err))
+		return
+	}
+	referenceStr := fmt.Sprintf("${%s:%s}", secretTypeKeyring, req.SecretName)
+
+	// Apply the swap as a deep-merge PATCH so we don't touch any other
+	// keys on the server. Build the updates map with just the one field
+	// we care about.
+	updates := &config.ServerConfig{Name: serverName}
+	if req.Scope == "header" {
+		merged := map[string]string{}
+		for k, v := range sc.Headers {
+			merged[k] = v
+		}
+		merged[req.Key] = referenceStr
+		updates.Headers = merged
+	} else {
+		merged := map[string]string{}
+		for k, v := range sc.Env {
+			merged[k] = v
+		}
+		merged[req.Key] = referenceStr
+		updates.Env = merged
+	}
+	// Preserve existing bool fields so the partial config doesn't reset them.
+	updates.Enabled = sc.Enabled
+	updates.Quarantined = sc.Quarantined
+	updates.ReconnectOnUse = sc.ReconnectOnUse
+
+	if err := s.controller.UpdateServer(ctx, serverName, updates); err != nil {
+		s.logger.Error("config-to-secret: keyring write succeeded but config update failed; secret is stored but not referenced",
+			"server", serverName, "scope", req.Scope, "key", req.Key, "secret_name", req.SecretName, "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("secret stored as %q but config update failed: %v", req.SecretName, err))
+		return
+	}
+
+	// Wake any servers that depend on the new secret. Best-effort.
+	if err := s.controller.NotifySecretsChanged(ctx, "store", req.SecretName); err != nil {
+		s.logger.Warn("config-to-secret: failed to notify runtime of secret change",
+			"name", req.SecretName, "error", err)
+	}
+
+	s.writeSuccess(w, map[string]interface{}{
+		"message":   fmt.Sprintf("%s %q on %q now references keyring secret %q", req.Scope, req.Key, serverName, req.SecretName),
+		"reference": referenceStr,
 	})
 }
 
@@ -2045,26 +2628,8 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to typed tools
-	typedTools := contracts.ConvertGenericToolsToTyped(tools)
-
-	// Enrich with approval status from storage
-	enrichedCount := 0
-	var firstErr error
-	for i := range typedTools {
-		status, err := s.controller.GetToolApprovalStatus(serverID, typedTools[i].Name)
-		if err == nil && status != "" {
-			typedTools[i].ApprovalStatus = status
-			enrichedCount++
-		} else if i == 0 {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		fmt.Printf("[DEBUG] Tool approval enrichment: server=%s enriched=%d/%d first_error=%v\n", serverID, enrichedCount, len(typedTools), firstErr)
-	} else {
-		fmt.Printf("[DEBUG] Tool approval enrichment: server=%s enriched=%d/%d\n", serverID, enrichedCount, len(typedTools))
-	}
+	// Convert + enrich (shared with the global tools endpoint, spec 050).
+	typedTools := s.enrichServerTools(serverID, tools)
 
 	// Sort: pending/changed tools first, then approved
 	sort.SliceStable(typedTools, func(i, j int) bool {
@@ -2078,6 +2643,135 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeSuccess(w, response)
+}
+
+// enrichServerTools converts generic upstream tools to typed tools and enriches
+// each with approval status, per-tool disabled state, and config-denied state.
+// Shared by the per-server tools endpoint and the global tools endpoint
+// (spec 050). ServerName is forced to serverID so the global merge can attribute
+// every tool to its server even if the upstream payload omits server_name.
+func (s *Server) enrichServerTools(serverID string, tools []map[string]interface{}) []contracts.Tool {
+	typedTools := contracts.ConvertGenericToolsToTyped(tools)
+
+	type configDeniedChecker interface {
+		IsToolConfigDenied(serverName, toolName string) bool
+	}
+	configChecker, hasConfigChecker := s.controller.(configDeniedChecker)
+
+	enrichedCount := 0
+	var firstErr error
+	for i := range typedTools {
+		typedTools[i].ServerName = serverID
+		record, err := s.controller.GetToolApproval(serverID, typedTools[i].Name)
+		if err == nil && record != nil {
+			typedTools[i].ApprovalStatus = record.Status
+			typedTools[i].Disabled = record.Disabled
+			enrichedCount++
+		} else if i == 0 {
+			firstErr = err
+		}
+		if hasConfigChecker {
+			typedTools[i].ConfigDenied = configChecker.IsToolConfigDenied(serverID, typedTools[i].Name)
+		}
+	}
+	if firstErr != nil {
+		s.logger.Debug("Tool approval enrichment partial", "server", serverID, "enriched", enrichedCount, "total", len(typedTools), "error", firstErr)
+	}
+	return typedTools
+}
+
+// globalToolsUsageWindow is the fixed look-back window for the usage columns on
+// the global tools page (spec 050). Not user-configurable in v1.
+const globalToolsUsageWindow = 30 * 24 * time.Hour
+
+// handleGetGlobalTools godoc
+// @Summary List every tool across all servers
+// @Description Consolidated, read-only listing of all tools from every configured server (including disabled servers and disabled/config-denied tools), enriched with approval state and 30-day usage. Backs the global Tools page and the CLI global `tools list` (spec 050, issue #437).
+// @Tags tools
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Success 200 {object} contracts.GlobalToolsResponse "All tools across all servers"
+// @Failure 500 {object} contracts.ErrorResponse "Could not enumerate servers"
+// @Router /api/v1/tools [get]
+func (s *Server) handleGetGlobalTools(w http.ResponseWriter, r *http.Request) {
+	allServers, err := s.controller.GetAllServers()
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to enumerate servers")
+		return
+	}
+
+	// Usage rollup is a single bounded pass over the activity log; a failure
+	// here must not fail the whole page — usage columns just stay zero.
+	usage, usageErr := s.controller.AggregateToolUsage(time.Now().Add(-globalToolsUsageWindow))
+	if usageErr != nil {
+		s.logger.Warn("Global tools: usage aggregation failed, continuing without usage", "error", usageErr)
+		usage = map[string]storage.ToolUsageStat{}
+	}
+
+	// Use the same management-service path as the per-server tools endpoint so
+	// behaviour is consistent: a disabled / not-connected server returns an
+	// empty tool set (NOT an error), so it contributes zero tools without
+	// being mislabelled as a failed server. Fall back to the controller path
+	// when the management service is unavailable (keeps unit tests + minimal
+	// deployments working).
+	mgmtSvc, hasMgmt := s.controller.GetManagementService().(interface {
+		GetServerTools(ctx context.Context, name string) ([]map[string]interface{}, error)
+	})
+	getTools := func(name string) ([]map[string]interface{}, error) {
+		if hasMgmt {
+			return mgmtSvc.GetServerTools(r.Context(), name)
+		}
+		return s.controller.GetServerTools(name)
+	}
+
+	resp := contracts.GlobalToolsResponse{
+		Tools: make([]contracts.Tool, 0, 256),
+	}
+
+	for _, srv := range allServers {
+		name, _ := srv["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		generic, terr := getTools(name)
+		if terr != nil {
+			// Spec edge case: a genuine fetch error — still return every tool
+			// we could gather, flag the rest as partial.
+			resp.Partial = true
+			resp.FailedServers = append(resp.FailedServers, name)
+			s.logger.Debug("Global tools: server tools fetch failed", "server", name, "error", terr)
+			continue
+		}
+
+		typed := s.enrichServerTools(name, generic)
+		for i := range typed {
+			if st, ok := usage[name+"\x00"+typed[i].Name]; ok {
+				typed[i].Usage = st.Count
+				if !st.LastUsed.IsZero() {
+					lu := st.LastUsed
+					typed[i].LastUsed = &lu
+				}
+			}
+		}
+		resp.Tools = append(resp.Tools, typed...)
+	}
+
+	for i := range resp.Tools {
+		t := &resp.Tools[i]
+		resp.Stats.Total++
+		if t.Disabled || t.ConfigDenied {
+			resp.Stats.Disabled++
+		} else {
+			resp.Stats.Enabled++
+		}
+		if t.ApprovalStatus == storage.ToolApprovalStatusPending || t.ApprovalStatus == storage.ToolApprovalStatusChanged {
+			resp.Stats.PendingApproval++
+		}
+	}
+
+	s.writeSuccess(w, resp)
 }
 
 // handleGetServerLogs godoc
@@ -2095,6 +2789,9 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} contracts.ErrorResponse "Internal server error"
 // @Router /api/v1/servers/{id}/logs [get]
 func (s *Server) handleGetServerLogs(w http.ResponseWriter, r *http.Request) {
+	// The {id} param is percent-decoded by decodeServerIDParam middleware on the
+	// /servers/{id} subtree (MCP-1118), so a namespace/name server id such as
+	// io.github.evidai/polymarket-guard reaches us already unescaped.
 	serverID := chi.URLParam(r, "id")
 	if serverID == "" {
 		s.writeError(w, r, http.StatusBadRequest, "Server ID required")
@@ -3169,6 +3866,174 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 	s.writeSuccess(w, response)
 }
 
+// handlePatchDockerIsolation godoc
+// @Summary      Toggle global Docker isolation
+// @Description  Convenience endpoint to flip `docker_isolation.enabled` without resending the full config. Persists to disk via the existing config writer — the file watcher then hot-reloads the change. Returns the new state and whether a restart is required for existing connections to pick it up.
+// @Tags         config
+// @Accept       json
+// @Produce      json
+// @Param        payload  body      object{enabled=bool}          true  "New isolation state"
+// @Success      200      {object}  contracts.ConfigApplyResult   "Isolation toggle applied"
+// @Failure      400      {object}  contracts.ErrorResponse       "Invalid JSON payload"
+// @Failure      401      {object}  contracts.ErrorResponse       "Unauthorized - missing or invalid API key"
+// @Failure      500      {object}  contracts.ErrorResponse       "Failed to apply configuration"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/config/docker-isolation [patch]
+func (s *Server) handlePatchDockerIsolation(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
+		return
+	}
+	if payload.Enabled == nil {
+		s.writeError(w, r, http.StatusBadRequest, "Field 'enabled' is required")
+		return
+	}
+
+	// Fetch current config, mutate the single field, and push it back through
+	// the existing apply pipeline so we benefit from validation, change
+	// detection, disk persistence, and hot-reload without duplicating any of
+	// that logic here.
+	cfg, err := s.controller.GetConfig()
+	if err != nil {
+		s.logger.Error("Failed to get configuration for docker-isolation patch", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	if cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Configuration not available")
+		return
+	}
+
+	if cfg.DockerIsolation == nil {
+		cfg.DockerIsolation = config.DefaultDockerIsolationConfig()
+	}
+	cfg.DockerIsolation.Enabled = *payload.Enabled
+
+	cfgPath := s.controller.GetConfigPath()
+	result, err := s.controller.ApplyConfig(cfg, cfgPath)
+	if err != nil {
+		s.logger.Error("Failed to apply docker-isolation toggle", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		return
+	}
+
+	response := &contracts.ConfigApplyResult{
+		Success:            result.Success,
+		AppliedImmediately: result.AppliedImmediately,
+		RequiresRestart:    result.RequiresRestart,
+		RestartReason:      result.RestartReason,
+		ChangedFields:      result.ChangedFields,
+		ValidationErrors:   contracts.ConvertValidationErrors(result.ValidationErrors),
+	}
+	s.writeSuccess(w, response)
+}
+
+// handlePatchConfig godoc
+// @Summary      Partially update configuration
+// @Description  Deep-merges only the fields present in the request body onto the live in-memory configuration and routes the result through the existing apply pipeline (validation, change detection, disk persistence, hot-reload). Fields the client omits — including masked secrets such as `api_key` and secret request headers — are preserved verbatim. Nested objects are merged recursively; arrays and scalars replace wholesale.
+// @Tags         config
+// @Accept       json
+// @Produce      json
+// @Param        patch  body      object                        true  "Partial configuration with only the fields to change"
+// @Success      200    {object}  contracts.ConfigApplyResult   "Configuration patch applied (inspect validation_errors for rejected values)"
+// @Failure      400    {object}  contracts.ErrorResponse       "Invalid JSON payload or empty patch"
+// @Failure      401    {object}  contracts.ErrorResponse       "Unauthorized - missing or invalid API key"
+// @Failure      500    {object}  contracts.ErrorResponse       "Failed to read or apply configuration"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/config [patch]
+func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
+	var patchMap map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&patchMap); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
+		return
+	}
+	if len(patchMap) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "Patch body must contain at least one field")
+		return
+	}
+
+	// Read the REAL in-memory config (secrets intact — redaction only happens
+	// on the GET response path). We deep-merge only the client-sent keys so
+	// untouched fields, including masked secrets, are preserved verbatim.
+	cfg, err := s.controller.GetConfig()
+	if err != nil {
+		s.logger.Error("Failed to get configuration for patch", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	if cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Configuration not available")
+		return
+	}
+
+	// Round-trip the live config through JSON to get a generic map we can
+	// deep-merge the patch onto without enumerating every field.
+	baseBytes, err := json.Marshal(cfg)
+	if err != nil {
+		s.logger.Error("Failed to marshal live configuration", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	var baseMap map[string]interface{}
+	if err := json.Unmarshal(baseBytes, &baseMap); err != nil {
+		s.logger.Error("Failed to unmarshal live configuration", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+
+	deepMergeJSON(baseMap, patchMap)
+
+	mergedBytes, err := json.Marshal(baseMap)
+	if err != nil {
+		s.logger.Error("Failed to marshal merged configuration", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to build configuration")
+		return
+	}
+	var merged config.Config
+	if err := json.Unmarshal(mergedBytes, &merged); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid configuration patch: %v", err))
+		return
+	}
+
+	result, err := s.controller.ApplyConfig(&merged, s.controller.GetConfigPath())
+	if err != nil {
+		s.logger.Error("Failed to apply configuration patch", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		return
+	}
+
+	response := &contracts.ConfigApplyResult{
+		Success:            result.Success,
+		AppliedImmediately: result.AppliedImmediately,
+		RequiresRestart:    result.RequiresRestart,
+		RestartReason:      result.RestartReason,
+		ChangedFields:      result.ChangedFields,
+		ValidationErrors:   contracts.ConvertValidationErrors(result.ValidationErrors),
+	}
+	s.writeSuccess(w, response)
+}
+
+// deepMergeJSON recursively merges patch into base. When both base[k] and
+// patch[k] are JSON objects (map[string]interface{}), they are merged
+// recursively; otherwise patch[k] overwrites base[k] (arrays and scalars
+// replace wholesale). Keys present only in base are preserved.
+func deepMergeJSON(base, patch map[string]interface{}) {
+	for k, patchVal := range patch {
+		patchSub, patchIsMap := patchVal.(map[string]interface{})
+		baseSub, baseIsMap := base[k].(map[string]interface{})
+		if patchIsMap && baseIsMap {
+			deepMergeJSON(baseSub, patchSub)
+			continue
+		}
+		base[k] = patchVal
+	}
+}
+
 // handleCallTool godoc
 // @Summary Call a tool
 // @Description Execute a tool on an upstream MCP server (wrapper around MCP tool calls)
@@ -3255,6 +4120,11 @@ func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 			ServersURL:  getString(regMap, "servers_url"),
 			Protocol:    getString(regMap, "protocol"),
 			Count:       regMap["count"],
+			// MCP-1072: normalize legacy provenance strings on read so the REST
+			// surface always emits the two-value vocabulary and trusted is derived
+			// from it.
+			Provenance: config.NormalizeRegistryProvenance(getString(regMap, "provenance")),
+			Trusted:    config.NormalizeRegistryProvenance(getString(regMap, "provenance")) == config.RegistryProvenanceOfficial,
 		}
 
 		if tags, ok := regMap["tags"].([]interface{}); ok {
@@ -3312,8 +4182,22 @@ func (s *Server) handleSearchRegistryServers(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	servers, err := s.controller.SearchRegistryServers(registryID, tag, query, limit)
+	servers, cacheInfo, err := s.controller.SearchRegistryServers(registryID, tag, query, limit)
 	if err != nil {
+		// FR-008: a registry that needs an unconfigured key is not an error —
+		// return an empty result marked unavailable so the overall search still
+		// succeeds and the unavailability is visible.
+		if errors.Is(err, registries.ErrRegistryKeyMissing) {
+			s.writeSuccess(w, contracts.SearchRegistryServersResponse{
+				RegistryID:  registryID,
+				Servers:     []contracts.RepositoryServer{},
+				Total:       0,
+				Query:       query,
+				Tag:         tag,
+				Unavailable: &contracts.RegistryUnavailable{Reason: err.Error()},
+			})
+			return
+		}
 		s.logger.Error("Failed to search registry servers", "registry", registryID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to search servers: %v", err))
 		return
@@ -3361,9 +4245,319 @@ func (s *Server) handleSearchRegistryServers(w http.ResponseWriter, r *http.Requ
 		Total:      len(contractServers),
 		Query:      query,
 		Tag:        tag,
+		Cache:      cacheInfo,
 	}
 
 	s.writeSuccess(w, response)
+}
+
+// handleAddFromRegistry godoc
+// @Summary      Add an upstream server from a registry reference
+// @Description  Resolves a registry server reference server-side, re-derives a validated config, and persists it quarantined (spec 070 keystone). The client never sends a config blob — command/args/url and the quarantine flag are derived from the registry entry, not the request.
+// @Tags         registries
+// @Accept       json
+// @Produce      json
+// @Param        id        path      string                            true   "Registry ID"
+// @Param        serverId  path      string                            true   "Server ID within the registry"
+// @Param        body      body      contracts.AddFromRegistryRequest  false  "Optional overrides (name, env, enabled)"
+// @Success      200       {object}  contracts.SuccessResponse         "Server added (quarantined)"
+// @Failure      400       {object}  contracts.ErrorResponse           "no_install_info | missing_required_input | duplicate_name"
+// @Failure      404       {object}  contracts.ErrorResponse           "registry_not_found | server_not_found"
+// @Failure      500       {object}  contracts.ErrorResponse           "Internal server error"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/registries/{id}/servers/{serverId}/add [post]
+// decodePathParam percent-decodes a chi path parameter. chi matches routes on
+// the raw (encoded) path, so parameters that legitimately contain reserved
+// characters such as "/" (encoded as %2F) arrive encoded. On a malformed escape
+// sequence it returns the original value unchanged so the downstream lookup can
+// surface a normal not-found rather than a decode panic.
+func decodePathParam(raw string) string {
+	if decoded, err := url.PathUnescape(raw); err == nil {
+		return decoded
+	}
+	return raw
+}
+
+// decodeServerIDParam percent-decodes the {id} path param of the /servers/{id}
+// route subtree in place. chi matches the parent /servers/{id} segment (and thus
+// populates "id") before mounting this subrouter, so the value is available to
+// this middleware. Slash-name servers (io.github.owner/repo) arrive as
+// io.github.owner%2Frepo; decoding here makes every sub-resource handler's
+// exact-match server lookup work without each one having to call
+// decodePathParam (MCP-1118).
+func decodeServerIDParam(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rctx := chi.RouteContext(r.Context()); rctx != nil {
+			for i, k := range rctx.URLParams.Keys {
+				if k == "id" {
+					rctx.URLParams.Values[i] = decodePathParam(rctx.URLParams.Values[i])
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleAddFromRegistry(w http.ResponseWriter, r *http.Request) {
+	// chi routes on RawPath, so path params arrive percent-encoded. Official
+	// modelcontextprotocol/registry v0.1 ids are namespace/name, so the slash
+	// reaches us as %2F and must be decoded before the exact-match registry
+	// lookup, otherwise every namespaced server is un-addable (MCP-1056).
+	registryID := decodePathParam(chi.URLParam(r, "id"))
+	serverID := decodePathParam(chi.URLParam(r, "serverId"))
+	if registryID == "" || serverID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "registry id and server id are required")
+		return
+	}
+
+	// Body is optional: missing/empty body means "no overrides".
+	var req contracts.AddFromRegistryRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+			return
+		}
+	}
+
+	logger := s.getRequestLogger(r)
+	cfg, rerr, err := s.controller.AddServerFromRegistryRef(r.Context(), registryID, serverID, req.Name, req.Env, req.Enabled)
+	if err != nil {
+		status := registryAddErrorStatus(rerr.Code)
+		if status >= http.StatusInternalServerError {
+			logger.Error("Add from registry failed", "registry", registryID, "server", serverID, "error", err)
+		}
+		s.writeRegistryAddError(w, r, status, rerr)
+		return
+	}
+
+	s.writeSuccess(w, contracts.AddFromRegistryData{
+		Server: contracts.AddedServerSummary{
+			Name:        cfg.Name,
+			Protocol:    cfg.Protocol,
+			Command:     cfg.Command,
+			Args:        cfg.Args,
+			URL:         cfg.URL,
+			Enabled:     cfg.Enabled,
+			Quarantined: cfg.Quarantined,
+		},
+	})
+}
+
+// handleAddRegistrySource godoc
+// @Summary      Add a user-supplied registry source
+// @Description  Adds a generic modelcontextprotocol/registry v0.1 https endpoint as a custom registry (MCP-866). The source is always tagged custom/unverified, so every server discovered through it lands quarantined and can never skip quarantine.
+// @Tags         registries
+// @Accept       json
+// @Produce      json
+// @Param        body  body      contracts.AddRegistrySourceRequest  true  "Registry source (https url + optional protocol/id/name)"
+// @Success      200   {object}  contracts.SuccessResponse           "Registry source added"
+// @Failure      400   {object}  contracts.ErrorResponse             "invalid_registry_url"
+// @Failure      403   {object}  contracts.ErrorResponse             "registries_locked"
+// @Failure      409   {object}  contracts.ErrorResponse             "registry_shadows_builtin | duplicate_registry"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/registries [post]
+func (s *Server) handleAddRegistrySource(w http.ResponseWriter, r *http.Request) {
+	var req contracts.AddRegistrySourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+	if req.URL == "" {
+		s.writeError(w, r, http.StatusBadRequest, "url is required")
+		return
+	}
+
+	logger := s.getRequestLogger(r)
+	entry, rerr, err := s.controller.AddRegistrySourceRef(req.URL, req.Protocol, req.ID, req.Name)
+	if err != nil {
+		status := registryAddErrorStatus(rerr.Code)
+		if status >= http.StatusInternalServerError {
+			logger.Error("Add registry source failed", "url", req.URL, "error", err)
+		}
+		s.writeRegistryAddError(w, r, status, rerr)
+		return
+	}
+
+	s.writeSuccess(w, contracts.AddRegistrySourceData{
+		Registry: contracts.RegistrySummary{
+			ID:         entry.ID,
+			Name:       entry.Name,
+			URL:        entry.URL,
+			ServersURL: entry.ServersURL,
+			Protocol:   entry.Protocol,
+			Provenance: entry.Provenance,
+			Trusted:    entry.IsTrusted(),
+		},
+	})
+}
+
+// handleRemoveRegistrySource godoc
+// @Summary      Remove a user-added custom registry source
+// @Description  Removes a custom/unverified registry previously added via add-source (MCP-1057). Built-in registries are refused with registry_shadows_builtin; an unknown id yields registry_not_found. The change is persisted copy-on-write.
+// @Tags         registries
+// @Produce      json
+// @Param        id   path      string  true  "Registry ID"
+// @Success      200  {object}  contracts.SuccessResponse  "Registry source removed"
+// @Failure      400  {object}  contracts.ErrorResponse    "Registry ID is required"
+// @Failure      403  {object}  contracts.ErrorResponse    "registries_locked"
+// @Failure      404  {object}  contracts.ErrorResponse    "registry_not_found"
+// @Failure      409  {object}  contracts.ErrorResponse    "registry_shadows_builtin"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/registries/{id} [delete]
+func (s *Server) handleRemoveRegistrySource(w http.ResponseWriter, r *http.Request) {
+	registryID := chi.URLParam(r, "id")
+	if registryID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Registry ID is required")
+		return
+	}
+
+	logger := s.getRequestLogger(r)
+	entry, rerr, err := s.controller.RemoveRegistrySourceRef(registryID)
+	if err != nil {
+		status := registryAddErrorStatus(rerr.Code)
+		if status >= http.StatusInternalServerError {
+			logger.Error("Remove registry source failed", "id", registryID, "error", err)
+		}
+		s.writeRegistryAddError(w, r, status, rerr)
+		return
+	}
+
+	s.writeSuccess(w, contracts.RemoveRegistrySourceData{
+		Registry: contracts.RegistrySummary{
+			ID:         entry.ID,
+			Name:       entry.Name,
+			URL:        entry.URL,
+			ServersURL: entry.ServersURL,
+			Protocol:   entry.Protocol,
+			Provenance: entry.Provenance,
+			Trusted:    entry.IsTrusted(),
+		},
+	})
+}
+
+// handleEditRegistrySource godoc
+// @Summary      Edit a user-added custom registry source
+// @Description  Updates a custom registry previously added via add-source (MCP-1072): name, url, servers-url. Empty fields are left unchanged. Built-in registries are refused with registry_shadows_builtin; an unknown id yields registry_not_found; a non-https url yields invalid_registry_url. The change is persisted copy-on-write.
+// @Tags         registries
+// @Accept       json
+// @Produce      json
+// @Param        id    path      string                               true  "Registry ID"
+// @Param        body  body      contracts.EditRegistrySourceRequest  true  "Fields to update (name/url/servers_url; empty = unchanged)"
+// @Success      200   {object}  contracts.SuccessResponse            "Registry source updated"
+// @Failure      400   {object}  contracts.ErrorResponse              "Registry ID is required | invalid_registry_url"
+// @Failure      403   {object}  contracts.ErrorResponse              "registries_locked"
+// @Failure      404   {object}  contracts.ErrorResponse              "registry_not_found"
+// @Failure      409   {object}  contracts.ErrorResponse              "registry_shadows_builtin"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/registries/{id} [put]
+func (s *Server) handleEditRegistrySource(w http.ResponseWriter, r *http.Request) {
+	registryID := chi.URLParam(r, "id")
+	if registryID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Registry ID is required")
+		return
+	}
+
+	var req contracts.EditRegistrySourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+
+	logger := s.getRequestLogger(r)
+	entry, rerr, err := s.controller.EditRegistrySourceRef(registryID, req.Name, req.URL, req.ServersURL)
+	if err != nil {
+		status := registryAddErrorStatus(rerr.Code)
+		if status >= http.StatusInternalServerError {
+			logger.Error("Edit registry source failed", "id", registryID, "error", err)
+		}
+		s.writeRegistryAddError(w, r, status, rerr)
+		return
+	}
+
+	s.writeSuccess(w, contracts.EditRegistrySourceData{
+		Registry: contracts.RegistrySummary{
+			ID:         entry.ID,
+			Name:       entry.Name,
+			URL:        entry.URL,
+			ServersURL: entry.ServersURL,
+			Protocol:   entry.Protocol,
+			Provenance: entry.Provenance,
+			Trusted:    entry.IsTrusted(),
+		},
+	})
+}
+
+// handleRefreshRegistryCache godoc
+// @Summary      Refresh a registry's cached server list
+// @Description  Invalidates the cached server lists for a registry so the next search re-fetches fresh data from the source (spec 070 FR-007). Returns how many cache entries were dropped.
+// @Tags         registries
+// @Produce      json
+// @Param        id   path      string  true  "Registry ID"
+// @Success      200  {object}  contracts.RefreshRegistryResponse  "Registry cache refreshed"
+// @Failure      400  {object}  contracts.ErrorResponse            "Registry ID is required"
+// @Failure      500  {object}  contracts.ErrorResponse            "Failed to refresh registry cache"
+// @Router       /api/v1/registries/{id}/refresh [post]
+func (s *Server) handleRefreshRegistryCache(w http.ResponseWriter, r *http.Request) {
+	registryID := chi.URLParam(r, "id")
+	if registryID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Registry ID is required")
+		return
+	}
+
+	cleared, err := s.controller.RefreshRegistryCache(registryID)
+	if err != nil {
+		s.logger.Error("Failed to refresh registry cache", "registry", registryID, "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to refresh registry cache: %v", err))
+		return
+	}
+
+	s.writeSuccess(w, contracts.RefreshRegistryResponse{
+		RegistryID: registryID,
+		Cleared:    cleared,
+	})
+}
+
+// registryAddErrorStatus maps a stable add-from-registry error code to its HTTP
+// status (spec 070 contract). An unknown/empty code is an internal error.
+func registryAddErrorStatus(code string) int {
+	switch code {
+	case "registry_not_found", "server_not_found":
+		return http.StatusNotFound
+	case "no_install_info", "missing_required_input", "duplicate_name", "invalid_registry_url",
+		"registry_source_unusable", "unsupported_registry_protocol":
+		return http.StatusBadRequest
+	case "registries_locked":
+		return http.StatusForbidden
+	case "registry_shadows_builtin", "duplicate_registry":
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// writeRegistryAddError writes the structured cross-surface error envelope so
+// every surface can read the same stable `code` and (for missing inputs) the
+// exact keys to supply.
+func (s *Server) writeRegistryAddError(w http.ResponseWriter, r *http.Request, status int, rerr *contracts.RegistryAddError) {
+	requestID := reqcontext.GetRequestID(r.Context())
+	body := struct {
+		Success       bool     `json:"success"`
+		Error         string   `json:"error"`
+		Code          string   `json:"code"`
+		MissingInputs []string `json:"missing_inputs,omitempty"`
+		RequestID     string   `json:"request_id,omitempty"`
+	}{
+		Success:       false,
+		Error:         rerr.Message,
+		Code:          rerr.Code,
+		MissingInputs: rerr.MissingInputs,
+		RequestID:     requestID,
+	}
+	s.writeJSON(w, status, body)
 }
 
 // Helper functions for type conversion
@@ -3505,8 +4699,24 @@ func (s *Server) handleGetDockerStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Report GENUINE daemon availability from a real probe, not the synthetic
+	// DockerAvailable:true that GetDockerRecoveryStatus returns when Docker
+	// recovery is disabled (isolation off). See MCP-2478: the dashboard bound
+	// its "Docker isolation active" badge to docker_available and lit up on
+	// hosts that have no Docker daemon at all. The recovery fields below stay
+	// purely diagnostic.
+	dockerAvailable := s.controller.IsDockerAvailable()
+
+	// isolation_enabled lets the UI label the badge "active" only when the user
+	// actually turned Docker isolation on AND the daemon is reachable.
+	isolationEnabled := false
+	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil && cfg.DockerIsolation != nil {
+		isolationEnabled = cfg.DockerIsolation.Enabled
+	}
+
 	response := map[string]interface{}{
-		"docker_available":   status.DockerAvailable,
+		"docker_available":   dockerAvailable,
+		"isolation_enabled":  isolationEnabled,
 		"recovery_mode":      status.RecoveryMode,
 		"failure_count":      status.FailureCount,
 		"attempts_since_up":  status.AttemptsSinceUp,
@@ -3565,7 +4775,183 @@ func (s *Server) handleApproveTools(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBlockTools handles POST /api/v1/servers/{id}/tools/block
+// A block is an atomic approve+disable performed in the runtime so the pair is
+// all-or-nothing — a tool is never left approved+enabled. Mirrors
+// handleApproveTools: accepts either {"tools":[...]} or {"block_all":true}.
+//
+// @Summary Block (approve+disable) tools for a server
+// @Description Atomically approves AND disables the given tools (or all pending/changed tools when block_all=true) for a server. The approve and disable land in a single write per tool, so a tool is never left in the approved+enabled state. The "blocked" field counts tools actually blocked.
+// @Tags servers
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Param id path string true "Server ID or name"
+// @Success 200 {object} contracts.SuccessResponse "Block result"
+// @Failure 400 {object} contracts.ErrorResponse "Bad request"
+// @Failure 500 {object} contracts.ErrorResponse "Internal server error"
+// @Router /api/v1/servers/{id}/tools/block [post]
+func (s *Server) handleBlockTools(w http.ResponseWriter, r *http.Request) {
+	serverID := chi.URLParam(r, "id")
+	if serverID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Server ID required")
+		return
+	}
+
+	var req struct {
+		Tools    []string `json:"tools"`
+		BlockAll bool     `json:"block_all"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+
+	if req.BlockAll {
+		count, err := s.controller.BlockAllTools(serverID, "api")
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to block tools: %v", err))
+			return
+		}
+		s.writeSuccess(w, map[string]interface{}{
+			"blocked": count,
+			"message": fmt.Sprintf("Blocked %d tools for server %s", count, serverID),
+		})
+		return
+	}
+
+	if len(req.Tools) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "Either 'tools' array or 'block_all: true' required")
+		return
+	}
+
+	count, err := s.controller.BlockTools(serverID, req.Tools, "api")
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to block tools: %v", err))
+		return
+	}
+
+	s.writeSuccess(w, map[string]interface{}{
+		"blocked": count,
+		"tools":   req.Tools,
+		"message": fmt.Sprintf("Blocked %d tools for server %s", count, serverID),
+	})
+}
+
 // handleGetToolDiff handles GET /api/v1/servers/{id}/tools/{tool}/diff
+func (s *Server) handleSetToolEnabled(w http.ResponseWriter, r *http.Request) {
+	authCtx := auth.AuthContextFromContext(r.Context())
+	if authCtx == nil || !authCtx.IsAdmin() {
+		s.writeError(w, r, http.StatusForbidden, "operation requires admin access")
+		return
+	}
+
+	serverID := chi.URLParam(r, "id")
+	toolName := chi.URLParam(r, "tool")
+	if serverID == "" || toolName == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Server ID and tool name required")
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+
+	// Reject attempts to enable a tool the server config forbids.
+	if req.Enabled {
+		if configChecker, ok := s.controller.(interface {
+			IsToolConfigDenied(serverName, toolName string) bool
+		}); ok && configChecker.IsToolConfigDenied(serverID, toolName) {
+			s.writeError(w, r, http.StatusConflict,
+				"tool is denied by server config (enabled_tools / disabled_tools); remove the config restriction to enable this tool")
+			return
+		}
+	}
+
+	controller, ok := s.controller.(interface {
+		SetToolEnabled(serverName, toolName string, enabled bool, updatedBy string) error
+	})
+	if !ok {
+		s.writeError(w, r, http.StatusNotImplemented, "Tool enable toggle not supported by controller")
+		return
+	}
+
+	if err := controller.SetToolEnabled(serverID, toolName, req.Enabled, "api"); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to update tool enabled state: %v", err))
+		return
+	}
+
+	s.writeSuccess(w, map[string]any{
+		"server_name": serverID,
+		"tool_name":   toolName,
+		"enabled":     req.Enabled,
+	})
+}
+
+// handleSetAllToolsEnabled returns an HTTP handler that bulk-toggles every
+// tool of a server to `enabled`. The two route registrations (enable_all,
+// disable_all) share this body to keep semantics identical and so the OpenAPI
+// docs stay aligned. Response shape mirrors handleSetToolEnabled, plus a
+// "changed" count for the bulk variant.
+//
+// @Summary Enable or disable all tools for a server
+// @Description Bulk-toggles every known tool of a server. The "changed" field
+//
+//	in the response counts tools whose state actually changed (tools already
+//	in the desired state are skipped to avoid no-op SSE traffic).
+//
+// @Tags servers
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Param id path string true "Server ID or name"
+// @Success 200 {object} contracts.SuccessResponse "Operation result"
+// @Failure 400 {object} contracts.ErrorResponse "Bad request"
+// @Failure 500 {object} contracts.ErrorResponse "Internal server error"
+// @Router /api/v1/servers/{id}/tools/enable_all [post]
+// @Router /api/v1/servers/{id}/tools/disable_all [post]
+func (s *Server) handleSetAllToolsEnabled(enabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authCtx := auth.AuthContextFromContext(r.Context())
+		if authCtx == nil || !authCtx.IsAdmin() {
+			s.writeError(w, r, http.StatusForbidden, "operation requires admin access")
+			return
+		}
+
+		serverID := chi.URLParam(r, "id")
+		if serverID == "" {
+			s.writeError(w, r, http.StatusBadRequest, "Server ID required")
+			return
+		}
+
+		controller, ok := s.controller.(interface {
+			SetAllToolsEnabled(serverName string, enabled bool, updatedBy string) (int, error)
+		})
+		if !ok {
+			s.writeError(w, r, http.StatusNotImplemented, "Bulk tool enable toggle not supported by controller")
+			return
+		}
+
+		changed, err := controller.SetAllToolsEnabled(serverID, enabled, "api")
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to update tool states: %v", err))
+			return
+		}
+
+		s.writeSuccess(w, map[string]any{
+			"server_name": serverID,
+			"enabled":     enabled,
+			"changed":     changed,
+		})
+	}
+}
+
 func (s *Server) handleGetToolDiff(w http.ResponseWriter, r *http.Request) {
 	serverID := chi.URLParam(r, "id")
 	toolName := chi.URLParam(r, "tool")
@@ -3586,16 +4972,24 @@ func (s *Server) handleGetToolDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Surface every field that participates in the approval hash so the operator
+	// can see exactly what changed. The output schema is part of the hashed
+	// contract (internal/runtime/tool_quarantine.go); omitting it here made
+	// output-schema-only changes (e.g. an upstream adding a new enum value) look
+	// like phantom rug-pull flags because the visible description was unchanged
+	// (MCP-2085).
 	s.writeSuccess(w, map[string]interface{}{
-		"server_name":          record.ServerName,
-		"tool_name":            record.ToolName,
-		"status":               record.Status,
-		"approved_hash":        record.ApprovedHash,
-		"current_hash":         record.CurrentHash,
-		"previous_description": record.PreviousDescription,
-		"current_description":  record.CurrentDescription,
-		"previous_schema":      record.PreviousSchema,
-		"current_schema":       record.CurrentSchema,
+		"server_name":            record.ServerName,
+		"tool_name":              record.ToolName,
+		"status":                 record.Status,
+		"approved_hash":          record.ApprovedHash,
+		"current_hash":           record.CurrentHash,
+		"previous_description":   record.PreviousDescription,
+		"current_description":    record.CurrentDescription,
+		"previous_schema":        record.PreviousSchema,
+		"current_schema":         record.CurrentSchema,
+		"previous_output_schema": record.PreviousOutputSchema,
+		"current_output_schema":  record.CurrentOutputSchema,
 	})
 }
 
@@ -3644,6 +5038,8 @@ func (s *Server) handleExportToolDescriptions(w http.ResponseWriter, r *http.Req
 		Hash        string `json:"hash"`
 		Description string `json:"description"`
 		Schema      string `json:"schema,omitempty"`
+		Enabled     bool   `json:"enabled"`
+		Disabled    bool   `json:"disabled"`
 	}
 
 	var exports []toolExport
@@ -3655,6 +5051,8 @@ func (s *Server) handleExportToolDescriptions(w http.ResponseWriter, r *http.Req
 			Hash:        record.CurrentHash,
 			Description: record.CurrentDescription,
 			Schema:      record.CurrentSchema,
+			Enabled:     !record.Disabled,
+			Disabled:    record.Disabled,
 		})
 	}
 

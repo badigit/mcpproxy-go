@@ -24,6 +24,7 @@ import type { HealthStatus } from './contracts'
 export interface QuarantineStats {
   pending_count: number
   changed_count: number
+  blocked_count: number
 }
 
 // Security scan summary (Spec 039)
@@ -41,6 +42,15 @@ export interface SecurityScanSummary {
   risk_score: number
   status: SecurityScanStatus
   finding_counts?: SecurityScanFindingCounts
+  // Scanner coverage for the primary (baseline) scan pass — informational only.
+  // Spec 077 US3 (FR-008/FR-014): status derives SOLELY from baseline findings;
+  // a failed Docker deep scanner never downgrades the verdict.
+  scanners_run?: number
+  scanners_failed?: number
+  scanners_total?: number
+  // Opt-in deep-scan layer status (Spec 077 US3), always emitted on a computed
+  // summary (enabled=false when off). Informational — never influences status.
+  deep_scan?: DeepScanDescriptor
 }
 
 // Security scan finding (Spec 039)
@@ -65,6 +75,11 @@ export interface SecurityScanFinding {
   scan_pass?: number            // 1 = security scan, 2 = supply chain audit
   evidence?: string             // Text/content that triggered the finding
   supply_chain_audit?: boolean  // True for real CVE/package findings — routes to the Supply Chain (CVEs) section regardless of scan_pass
+  // Spec 077 unified report — additive fields.
+  sources?: string[]            // Contributing scanner ids; ≥2 means scanners agreed (consensus)
+  tier?: string                 // "hard" (gates approval) | "soft" (review-only)
+  confidence?: number           // 0.0–1.0; raised when independent sources agree
+  signals?: string[]            // Deterministic detect check ids that fired
 }
 
 export interface SecurityScanReport {
@@ -73,7 +88,14 @@ export interface SecurityScanReport {
   status: SecurityScanStatus
   risk_score: number
   findings: SecurityScanFinding[]
-  finding_counts: SecurityScanFindingCounts
+  // Tier-driven, baseline-only verdict (Spec 077 FR-014): 'dangerous' only for
+  // hard-tier baseline findings; tierless deep-scan/external findings never
+  // move it. Verdict-bearing UI must read this, NOT summary (raw counts).
+  verdict?: 'clean' | 'warnings' | 'dangerous'
+  // Tier-driven buckets matching SecurityScanSummary.finding_counts (a tierless
+  // 'dangerous' finding buckets as warning — informs, never gates).
+  finding_counts?: SecurityScanFindingCounts
+  // Raw threat-level/severity counts across ALL findings — transparency only.
   summary: SecurityScanReportSummary
   scanned_at: string
   duration_ms?: number
@@ -88,6 +110,22 @@ export interface SecurityScanReport {
   pass1_complete?: boolean  // Security scan (fast) done
   pass2_complete?: boolean  // Supply chain audit done
   pass2_running?: boolean   // Supply chain audit in progress
+  // Opt-in deep-scan availability (Spec 077 US3). Informational only — a failed
+  // or unavailable deep scanner never changes the baseline verdict/status.
+  deep_scan?: DeepScanDescriptor
+}
+
+// DeepScanDescriptor reports the informational status of the opt-in "deep scan"
+// layer (Docker-based scanners + source extraction) separately from the
+// baseline verdict (Spec 077 US3). Rendered as a quiet info note, never an error.
+export interface DeepScanDescriptor {
+  enabled: boolean
+  ran: boolean
+  available: boolean
+  scanners_failed?: { id: string; reason: string }[]
+  // Docker scanners the user enabled that are skipped because deep scan is off.
+  // Only populated when enabled=false (the descriptor is always emitted).
+  skipped_scanners?: string[]
 }
 
 // Scan job summary for history listing
@@ -117,19 +155,65 @@ export interface SecurityScanReportSummary {
 }
 
 // Server types
+export interface ServerIsolationConfig {
+  enabled: boolean
+  image?: string
+  network_mode?: string
+  extra_args?: string[]
+  memory_limit?: string
+  cpu_limit?: string
+  working_dir?: string
+  timeout?: string
+}
+
+// IsolationDefaults reports the resolved baseline Docker isolation
+// values the backend will apply when no per-server override is set.
+// Used as placeholders so "empty = inherit" is discoverable in the UI.
+export interface ServerIsolationDefaults {
+  runtime_type?: string
+  image?: string
+  network_mode?: string
+  extra_args?: string[]
+  working_dir?: string
+}
+
 export interface Server {
   name: string
+  // Human-friendly display label from the source registry (MCP-1112). When
+  // present it is preferred over `name` for display; `name` stays the stable
+  // identifier used for routing and API calls (it may be a reverse-DNS id such
+  // as "io.github.owner/repo").
+  title?: string
   url?: string
   command?: string
+  args?: string[]
+  working_dir?: string
+  env?: Record<string, string>
+  // Static headers sent with every request to HTTP / streamable-http
+  // servers. Server-side redaction replaces sensitive values with
+  // `***REDACTED***` unless `reveal_secret_headers: true` is set on the
+  // loaded config (see internal/httpapi/server.go:redactServerHeaders).
+  headers?: Record<string, string>
   protocol: 'http' | 'stdio' | 'streamable-http'
   enabled: boolean
   quarantined: boolean
+  // Per-server intent to auto-approve tool changes/additions (MCP-2930).
+  // When true, rug-pull protection is disabled for this server: changed and
+  // newly-added tools are trusted automatically instead of held for review.
+  // Optional because the REST status payload only includes it once the
+  // backend exposes the flag; absent/undefined is treated as OFF (protected).
+  auto_approve_tool_changes?: boolean
   connected: boolean
   connecting: boolean
   authenticated?: boolean
   tool_count: number
   last_error?: string
   tool_list_token_size?: number
+  connected_at?: string // ISO 8601 timestamp of last successful connect
+  last_reconnect_at?: string // ISO 8601 timestamp of last reconnect attempt
+  reconnect_count?: number
+  isolation?: ServerIsolationConfig // Per-server Docker isolation override
+  isolation_defaults?: ServerIsolationDefaults // Resolved baseline values (read-only)
   oauth?: {
     client_id: string
     auth_url: string
@@ -141,6 +225,68 @@ export interface Server {
   health?: HealthStatus // Unified health status calculated by the backend
   quarantine?: QuarantineStats // Tool-level quarantine stats (Spec 032)
   security_scan?: SecurityScanSummary // Security scan summary (Spec 039)
+  // Spec 044: structured diagnostic error + stable error code
+  error_code?: string
+  diagnostic?: Diagnostic | null
+}
+
+// Spec 044 — diagnostics & error taxonomy types.
+export type DiagnosticSeverity = 'info' | 'warn' | 'error'
+export type DiagnosticFixStepType = 'link' | 'command' | 'button'
+
+export interface DiagnosticFixStep {
+  type: DiagnosticFixStepType
+  label: string
+  command?: string
+  url?: string
+  fixer_key?: string
+  destructive?: boolean
+}
+
+export interface Diagnostic {
+  code: string
+  severity: DiagnosticSeverity
+  cause?: string
+  detected_at?: string
+  user_message?: string
+  fix_steps?: DiagnosticFixStep[]
+  docs_url?: string
+}
+
+export interface DiagnosticFixResponse {
+  outcome: 'success' | 'failed' | 'blocked'
+  duration_ms: number
+  mode: 'dry_run' | 'execute'
+  preview?: string
+  failure_msg?: string
+}
+
+// Global Tools response types (Spec 050)
+export interface GlobalTool {
+  name: string
+  server_name: string
+  description: string
+  approval_status: string  // "pending" | "changed" | "approved" | ""
+  disabled: boolean        // per-tool user toggle
+  config_denied: boolean   // layered config (read-only)
+  usage: number
+  last_used?: string       // ISO 8601; omitted if never used in window
+  annotations?: ToolAnnotation
+  // derived locally: enabled = !disabled && !config_denied
+}
+
+export interface GlobalToolsStats {
+  total: number
+  enabled: number
+  disabled: number
+  pending_approval: number
+}
+
+export interface GlobalToolsResponse {
+  tools: GlobalTool[]
+  stats: GlobalToolsStats
+  partial: boolean
+  failed_servers: string[]
 }
 
 // Tool Annotation types
@@ -167,6 +313,11 @@ export interface MCPSession {
   has_roots?: boolean
   has_sampling?: boolean
   experimental?: string[]
+  // Spec 082: the project the client is working in (basename only — the full
+  // local path never leaves the machine), and the work session this connection
+  // belongs to.
+  workspace_name?: string
+  work_session_id?: string
 }
 
 // Tool types
@@ -174,8 +325,15 @@ export interface Tool {
   name: string
   description: string
   server: string
+  server_name?: string
   input_schema?: Record<string, any>
+  schema?: Record<string, any>
   annotations?: ToolAnnotation
+  usage?: number
+  last_used?: string
+  approval_status?: string
+  disabled?: boolean
+  config_denied?: boolean
 }
 
 // Tool approval types (Spec 032)
@@ -192,6 +350,13 @@ export interface ToolApproval {
   current_description?: string
   previous_schema?: string
   current_schema?: string
+  // Output schema diff fields (MCP-2096 / PR #638): exposed by
+  // GET /api/v1/servers/{id}/tools/{tool}/diff so the approval UI can render
+  // an Output-Schema diff section, not just description/input-schema.
+  previous_output_schema?: string
+  current_output_schema?: string
+  enabled?: boolean
+  disabled?: boolean
 }
 
 // Search result types
@@ -312,6 +477,55 @@ export interface ServerTokenMetrics {
   per_server_tool_list_sizes: Record<string, number>
 }
 
+// Usage statistics aggregate — GET /api/v1/activity/usage (Spec 069).
+// Mirrors contracts.UsageAggregateResponse. Per-tool metrics are
+// lifetime-cumulative; `window` scopes the timeline + the tool-list membership.
+export interface UsageToolStat {
+  server: string
+  tool: string
+  calls: number
+  errors: number
+  error_rate: number
+  blocked: number
+  total_resp_bytes: number
+  avg_resp_bytes: number | null   // null when only legacy 0-byte calls exist
+  total_req_bytes: number
+  avg_req_bytes: number | null
+  sized_calls: number
+  p50_ms: number
+  p95_ms: number
+  last_used: string
+}
+
+export interface UsageOtherBucket {
+  tools_folded: number
+  calls: number
+  total_resp_bytes: number
+}
+
+export interface UsageTimeBucket {
+  start: string
+  calls: number
+  errors: number
+  total_resp_bytes: number
+}
+
+export interface UsageAggregateResponse {
+  window: string
+  generated_at: string
+  freshness_ms: number
+  token_source: string              // "bytes" — size-based proxy (FR-006)
+  tokens_saved: number              // echoed from ServerTokenMetrics (FR-007)
+  tokens_saved_percentage: number
+  tools: UsageToolStat[]
+  other?: UsageOtherBucket | null   // present only when list truncated to top-N
+  timeline: UsageTimeBucket[]
+}
+
+export type UsageWindow = '24h' | '7d' | 'all'
+export type UsageSort = 'calls' | 'resp_bytes' | 'error_rate' | 'p95'
+export type UsageStatus = 'success' | 'error' | 'blocked'
+
 export interface ToolCallRecord {
   id: string
   server_id: string
@@ -406,6 +620,28 @@ export interface Registry {
   tags?: string[]
   protocol?: string
   count?: number | string
+  // MCP-866: trust tag — "official/trusted" for built-in defaults,
+  // "custom/unverified" for user-added sources. Derived server-side from
+  // membership in the default set, never from self-assertion in config.
+  provenance?: string
+  // Convenience boolean mirror of provenance === "official/trusted".
+  trusted?: boolean
+}
+
+// MCP-866 trust-tag constants (mirror config.RegistryProvenance*).
+export const REGISTRY_PROVENANCE_OFFICIAL = 'official/trusted'
+export const REGISTRY_PROVENANCE_CUSTOM = 'custom/unverified'
+
+// RegistrySummary is the slim projection returned by POST /api/v1/registries
+// (add-source). Mirrors contracts.RegistrySummary.
+export interface RegistrySummary {
+  id: string
+  name: string
+  url?: string
+  servers_url?: string
+  protocol?: string
+  provenance?: string
+  trusted?: boolean
 }
 
 export interface NPMPackageInfo {
@@ -418,18 +654,29 @@ export interface RepositoryInfo {
   // Future: pypi, docker_hub, etc.
 }
 
+// RequiredInput declares an env var / key a server needs before it can run.
+// Spec 070: detected server-side (explicit registry fields + ${VAR} heuristic)
+// and used by the Web UI to prompt the user before adding. Mirrors
+// registries.RequiredInput.
+export interface RequiredInput {
+  name: string
+  description?: string
+  secret?: boolean
+}
+
 export interface RepositoryServer {
   id: string
   name: string
   description: string
   url?: string  // MCP endpoint for remote servers only
   source_code_url?: string  // Source repository URL
-  installCmd?: string  // Installation command
-  connectUrl?: string  // Alternative connection URL
+  install_cmd?: string  // Installation command (matches backend contracts.RepositoryServer)
+  connect_url?: string  // Alternative connection URL (matches backend contracts.RepositoryServer)
   updatedAt?: string
   createdAt?: string
   registry?: string  // Which registry this came from
   repository_info?: RepositoryInfo  // Detected package info
+  required_inputs?: RequiredInput[]  // Spec 070: env/keys the user must supply before add
 }
 
 export interface GetRegistriesResponse {
@@ -471,6 +718,8 @@ export interface ActivityRecord {
   duration_ms?: number
   timestamp: string
   session_id?: string
+  /** Spec 082: one client, one project, across reconnects. Absent on pre-082 records. */
+  work_session_id?: string
   request_id?: string
   metadata?: Record<string, any>
   // Spec 026: Sensitive data detection fields
@@ -588,6 +837,11 @@ export interface ImportResponse {
 // API returns a flat array of ClientStatus objects in the data field
 export type ConnectStatusResponse = ClientStatus[]
 
+// AccessState classifies a per-client config content access (Spec 075). The
+// stat-only overall listing leaves it 'unknown' (no eager read); the on-demand
+// per-client GET / connect / disconnect paths resolve it to one of the others.
+export type AccessState = 'unknown' | 'accessible' | 'absent' | 'denied' | 'malformed'
+
 export interface ClientStatus {
   id: string
   name: string
@@ -596,7 +850,15 @@ export interface ClientStatus {
   connected: boolean
   supported: boolean
   reason?: string
+  note?: string
+  bridge?: boolean
   icon: string
+  server_name?: string
+  // Spec 075 (additive): per-client content access classification and, when
+  // access_state === 'denied', actionable remediation text (the macOS App-Data
+  // privacy fix including the exact tccutil reset command).
+  access_state?: AccessState
+  remediation?: string
 }
 
 export interface ConnectResult {
@@ -608,4 +870,72 @@ export interface ConnectResult {
   action: string
   message: string
   error?: string
+}
+
+// Spec 078 US1: the exact change a connect would make, returned WITHOUT writing
+// the file or creating a backup. entry/entry_text carry a MASKED apikey;
+// contains_api_key flags that a credential is written; entry_exists marks the
+// overwrite (force) case; access_state degrades per Spec 075.
+export interface ConnectPreview {
+  client: string
+  config_path: string
+  format: 'json' | 'toml'
+  server_key: string
+  server_name: string
+  entry: Record<string, unknown>
+  entry_text: string
+  entry_exists: boolean
+  contains_api_key: boolean
+  bridge?: boolean
+  access_state?: AccessState
+}
+
+// Onboarding wizard types (Spec 046)
+export interface OnboardingState {
+  engaged: boolean
+  first_shown_at?: string
+  engaged_at?: string
+  connect_step_status?: '' | 'completed' | 'skipped'
+  server_step_status?: '' | 'completed' | 'skipped'
+}
+
+export interface OnboardingStateResponse {
+  has_connected_client: boolean
+  has_configured_server: boolean
+  connected_client_count: number
+  connected_client_ids: string[]
+  configured_server_count: number
+  state: OnboardingState
+  should_show_wizard: boolean
+  // Spec 046 v2 — passive Verify tab + sidebar badge
+  first_mcp_client_ever: boolean
+  mcp_clients_seen_ever: string[]
+  incomplete_tab_count: number
+}
+
+export interface OnboardingMarkRequest {
+  engaged?: boolean
+  connect_step_status?: '' | 'completed' | 'skipped'
+  server_step_status?: '' | 'completed' | 'skipped'
+  mark_shown?: boolean
+}
+
+// Profiles v2 (MCP-3243 / T4): a profile scopes tool discovery + calls to a
+// named subset of upstream servers. Mirrors httpapi.ProfileSummary from the
+// GET /api/v1/profiles listing (MCP-3241).
+export interface ProfileSummary {
+  name: string
+  servers: string[]
+  tool_count: number
+}
+
+export interface ListProfilesResponse {
+  profiles: ProfileSummary[]
+}
+
+// Server-level default active profile used by UI surfaces (Web UI / tray).
+// Empty string means "all servers". A live MCP session's set_profile selection
+// takes precedence over this default.
+export interface ActiveProfileResponse {
+  active_profile: string
 }

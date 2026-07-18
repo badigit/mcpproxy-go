@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -29,7 +29,7 @@ jobs:
         run: cd frontend && npm run build
 
       - name: Upload frontend artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: frontend-dist-e2e
           path: frontend/dist/
@@ -45,19 +45,19 @@ jobs:
 
     strategy:
       matrix:
-        # On PRs: test only latest Go on ubuntu-latest
-        # On main/push: test Linux + macOS (Windows E2E removed — chronic flakes
-        # from file-lock races in TestAtomicConfigWrite and runtime timeouts;
-        # Windows coverage stays in logging-tests job below).
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
-        go-version: ${{ github.event_name == 'pull_request' && fromJSON('["1.25"]') || fromJSON('["1.23.10", "1.24.5", "1.25"]') }}
+        # On PRs: test only ubuntu-latest. On main/push: test all OSes.
+        # Go is pinned to "1.25" because go.mod requires go 1.25.5 — older
+        # toolchains can't build the module, and auto-downloading 1.25.x under
+        # setup-go's module cache collides ("tar: ... File exists").
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+        go-version: ["1.25"]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -69,7 +69,7 @@ jobs:
         run: go mod verify
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: frontend-dist-e2e
           path: frontend/dist
@@ -93,7 +93,10 @@ jobs:
         run: go build -tags nogui -o mcpproxy ./cmd/mcpproxy
 
       - name: Run unit tests
-        run: go test -v -race -timeout 2m -skip "Binary|MCP|E2E|TestInfoEndpoint|TestGracefulShutdownNoPanic|TestSocketInfoEndpoint" ./internal/...
+        # -short skips the heavy property/timing tests (TestRapidQuarantine* etc.);
+        # they run unguarded in the main-only stress-tests job below so coverage
+        # is preserved. Bumped to 4m for headroom under -race on slow runners.
+        run: go test -v -short -race -timeout 4m -skip "Binary|MCP|E2E|TestInfoEndpoint|TestGracefulShutdownNoPanic|TestSocketInfoEndpoint" ./internal/...
 
       # Binary tests are too flaky in CI due to server startup timing issues
       # All Binary tests consistently timeout waiting for server to be ready
@@ -154,13 +157,13 @@ jobs:
           GO_TEST_TIMEOUT: 300s
 
       - name: Run E2E tests with race detector
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.10'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
         run: go test -v -race -timeout 10m ./internal/server -run TestE2E
         env:
           GO_TEST_TIMEOUT: 600s
 
       - name: Run Logging E2E tests with race detector
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.10'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
         run: go test -v -race -timeout 10m ./internal/logs -run TestE2E
         env:
           GO_TEST_TIMEOUT: 600s
@@ -175,16 +178,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
           cache: true
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: frontend-dist-e2e
           path: frontend/dist
@@ -238,7 +241,7 @@ jobs:
           go tool cover -html=coverage-logs.out -o coverage-logs.html
 
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           file: ./coverage.out
           flags: e2e-tests
@@ -271,16 +274,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
           cache: true
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: frontend-dist-e2e
           path: frontend/dist
@@ -327,21 +330,21 @@ jobs:
           if [ -d "${{ matrix.log_path_check }}" ]; then
             echo "✓ Log directory created successfully"
             ls -la "${{ matrix.log_path_check }}"
-            
+
             # Check if log file exists and has content
             if [ -f "${{ matrix.log_path_check }}/main.log" ]; then
               echo "✓ Log file created successfully"
               echo "Log file size: $(wc -c < "${{ matrix.log_path_check }}/main.log") bytes"
               echo "First few lines:"
               head -3 "${{ matrix.log_path_check }}/main.log"
-              
+
               # Verify log contains expected content
               if grep -q "Log directory configured" "${{ matrix.log_path_check }}/main.log"; then
                 echo "✓ Log contains expected startup messages"
               else
                 echo "⚠ Log missing expected startup messages"
               fi
-              
+
               if grep -q "${{ matrix.log_standard }}" "${{ matrix.log_path_check }}/main.log"; then
                 echo "✓ Log contains OS standard compliance information"
               else
@@ -432,10 +435,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
           cache: true
@@ -459,16 +462,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.25"
           cache: true
 
       - name: Download frontend artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: frontend-dist-e2e
           path: frontend/dist
@@ -477,6 +480,13 @@ jobs:
         run: |
           mkdir -p web/frontend
           cp -r frontend/dist web/frontend/
+
+      - name: Run heavy runtime property/timing tests
+        run: |
+          # These are -short-skipped in the fast unit step; run them here
+          # (unguarded, generous timeout) so invariant coverage is preserved.
+          go test -v -race -timeout 20m ./internal/runtime \
+            -run 'TestRapidQuarantineStateMachine|TestRapidInvariant_ChangedNeverAutoApproved|TestApplyConfig_ListenAddressChange|TestIsDockerAvailable_NegativeTTLShorter|TestIsDockerAvailable_PositiveTTLHonored|TestToolCacheInvalidation_DisableServerRemovesTools|TestRuntimeStatusSnapshotReflectsRunningAndListen'
 
       - name: Run concurrent stress tests
         run: |

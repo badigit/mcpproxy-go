@@ -17,7 +17,8 @@ Complete reference for MCPProxy configuration file (`mcp_config.json`). This doc
 11. [Code Execution](#code-execution)
 12. [Feature Flags](#feature-flags)
 13. [Registries](#registries)
-14. [Complete Example](#complete-example)
+14. [Update Check](#update-check)
+15. [Complete Example](#complete-example)
 
 ---
 
@@ -86,7 +87,8 @@ MCPProxy looks for configuration in these locations (in order):
 {
   "tools_limit": 15,
   "tool_response_limit": 20000,
-  "call_tool_timeout": "2m"
+  "call_tool_timeout": "2m",
+  "init_timeout": "30s"
 }
 ```
 
@@ -95,6 +97,79 @@ MCPProxy looks for configuration in these locations (in order):
 | `tools_limit` | integer | `15` | Maximum number of tools to return per request (1-1000) |
 | `tool_response_limit` | integer | `20000` | Maximum characters in tool responses (0 = unlimited) |
 | `call_tool_timeout` | string | `"2m"` | Timeout for tool calls (e.g., `"30s"`, `"2m"`, `"5m"`). **Note**: When using agents like Codex or Claude as MCP servers, you may need to increase this timeout significantly, even up to 10 minutes (`"10m"`), as these agents may require longer processing times for complex operations |
+| `init_timeout` | duration | `"30s"` | Deadline for an upstream's MCP `initialize` handshake (e.g. `"30s"`, `"120s"`, `"3m"`). Raise this for servers that do legitimate first-run warmup — building a cache/index or prefetching — before they answer `initialize`, so they are not killed mid-startup. Global default; can be overridden per server (see [Server Fields](#server-fields)). Range: `1s`–`30m`; `"0s"`/unset uses the 30s default. |
+
+### TOON Output (Adaptive Result Encoding)
+
+```json
+{
+  "toon_output": "adaptive",
+  "toon_min_savings_pct": 15
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `toon_output` | string | `"off"` | TOON encoding of `call_tool_*` result text blocks: `off` (byte-identical to pre-feature behavior), `adaptive` (encode only tabular-uniform JSON when the complete TOON emission — marker + decode hint + body — beats the passthrough by at least `toon_min_savings_pct`; never larger by construction), or `always` (encode every JSON-parseable block regardless of size — **benchmarking/debugging only, can increase token cost**). Hot-reloads; applies to the next tool call without restart. |
+| `toon_min_savings_pct` | integer | `15` | Minimum byte savings (percent, 1–90) the TOON emission must achieve over the passthrough for `adaptive` mode to encode. Byte savings approximate token savings for this payload class. |
+
+Per-server override: set `toon_output` on a server entry to override the global for that server's tools (precedence: per-server > global > default `off`). See [Server Fields](#server-fields) and [TOON Output](features/toon-output.md) for the full feature description (marker contract, safety chain, decision metadata).
+
+### Discovery & Health Checks
+
+mcpproxy keeps each upstream connection alive and its tool index fresh with two
+background loops. Both intervals are tunable globally and per server, so you can
+quiet a chatty upstream that returns a large tool catalog.
+
+```json
+{
+  "health_check_interval": "30s",
+  "tool_discovery_interval": "5m"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `health_check_interval` | duration | `"30s"` | How often to probe each connected server for liveness with a lightweight MCP `ping`. `"0s"` disables the periodic probe. Range: `5s`–`1h`. **Does not apply to Docker-isolated servers** (see note below). |
+| `tool_discovery_interval` | duration | `"5m"` | How often to re-list every server's tools to rebuild the search index. `"0s"` disables the periodic sweep. Range: `30s`–`24h`. Applies to all server types, including Docker. |
+
+> **Docker-isolated servers.** `health_check_interval` has **no effect** on
+> Docker-isolated servers. Their liveness is monitored separately at the
+> container level on a fixed internal cadence (not an MCP `ping`), so the
+> periodic ping probe is intentionally skipped for them. `tool_discovery_interval`
+> still applies to Docker servers. Remote (HTTP/SSE) servers benefit most from
+> the `ping` switch, since both the probe and the former `tools/list` crossed
+> the network.
+
+**Liveness uses `ping`, not `tools/list`.** The health-check loop issues the
+MCP-standard `ping` request rather than re-listing every tool, so an idle proxy
+no longer generates large recurring `tools/list` traffic to upstream servers
+(GitHub [#608](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/608)). Tool
+changes are still picked up reactively whenever a server pushes
+`notifications/tools/list_changed`.
+
+**Disabling a loop (`"0s"`).** Set either key to `"0s"` to turn the
+corresponding loop off:
+
+- `health_check_interval: "0s"` — no periodic liveness probe. A dead transport
+  is then detected lazily, on the next real tool call or discovery sweep, rather
+  than proactively.
+- `tool_discovery_interval: "0s"` — no periodic index rebuild. Tools are still
+  discovered at connect time and whenever a server pushes
+  `notifications/tools/list_changed`. **Trade-off:** a server that does *not*
+  support `list_changed` will not have new/removed tools reflected until it
+  reconnects or you trigger a manual refresh.
+
+An unset key behaves exactly as before this feature (the built-in default), and
+a change to either interval takes effect on the next cycle without restarting
+the proxy.
+
+> **Per-server override.** Both keys can also be set on an individual server
+> entry under `mcpServers[]` (see [Server Fields](#server-fields)) to override
+> the global value for just that server; the per-server value wins, and `"0s"`
+> disables the loop for that server only. A dedicated per-server form control in
+> the Web UI / macOS app is planned; for now set per-server overrides via the
+> Raw JSON editor or the REST API.
 
 ### Debug & Development
 
@@ -147,13 +222,18 @@ MCPProxy looks for configuration in these locations (in order):
 | `args` | array | No | Command arguments |
 | `url` | string | Yes* | Server URL (required for `http`/`sse`/`streamable-http` protocols) |
 | `headers` | object | No | HTTP headers for HTTP-based protocols |
-| `working_dir` | string | No | Working directory for stdio servers (default: current directory) |
-| `env` | object | No | Environment variables for stdio servers |
+| `working_dir` | string | No | Working directory for stdio servers, or for the locally-launched child of an HTTP/SSE server (default: current directory) |
+| `env` | object | No | Environment variables for stdio servers, or for the locally-launched child of an HTTP/SSE server |
+| `launcher_wait_timeout` | duration | No | When `command` is set together with an HTTP/SSE `url`, how long mcpproxy waits for that URL to become reachable after spawning the child (e.g. `"15s"`, default `"30s"`) |
+| `health_check_interval` | duration | No | Per-server override for the global [`health_check_interval`](#discovery--health-checks). `"0s"` disables the liveness probe for this server only. Range: `5s`–`1h`. Omit to inherit the global value. |
+| `tool_discovery_interval` | duration | No | Per-server override for the global [`tool_discovery_interval`](#discovery--health-checks). Overrides the global/default cadence for this server only; `"0s"` disables the periodic tool-discovery sweep for this server (connect-time and reactive `list_changed` discovery still run). Range: `30s`–`24h`. Omit to inherit the global value. |
+| `init_timeout` | duration | No | Per-server override for the global [`init_timeout`](#search--tool-limits) — the MCP `initialize` handshake deadline. Raise it for an upstream that warms up (caches/indexes data) before responding to `initialize` (e.g. `"120s"`, `"3m"`); without it such a server is killed mid-startup and, with `docker run --rm`, retries forever. Range: `1s`–`30m`. Omit to inherit the global value (30s default). Settable via the `upstream_servers` tool and `mcpproxy upstream patch --init-timeout`. |
 | `oauth` | object | No | OAuth configuration (see [OAuth Configuration](#oauth-configuration)) |
 | `isolation` | object | No | Per-server Docker isolation settings (see [Docker Isolation](#docker-isolation)) |
 | `enabled` | boolean | No | Enable/disable server (default: `true`) |
 | `quarantined` | boolean | No | Security quarantine status (default: `false` for manually added servers, `true` for LLM-added servers) |
 | `reconnect_on_use` | boolean | No | When `true`, tool calls to a disconnected server trigger an immediate reconnect attempt (15s timeout) before failing (default: `false`) |
+| `toon_output` | string | No | Per-server override for the global [`toon_output`](#toon-output-adaptive-result-encoding): `off`, `adaptive`, or `always`. Non-empty value wins over the global for this server's tools; omit to inherit. See [TOON Output](features/toon-output.md). |
 | `created` | string | No | ISO 8601 timestamp (auto-generated) |
 | `updated` | string | No | ISO 8601 timestamp (auto-updated) |
 
@@ -210,6 +290,54 @@ MCPProxy looks for configuration in these locations (in order):
 }
 ```
 
+### Locally-launched HTTP / SSE servers
+
+By default `command` is only used for `stdio` servers. When you set `command`
+together with an HTTP/SSE `url` and an explicit `protocol` of `http`, `sse`,
+or `streamable-http`, mcpproxy will:
+
+1. Spawn the command (with `args`, `env`, `working_dir`, and Docker isolation
+   exactly like a stdio server).
+2. Wait up to `launcher_wait_timeout` (default 30s) for `url` to accept a TCP
+   connection.
+3. Connect via the configured HTTP/SSE transport.
+4. Own the child's lifecycle — the process is stopped (`SIGTERM`, then
+   `SIGKILL` after a grace period) on disconnect, restart, server-disable, or
+   mcpproxy shutdown. Unexpected exits trigger an automatic disconnect, which
+   the existing reconnect path picks up.
+
+```json
+{
+  "name": "local-http-mcp",
+  "protocol": "http",
+  "url": "http://127.0.0.1:9999/mcp",
+  "command": "node",
+  "args": ["./examples/echo-http-server.js", "--port", "9999"],
+  "working_dir": "/path/to/repo",
+  "launcher_wait_timeout": "15s",
+  "enabled": true
+}
+```
+
+`stdout` and `stderr` of the child are routed to the per-server log, so
+`mcpproxy upstream logs <name>` continues to work the same way it does for
+stdio servers.
+
+#### Behaviour matrix when both `command` and `url` are set
+
+| `protocol` | `command` | `url` | Behaviour |
+|---|---|---|---|
+| `stdio` (explicit) | set | any | Stdio transport, child via stdin/stdout — `url` ignored. |
+| `http` / `sse` / `streamable-http` (explicit) | set | set | **Locally-launched HTTP/SSE** — spawn child, wait for URL, connect via network. |
+| `http` / `sse` / `streamable-http` (explicit) | unset | set | Connect to remote URL — no spawn. |
+| `auto` or unset | set | any | Stdio (`command` wins over `url` for back-compat — set `protocol` explicitly to opt into the launcher). |
+| `auto` or unset | unset | set | HTTP/SSE remote — no spawn. |
+
+The "command wins" rule under `auto` is intentional: it preserves backwards
+compatibility with configurations written before the launcher feature
+existed. To launch a local HTTP/SSE server you **must** set `protocol`
+explicitly to one of `http`, `sse`, or `streamable-http`.
+
 ### OAuth Configuration
 
 ```json
@@ -261,6 +389,46 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 - **Empty API Key**: Empty values are replaced with an auto-generated key; authentication is always enforced
 - **Auto-Generation**: If no API key is provided, one is generated and logged for easy access
 - **Tray Integration**: Tray app automatically manages API keys for core communication
+
+### Security Scanner (`security`)
+
+The deterministic, offline `tpa-descriptions` baseline scanner always runs and is
+the sole source of the approval verdict. The heavier Docker-based scanner plugins
+and published-package-source extraction live behind the **opt-in `security.deep_scan`
+block** — off by default, best-effort, and unable to change the baseline verdict
+(Spec 077).
+
+```json
+{
+  "security": {
+    "scan_timeout_default": "60s",
+    "integrity_check_interval": "1h",
+    "integrity_check_on_restart": false,
+    "scanner_registry_url": "",
+    "deep_scan": {
+      "enabled": false,
+      "fetch_package_source": true,
+      "disable_no_new_privileges": false,
+      "scanners": []
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `deep_scan.enabled` | boolean | `false` | Master opt-in for the heavy layer. When `false`, no Docker scanner runs and no source extraction is attempted — only the in-process baseline scanner executes. |
+| `deep_scan.fetch_package_source` | boolean | `true` (when deep scan is on) | Whether the scanner fetches (never executes) the published source of `npx`/`uvx` package-runner servers when no local source is available. Set `false` for air-gapped deployments. |
+| `deep_scan.disable_no_new_privileges` | boolean | `false` | Omits `--security-opt no-new-privileges` from scanner container runs (snap-docker/AppArmor escape hatch). |
+| `deep_scan.scanners` | string[] | `[]` | Optional allow-list of deep scanner ids. Empty ⇒ all enabled deep scanners are eligible. |
+
+**Deprecated-key migration.** The old top-level `security.scanner_fetch_package_source`
+and `security.scanner_disable_no_new_privileges` keys still parse and are migrated
+into `security.deep_scan.*` on load. The former `security.auto_scan_quarantined`
+key was **removed**; a config still carrying it loads without error and the key is
+ignored.
+
+See [Security Scanner Plugins](features/security-scanner-plugins.md#configuration) for the full scanner configuration reference.
 
 ---
 
@@ -442,7 +610,7 @@ See [Setup Guide - HTTPS](setup.md#optional-https-setup) for complete details.
 - **macOS:** `~/Library/Logs/mcpproxy/main.log`
 - **Linux:** `~/.local/state/mcpproxy/logs/main.log` (or `/var/log/mcpproxy` when running as root)
 - **Windows:** `%LOCALAPPDATA%\mcpproxy\logs\main.log`
-- **Per-server logs:** same directory, `server-{name}.log`
+- **Per-server logs:** same directory, `server-{name}.log` (characters in the server name that aren't letters, digits, `.`, `-`, or `_` — such as the `/` in registry names like `io.github.evidai/polymarket-guard` — are sanitized to `_`, so the log is always a single flat file)
 - **Custom:** set `log_dir` to override (supports `~` expansion)
 
 **Behavior notes:**
@@ -621,6 +789,39 @@ See [Docker Recovery Documentation](docker-recovery-phase3.md) for complete deta
 - Locale: all `LC_*` variables (e.g., `LC_ALL`, `LC_CTYPE`, …)
 - Custom additions: `custom_vars` merged on top
 
+> **Proxy variables are never inherited by default.** `HTTP_PROXY`, `HTTPS_PROXY`,
+> `NO_PROXY`, `ALL_PROXY`, and `FTP_PROXY` are deliberately excluded from the
+> default allow-list because proxy URLs commonly embed credentials
+> (`http://user:pass@proxy`). To forward them to upstream stdio servers, opt in
+> with `forward_proxy_env` (see below).
+
+### Proxy Environment Forwarding
+
+```json
+{
+  "forward_proxy_env": true
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `forward_proxy_env` | boolean | `false` | Forward ambient proxy environment variables to spawned stdio upstream servers, with credentials redacted |
+
+When `forward_proxy_env` is `true`, mcpproxy forwards the proxy variables present
+in its own environment (`HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`,
+`NO_PROXY`/`no_proxy`, `ALL_PROXY`/`all_proxy`, `FTP_PROXY`/`ftp_proxy` — both
+spellings are recognized) to each spawned stdio upstream. Any userinfo
+(`user:password@`) is **stripped** from the value before forwarding, so
+credentials never reach upstream servers while the proxy host/port is preserved.
+An explicitly configured proxy value (via `custom_vars` or a server's `env`)
+always takes precedence and suppresses forwarding of the ambient value, including
+the other-cased alias.
+
+> **macOS GUI/launchd note:** when launched from the Dock/Launchpad or the login
+> item, mcpproxy inherits a minimal environment that may not contain your proxy
+> variables. In that case set the proxy explicitly under `custom_vars` or a
+> server's `env` block.
+
 ---
 
 ## Routing Mode
@@ -651,6 +852,46 @@ See [Routing Modes](features/routing-modes.md) for complete details.
 
 ---
 
+## Tool Response Mode
+
+Controls only the *serialization* of `retrieve_tools` responses (Spec 085) — never the query, ranking, or result set. Orthogonal to `routing_mode`.
+
+```json
+{
+  "tool_response_mode": "full"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tool_response_mode` | string | `"full"` | `full` returns complete `inputSchema` entries (pre-Spec-085 behavior, byte-identical). `compact` returns one-line signatures instead: per entry `id`, `score`, `sig`, first-sentence `desc`, and a `lossy` flag, plus one top-level `hint` line. |
+
+- **Compact signatures**: `*` marks a required parameter (never elided), `~` marks a lossy collapse (nested objects, long enums — call `describe_tool` for the full schema), short enums/defaults are inlined (e.g. `(origin*:str, ttl:int=3600)`).
+- **Per-call override**: the `detail` parameter on `retrieve_tools` (`compact` | `full`) overrides the configured mode for that call only.
+- **describe_tool**: in compact mode, agents fetch full definitions on demand with `describe_tool` (batch of 1–5 `server:tool` ids; same visibility rules as search).
+- **Hot-reload**: changes apply on the next call via the config file reload or `POST /api/v1/config/apply` — no restart.
+- Env: `MCPPROXY_TOOL_RESPONSE_MODE` · Flag: `--tool-response-mode`.
+
+## Server Instructions
+
+Text returned in the MCP `initialize` response to guide AI agents on how to use the proxy (e.g., use `retrieve_tools` to discover existing tools rather than `search_servers`).
+
+```json
+{
+  "instructions": "Use retrieve_tools to discover tools before assuming a capability is unavailable."
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `instructions` | string | _(built-in)_ | Custom instructions sent in the MCP `initialize` response. When empty, a built-in default explains the `retrieve_tools` → `call_tool_*` workflow and warns against using `search_servers` for existing tools. |
+
+You can edit this from the Web UI under **Settings → Advanced → MCP server instructions**. The textarea shows the built-in default as a greyed-out placeholder; clearing it restores that default.
+
+**Note:** Applied at startup / on the next client connect — editing this value does not hot-reload into already-connected MCP sessions.
+
+---
+
 ## Tool-Level Quarantine
 
 SHA256 hash-based tool approval system that detects changes to tool descriptions and schemas.
@@ -665,7 +906,7 @@ SHA256 hash-based tool approval system that detects changes to tool descriptions
 |-------|------|---------|-------------|
 | `quarantine_enabled` | boolean | `true` | Enable tool-level quarantine globally |
 
-Per-server quarantine skip is configured on the server entry:
+Per-server tool-change auto-approval is configured on the server entry:
 
 ```json
 {
@@ -681,7 +922,8 @@ Per-server quarantine skip is configured on the server entry:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `skip_quarantine` | boolean | `false` | Skip tool-level quarantine for this server (auto-approve new tools) |
+| `auto_approve_tool_changes` | boolean (tri-state) | unset (= `false`) | Auto-approve **all** post-baseline tool changes AND additions for this server (disables per-server rug-pull protection). The active per-server control. A trusted server's *baseline* is auto-approved regardless of this flag. |
+| `skip_quarantine` | boolean | `false` | **Deprecated** — superseded by `auto_approve_tool_changes`. A legacy `skip_quarantine: true` is migrated onto `auto_approve_tool_changes` on load **only when it is unset** (an explicit `false` overrides the legacy flag). |
 
 See [Tool Quarantine](features/tool-quarantine.md) for complete details.
 
@@ -742,17 +984,20 @@ See [Code Execution Documentation](code_execution/overview.md) for complete deta
 
 ## Registries
 
+The three default registries ship built-in and require no configuration. Use
+the `registries` array only to **add your own** custom source:
+
 ```json
 {
   "registries": [
     {
-      "id": "pulse",
-      "name": "Pulse MCP",
-      "description": "Browse and discover MCP use-cases, servers, clients, and news",
-      "url": "https://www.pulsemcp.com/",
-      "servers_url": "https://api.pulsemcp.com/v0beta/servers",
-      "tags": ["verified"],
-      "protocol": "custom/pulse"
+      "id": "mycorp",
+      "name": "My Corp Registry",
+      "description": "Internal MCP server catalog",
+      "url": "https://registry.mycorp.example/",
+      "servers_url": "https://registry.mycorp.example/v0.1/servers",
+      "tags": ["internal"],
+      "protocol": "modelcontextprotocol/registry"
     }
   ]
 }
@@ -769,14 +1014,105 @@ See [Code Execution Documentation](code_execution/overview.md) for complete deta
 | `protocol` | string | Registry protocol type |
 | `count` | number/string | Number of servers in registry (auto-populated) |
 
-**Default Registries:**
-- Pulse MCP
-- Docker MCP Catalog
-- Fleur
-- Azure MCP Registry Demo
-- Remote MCP Servers
+**SSRF guard (`allow_private_registry_fetch`).** Because the daemon fetches the
+URL you configure, registry fetches refuse any host that is — or resolves to — a
+non-routable address (loopback, RFC1918/CGNAT private, link-local including the
+`169.254.169.254` cloud-metadata endpoint). This bounds CWE-918 request forgery
+against internal services. Set this top-level flag to `true` **only** if you
+intentionally run a trusted registry mirror on an internal/private address:
 
-See [Search Servers Documentation](search_servers.md) for complete details.
+```json
+{ "allow_private_registry_fetch": true }
+```
+
+> ⚠️ **The opt-out is blanket (all-or-nothing).** Setting it `true` lifts the
+> guard for **every** non-routable range at once — loopback, RFC1918/CGNAT
+> private, link-local **and** the `169.254.169.254` cloud-metadata endpoint.
+> There is no way to allow only loopback: enabling it for a localhost dev
+> registry also re-opens the cloud-metadata SSRF vector (e.g.
+> `registry add-source https://169.254.169.254/...` will then succeed). Enable
+> it only for trusted local/dev use, ideally on hosts with no cloud-metadata
+> exposure. The flag takes effect only on daemon (re)start / config reload.
+
+Default `false` (secure). See [Registries Documentation](registries.md#adding-your-own-registry-source).
+
+**Default Registries** (shipped built-in, no configuration required):
+- `official` — Official MCP Registry (`modelcontextprotocol/registry`): primary, zero-config aggregator
+- `reference` — Reference Servers (`builtin/reference`): curated `@modelcontextprotocol` servers, shipped in-binary so the basics work offline
+- `docker-mcp-catalog` — Docker MCP Catalog (`custom/docker`): signed-container MCP server inventory
+
+> **Deprecated former-defaults:** earlier versions also shipped `pulse`, `smithery`, `fleur`, `azure-mcp-demo`, and `remote-mcp-servers` as defaults. These were removed and are pruned from an existing `mcp_config.json` on load, so upgrades converge to the three defaults above. Genuinely user-added custom registries are never touched; `pulse`/`smithery` can be added back as custom sources.
+
+See [Registries Documentation](registries.md) and [Search Servers Documentation](search_servers.md) for complete details.
+
+---
+
+## Observability
+
+Controls the usage-statistics aggregate that powers the Web UI usage graphs
+(spec 069). The aggregate is built incrementally from the activity log, kept in
+memory as an immutable snapshot, and periodically persisted so it survives
+restarts without a full re-scan.
+
+```json
+{
+  "observability": {
+    "usage_cache_ttl": "5s",
+    "usage_persist_interval": "30s"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `usage_cache_ttl` | duration string | `5s` | Freshness bound for the usage endpoint's read cache on wide time windows. |
+| `usage_persist_interval` | duration string | `30s` | How often the in-memory usage aggregate snapshot is flushed to storage (also flushed on graceful shutdown). |
+
+Both fields are optional, accept Go duration strings (e.g. `"10s"`, `"1m"`),
+and are hot-reloadable. Non-positive values fall back to the defaults.
+
+---
+
+## Update Check
+
+Controls the background upgrade-awareness checker (Spec 079). MCPProxy
+periodically queries GitHub Releases and surfaces "update available" on
+`mcpproxy status` / `doctor`, a startup log line, the Web UI (sidebar badge +
+dismissible banner), and the trays. Checks never block and fail silently when
+offline.
+
+```json
+{
+  "update_check": {
+    "enabled": true,
+    "channel": "stable"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Master switch for update checking. When `false`, no network check is performed (background poll *and* the manual `/api/v1/info?refresh=true` re-check) and no upgrade nudge appears on any surface — the `update` object is omitted from `/api/v1/info`. |
+| `channel` | string | `"stable"` | Release channel: `"stable"` (GitHub `releases/latest`; prereleases never offered) or `"rc"` (prerelease tags such as `v0.47.0-rc.1` included). |
+
+Both keys are optional and hot-reloadable: editing them (config file or
+`POST /api/v1/config/apply`) takes effect without a restart, and re-enabling
+triggers a prompt re-check.
+
+**Environment-variable precedence** — the existing switches keep working and
+**win over** the config keys (operator override):
+
+| Variable | Effect |
+|----------|--------|
+| `MCPPROXY_DISABLE_AUTO_UPDATE=true` | Force-disables update checking even when `update_check.enabled` is `true`. |
+| `MCPPROXY_ALLOW_PRERELEASE_UPDATES=true` | Force-selects the prerelease (`rc`) channel even when `update_check.channel` is `stable`. |
+
+The env vars only widen in one direction (disable checks / enable
+prereleases); they cannot force-enable checking that config disabled — with
+`update_check.enabled: false`, checks stay off regardless of environment.
+
+See [Version Updates](features/version-updates.md) for where updates are
+surfaced.
 
 ---
 
@@ -888,6 +1224,7 @@ Many configuration options can be overridden via environment variables:
 | `MCPPROXY_TLS_REQUIRE_CLIENT_CERT` | `tls.require_client_cert` | Enable mTLS |
 | `MCPPROXY_CERTS_DIR` | `tls.certs_dir` | Custom certificates directory |
 | `MCPPROXY_DATA` | `data_dir` | Override data directory |
+| `MCPPROXY_TOOL_RESPONSE_MODE` | `tool_response_mode` | `retrieve_tools` serialization: `full` (default) or `compact` |
 | `MCPPROXY_DISABLE_OAUTH` | - | Disable OAuth for testing |
 | `HEADLESS` | - | Run in headless mode |
 
@@ -923,3 +1260,4 @@ Run `mcpproxy doctor` to check configuration health.
 - [Logging](logging.md) - Logging configuration and management
 - [Code Execution](code_execution/overview.md) - JavaScript code execution
 - [Search Servers](search_servers.md) - MCP server discovery
+- [TOON Output](features/toon-output.md) - Adaptive TOON encoding of tool results

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -62,15 +63,47 @@ func NewManager(db *bbolt.DB, logger *zap.Logger) (*Manager, error) {
 	return manager, nil
 }
 
-// GenerateKey generates a cache key from tool name, arguments, and timestamp
+// GenerateKey generates a cache key from tool name, arguments, and timestamp.
+//
+// The timestamp is mixed in at nanosecond granularity. The truncator calls
+// this with time.Now() once per truncated payload; a single upstream result
+// can carry multiple oversized TextContent blocks, and recursive read_cache
+// truncation can mint several keys in quick succession. At second granularity
+// any of those that landed in the same wall-clock second collided on one key,
+// so a later Store silently overwrote an earlier payload and the earlier
+// banner resolved to the wrong data. GenerateKey is a PURE function of its
+// inputs (asserted by TestGenerateKey); callers that need per-call uniqueness
+// must supply distinct timestamps — see NextUniqueTimestamp.
 func GenerateKey(toolName string, args map[string]interface{}, timestamp time.Time) string {
 	// Create a consistent string representation
 	argsJSON, _ := json.Marshal(args)
-	input := fmt.Sprintf("%s:%s:%d", toolName, string(argsJSON), timestamp.Unix())
+	input := fmt.Sprintf("%s:%s:%d", toolName, string(argsJSON), timestamp.UnixNano())
 
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])
 }
+
+// NextUniqueTimestamp returns a strictly increasing timestamp for cache-key
+// generation. time.Now() alone is not collision-safe: Windows wall-clock
+// resolution is ~0.5-15.6ms, so two truncated blocks in the same tick got
+// identical UnixNano readings and therefore identical keys (flaked
+// TestForwardContentResult_MultipleTextBlocksDistinctKeys on windows-latest).
+// A process-wide atomic high-water mark bumps same-tick readings by 1ns each,
+// preserving GenerateKey's purity while guaranteeing distinct inputs.
+func NextUniqueTimestamp() time.Time {
+	for {
+		now := time.Now().UnixNano()
+		last := lastKeyNano.Load()
+		if now <= last {
+			now = last + 1
+		}
+		if lastKeyNano.CompareAndSwap(last, now) {
+			return time.Unix(0, now)
+		}
+	}
+}
+
+var lastKeyNano atomic.Int64
 
 // Store saves a tool response to cache
 func (m *Manager) Store(key, toolName string, args map[string]interface{}, content, recordPath string, totalRecords int) error {
@@ -209,6 +242,97 @@ func (m *Manager) GetRecords(key string, offset, limit int) (*ReadCacheResponse,
 // GetStats returns current cache statistics
 func (m *Manager) GetStats() *Stats {
 	return m.stats
+}
+
+// Invalidate removes a single cache entry, forcing the next access to miss.
+// It is a no-op (nil error) if the key is absent. Used by the registry refresh
+// path (FR-007) to drop cached server lists on demand.
+func (m *Manager) Invalidate(key string) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(CacheBucket))
+		data := bucket.Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		var record Record
+		if err := record.UnmarshalBinary(data); err == nil {
+			m.stats.TotalEntries--
+			m.stats.TotalSizeBytes -= record.TotalSize
+		}
+		if err := bucket.Delete([]byte(key)); err != nil {
+			return fmt.Errorf("invalidate cache key: %w", err)
+		}
+		return m.saveStats(tx)
+	})
+}
+
+// Refresh forces the next access to re-fetch by invalidating the cached entry.
+// The cache manager has no knowledge of the upstream source, so "refresh" is a
+// lazy operation: it drops the stale value and the caller re-populates it on
+// the next Store. Provided alongside Invalidate to match the data model (FR-007).
+func (m *Manager) Refresh(key string) error {
+	return m.Invalidate(key)
+}
+
+// InvalidatePrefix removes every cache entry whose key starts with prefix and
+// returns how many were deleted. Registry caches are keyed by a stable prefix
+// (e.g. "registry-servers:<id>:") so a single refresh can drop all variants of
+// a registry's cached results regardless of tag/query/limit (FR-007).
+func (m *Manager) InvalidatePrefix(prefix string) (int, error) {
+	deleted := 0
+	err := m.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(CacheBucket))
+		cursor := bucket.Cursor()
+
+		var keysToDelete [][]byte
+		var sizeReduced int
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			if !strings.HasPrefix(string(key), prefix) {
+				continue
+			}
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			keysToDelete = append(keysToDelete, keyCopy)
+			var record Record
+			if err := record.UnmarshalBinary(value); err == nil {
+				sizeReduced += record.TotalSize
+			}
+		}
+
+		for _, key := range keysToDelete {
+			if err := bucket.Delete(key); err != nil {
+				return fmt.Errorf("invalidate prefix key: %w", err)
+			}
+		}
+		deleted = len(keysToDelete)
+		m.stats.TotalEntries -= deleted
+		m.stats.TotalSizeBytes -= sizeReduced
+		return m.saveStats(tx)
+	})
+	return deleted, err
+}
+
+// Peek returns a cached record WITHOUT evicting it or mutating access stats,
+// even when the entry has expired. Unlike Get (which deletes expired entries
+// and is the read path for fresh data), Peek lets the registry layer serve a
+// stale value while still flagging its age — callers derive freshness from
+// time.Since(record.CreatedAt) and record.IsExpired() (FR-007). The boolean is
+// false only when the key is absent.
+func (m *Manager) Peek(key string) (*Record, bool) {
+	var record *Record
+	_ = m.db.View(func(tx *bbolt.Tx) error {
+		data := tx.Bucket([]byte(CacheBucket)).Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		rec := &Record{}
+		if err := rec.UnmarshalBinary(data); err != nil {
+			return nil
+		}
+		record = rec
+		return nil
+	})
+	return record, record != nil
 }
 
 // startCleanup runs periodic cleanup of expired cache entries

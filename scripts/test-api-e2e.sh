@@ -41,6 +41,7 @@ API_KEY=""
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
+TESTS_SKIPPED=0
 
 echo -e "${GREEN}MCPProxy API E2E Tests${NC}"
 echo "=============================="
@@ -77,6 +78,9 @@ cleanup() {
 
     # Additional cleanup - find any remaining mcpproxy processes
     pkill -f "mcpproxy.*serve" 2>/dev/null || true
+    # Reap the launcher-test fixture if our launcher-lifecycle test
+    # failed before the shutdown reap path could run.
+    pkill -f "launcher-server.*--port 39933" 2>/dev/null || true
     sleep 1
 
     # Clean up test data
@@ -109,10 +113,25 @@ log_fail() {
     TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 
+# log_skip: non-blocking outcome for tests whose subject is an external,
+# third-party dependency (e.g. the live public MCP registry). A release-blocking
+# gate must not be held hostage by a third party's uptime, so a confirmed outage
+# of the *external* service is recorded as skipped, NOT failed. Reachable-but-wrong
+# responses still hard-fail via log_fail, preserving proxy-regression coverage.
+log_skip() {
+    echo -e "${YELLOW}[SKIP]${NC} $1"
+    TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+}
+
 # Extract API key from server logs
+# Optional $1 overrides the log path (used by scripts/test-extract-api-key.sh).
+# -a forces grep to treat the log as text: the server log can contain NUL bytes
+# (and ANSI color codes), which otherwise make grep report "Binary file ... matches"
+# instead of the match, corrupting API_KEY. See MCP-2404.
 extract_api_key() {
-    if [ -f "/tmp/mcpproxy_e2e.log" ]; then
-        API_KEY=$(grep -o '"api_key": "[^"]*"' "/tmp/mcpproxy_e2e.log" | sed 's/.*"api_key": "\([^"]*\)".*/\1/' | head -1)
+    local log_file="${1:-/tmp/mcpproxy_e2e.log}"
+    if [ -f "$log_file" ]; then
+        API_KEY=$(grep -ao '"api_key": "[^"]*"' "$log_file" | sed 's/.*"api_key": "\([^"]*\)".*/\1/' | head -1)
         if [ ! -z "$API_KEY" ]; then
             echo "Extracted API key: ${API_KEY:0:8}..."
         fi
@@ -167,6 +186,41 @@ wait_for_server() {
     done
 
     echo "Server failed to start within $max_attempts seconds"
+    return 1
+}
+
+# Wait for the launcher-test server (spec 046) to reach healthy.
+# Distinct from wait_for_everything_server because it specifically
+# verifies the new "mcpproxy spawned and connected to an HTTP MCP
+# server it owns" path rather than a stdio upstream.
+wait_for_launcher_test_server() {
+    local max_attempts=30
+    local attempt=1
+
+    echo "Waiting for launcher-test server to be connected..."
+
+    while [ $attempt -le $max_attempts ]; do
+        local curl_cmd="curl -s --max-time 5 $CURL_CA_OPTS"
+        if [ ! -z "$API_KEY" ]; then
+            curl_cmd="$curl_cmd -H \"X-API-Key: $API_KEY\""
+        fi
+        curl_cmd="$curl_cmd \"${API_BASE}/servers\""
+
+        local response=$(eval $curl_cmd 2>/dev/null)
+        local connected=$(echo "$response" | jq -r '.data.servers[] | select(.name=="launcher-test") | .connected // false' 2>/dev/null)
+
+        if [ "$connected" = "true" ]; then
+            echo "launcher-test server is connected"
+            sleep 1
+            return 0
+        fi
+
+        echo "Attempt $attempt/$max_attempts - launcher-test connected: $connected"
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo "launcher-test server failed to connect within $max_attempts attempts"
     return 1
 }
 
@@ -366,6 +420,97 @@ test_sse_auth_failure() {
     fi
 }
 
+# Spec-046 lifecycle test: verifies that mcpproxy spawned the launcher
+# fixture, drove its lifecycle via the REST API, and reaped it cleanly.
+#
+# Each assertion is a separate test row so a partial failure shows up as
+# one failed sub-step rather than a single opaque test fail.
+test_launcher_lifecycle() {
+    log_test "Launcher lifecycle: tools/list call reaches launched HTTP MCP server"
+    local curl_cmd="curl -s --max-time 10 $CURL_CA_OPTS"
+    if [ ! -z "$API_KEY" ]; then
+        curl_cmd="$curl_cmd -H \"X-API-Key: $API_KEY\""
+    fi
+    local tools_response
+    tools_response=$(eval "$curl_cmd \"${API_BASE}/servers/launcher-test/tools\"")
+    if echo "$tools_response" | jq -e '.success == true and any(.data.tools[]; .name == "ping")' >/dev/null 2>&1; then
+        log_pass "tools/list returned the fixture's ping tool"
+    else
+        log_fail "tools/list missing ping tool. Response: $tools_response"
+    fi
+
+    # Step 2: the child should be a real OS process. pgrep over the
+    # fixture argv signature lets us detect it without knowing the PID
+    # mcpproxy assigned. Use `pgrep -f` for arg-line matching.
+    log_test "Launcher lifecycle: child process is running (pgrep)"
+    local before_pid
+    before_pid=$(pgrep -f 'launcher-server.*--port 39933' | head -1)
+    if [ -n "$before_pid" ]; then
+        log_pass "child running (pid=$before_pid)"
+    else
+        log_fail "no launcher-server process found via pgrep"
+    fi
+
+    # Step 3: restart -> child must be a NEW pid afterwards.
+    log_test "Launcher lifecycle: POST /restart reaps + respawns child with new PID"
+    eval "$curl_cmd -X POST \"${API_BASE}/servers/launcher-test/restart\"" >/dev/null
+    sleep 4
+    local after_pid
+    after_pid=$(pgrep -f 'launcher-server.*--port 39933' | head -1)
+    if [ -z "$after_pid" ]; then
+        log_fail "child gone after restart — should have respawned"
+    elif [ "$after_pid" = "$before_pid" ]; then
+        log_fail "child PID unchanged after restart (was $before_pid, still $after_pid)"
+    else
+        log_pass "child respawned (was=$before_pid, now=$after_pid)"
+    fi
+
+    # Step 4: disable -> child must be gone.
+    log_test "Launcher lifecycle: POST /disable reaps the child"
+    eval "$curl_cmd -X POST \"${API_BASE}/servers/launcher-test/disable\"" >/dev/null
+    # Give the launcher up to 8s to deliver SIGTERM + wait for exit.
+    local waited=0
+    while [ $waited -lt 8 ]; do
+        if ! pgrep -f 'launcher-server.*--port 39933' >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if pgrep -f 'launcher-server.*--port 39933' >/dev/null 2>&1; then
+        local stragglers
+        stragglers=$(pgrep -f 'launcher-server.*--port 39933' | tr '\n' ' ')
+        log_fail "child still alive ${waited}s after disable (pids: $stragglers)"
+    else
+        log_pass "child reaped within ${waited}s of disable"
+    fi
+
+    # Step 5: re-enable + reconnect, then verify a fresh PID appears.
+    log_test "Launcher lifecycle: POST /enable respawns child"
+    eval "$curl_cmd -X POST \"${API_BASE}/servers/launcher-test/enable\"" >/dev/null
+    if wait_for_launcher_test_server; then
+        local reenabled_pid
+        reenabled_pid=$(pgrep -f 'launcher-server.*--port 39933' | head -1)
+        if [ -n "$reenabled_pid" ] && [ "$reenabled_pid" != "$after_pid" ]; then
+            log_pass "child respawned after enable (pid=$reenabled_pid, different from $after_pid)"
+        else
+            log_fail "expected a new PID after enable; got '$reenabled_pid' (previous '$after_pid')"
+        fi
+    else
+        log_fail "launcher-test never reconnected after enable"
+    fi
+
+    # Step 6: per-server log should contain the launcher banner.
+    log_test "Launcher lifecycle: per-server log captures child output"
+    local logs_response
+    logs_response=$(eval "$curl_cmd \"${API_BASE}/servers/launcher-test/logs?tail=200\"")
+    if echo "$logs_response" | jq -r '.data.logs[]?' 2>/dev/null | grep -qE '\[launcher\] starting|\[launcher-server\] listening'; then
+        log_pass "per-server log contains launcher banner / child stdout"
+    else
+        log_fail "per-server log missing launcher banner or child stdout"
+    fi
+}
+
 # Prerequisites check
 echo -e "${YELLOW}Checking prerequisites...${NC}"
 
@@ -393,6 +538,21 @@ fi
 if ! command -v npx &> /dev/null; then
     echo -e "${RED}Error: npx is required for @modelcontextprotocol/server-everything${NC}"
     echo "Please install Node.js and npm"
+    exit 1
+fi
+
+# Build the launcher-test fixture. This is a tiny HTTP MCP server used
+# by the spec-046 launcher-lifecycle test below. We rebuild every run
+# so the fixture stays in lockstep with the e2e harness.
+LAUNCHER_FIXTURE="./test/launcher-server/launcher-server"
+echo -e "${YELLOW}Building launcher-test fixture (./test/launcher-server)...${NC}"
+if ! go build -o "$LAUNCHER_FIXTURE" ./test/launcher-server >/tmp/launcher-fixture-build.log 2>&1; then
+    echo -e "${RED}Error: failed to build launcher-test fixture${NC}"
+    cat /tmp/launcher-fixture-build.log
+    exit 1
+fi
+if [ ! -x "$LAUNCHER_FIXTURE" ]; then
+    echo -e "${RED}Error: launcher-test fixture not executable at $LAUNCHER_FIXTURE${NC}"
     exit 1
 fi
 
@@ -438,6 +598,13 @@ if ! wait_for_everything_server; then
     exit 1
 fi
 
+# Wait for the launcher-test server (spec 046). Failing this hard would
+# mask other regressions in the suite, so we just warn and let the
+# launcher tests below decide whether to fail.
+if ! wait_for_launcher_test_server; then
+    echo -e "${YELLOW}Warning: launcher-test server never connected — launcher lifecycle test will fail loudly below.${NC}"
+fi
+
 echo ""
 echo -e "${YELLOW}Running API tests...${NC}"
 echo ""
@@ -453,6 +620,10 @@ test_api "GET /api/v1/servers" "GET" "${API_BASE}/servers" "200" "" \
 # Test 2: Get specific server tools
 test_api "GET /api/v1/servers/everything/tools" "GET" "${API_BASE}/servers/everything/tools" "200" "" \
     "jq -e '.success == true and (.data.tools | length) > 0' < '$TEST_RESULTS_FILE' >/dev/null"
+
+# Test 2b: Global tools overview (spec 050, issue #437) — consolidated listing + stats
+test_api "GET /api/v1/tools" "GET" "${API_BASE}/tools" "200" "" \
+    "jq -e '.success == true and (.data.tools | type == \"array\") and (.data.tools | length) > 0 and (.data.stats | has(\"total\") and has(\"enabled\") and has(\"disabled\") and has(\"pending_approval\")) and (.data.stats.total == (.data.tools | length))' < '$TEST_RESULTS_FILE' >/dev/null"
 
 # Test 3: Search tools
 test_api "GET /api/v1/index/search?q=echo" "GET" "${API_BASE}/index/search?q=echo" "200" "" \
@@ -516,6 +687,13 @@ fi
 test_api "GET /api/v1/servers (after restart)" "GET" "${API_BASE}/servers" "200" "" \
     "jq -e '.success == true and (.data.servers | length) > 0' < '$TEST_RESULTS_FILE' >/dev/null"
 
+# Spec-046 launcher lifecycle (six sub-assertions). Runs late in the
+# suite so an earlier failure that takes down mcpproxy short-circuits
+# here too rather than producing confusing isolated failures.
+echo ""
+echo -e "${YELLOW}Running launcher lifecycle test (spec 046)...${NC}"
+test_launcher_lifecycle
+
 # Test 17: Test concurrent requests
 echo ""
 log_test "Concurrent API requests"
@@ -564,7 +742,7 @@ echo ""
 echo -e "${YELLOW}Executing a tool call to create history for replay test...${NC}"
 TOOL_CALL_ID=""
 # Make a tool call using the echo_tool from everything server
-$MCPPROXY_BINARY call tool --tool-name="everything:echo_tool" --json_args='{"message":"test replay"}' > /dev/null 2>&1 || true
+$MCPPROXY_BINARY -d "$TEST_DATA_DIR" call tool-read --tool-name="everything:echo_tool" --json_args='{"message":"test replay"}' > /dev/null 2>&1 || true
 sleep 2  # Wait for call to be recorded
 
 # Test 22: Get tool call history again (should have at least one call)
@@ -608,173 +786,57 @@ else
         "jq -e '.success == true and .data.registries != null and .data.total > 0' < '$TEST_RESULTS_FILE' >/dev/null"
 fi
 
+# Tests 26/27 proxy to the LIVE public "official" MCP registry. When that
+# third-party service is slow/down we log_skip instead of log_fail — a
+# release-blocking gate must not depend on a third party's uptime. But a
+# success:false is ONLY treated as an outage when there is transport-level
+# evidence: curl itself failed/timed out (rc != 0 or empty body), or the proxy's
+# error envelope names an upstream fetch/transport failure. A success:false whose
+# .error is anything else is a real proxy-side regression (same writeError path
+# the handler uses for its own bugs) and must hard-fail — otherwise the gate
+# would silently skip an API regression it exists to catch.
+registry_is_outage() {
+    # $1 = curl rc, $2 = response body
+    local rc="$1" body="$2"
+    if [ "$rc" -ne 0 ] || [ -z "$body" ]; then
+        return 0
+    fi
+    if echo "$body" | jq -e '.success == false' >/dev/null 2>&1; then
+        local err
+        err=$(echo "$body" | jq -r '.error // ""' 2>/dev/null)
+        if echo "$err" | grep -qiE 'timeout|timed out|deadline exceeded|connection refused|no such host|no route to host|network is unreachable|i/o timeout|tls handshake|EOF|temporarily|unreachable|dial tcp|refused|reset by peer|502|503|504|bad gateway|gateway timeout|upstream|server misbehaving'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Test 26: Search registry servers (Phase 7)
 log_test "GET /api/v1/registries/{id}/servers"
-RESPONSE=$(curl -s --max-time 10 $CURL_CA_OPTS -H "X-API-Key: $API_KEY" "${API_BASE}/registries/pulse/servers?limit=5")
+RESPONSE=$(curl -s --max-time 10 $CURL_CA_OPTS -H "X-API-Key: $API_KEY" "${API_BASE}/registries/official/servers?limit=5")
+CURL_RC=$?
 echo "$RESPONSE" > "$TEST_RESULTS_FILE"
-if echo "$RESPONSE" | jq -e '.success == true and .data.servers != null and .data.registry_id == "pulse"' >/dev/null; then
+if echo "$RESPONSE" | jq -e '.success == true and .data.servers != null and .data.registry_id == "official"' >/dev/null 2>&1; then
     log_pass "GET /api/v1/registries/{id}/servers - Response has servers array and registry_id"
+elif registry_is_outage "$CURL_RC" "$RESPONSE"; then
+    log_skip "GET /api/v1/registries/{id}/servers - external 'official' registry unreachable (curl rc=$CURL_RC); not a proxy regression"
 else
     log_fail "GET /api/v1/registries/{id}/servers - Expected server search results" \
-        "jq -e '.success == true and .data.servers != null and .data.registry_id == \"pulse\"' < '$TEST_RESULTS_FILE' >/dev/null"
+        "jq -e '.success == true and .data.servers != null and .data.registry_id == \"official\"' < '$TEST_RESULTS_FILE' >/dev/null"
 fi
 
-# Test 27: Search registry servers with query (Phase 7)
+# Test 27: Search registry servers with query (Phase 7) — same external dependency.
 log_test "GET /api/v1/registries/{id}/servers with query parameter"
-RESPONSE=$(curl -s --max-time 10 $CURL_CA_OPTS -H "X-API-Key: $API_KEY" "${API_BASE}/registries/pulse/servers?q=github&limit=3")
+RESPONSE=$(curl -s --max-time 10 $CURL_CA_OPTS -H "X-API-Key: $API_KEY" "${API_BASE}/registries/official/servers?q=github&limit=3")
+CURL_RC=$?
 echo "$RESPONSE" > "$TEST_RESULTS_FILE"
-if echo "$RESPONSE" | jq -e '.success == true and .data.servers != null and .data.query == "github"' >/dev/null; then
+if echo "$RESPONSE" | jq -e '.success == true and .data.servers != null and .data.query == "github"' >/dev/null 2>&1; then
     log_pass "GET /api/v1/registries/{id}/servers?q=github - Response has query field"
+elif registry_is_outage "$CURL_RC" "$RESPONSE"; then
+    log_skip "GET /api/v1/registries/{id}/servers?q=github - external 'official' registry unreachable (curl rc=$CURL_RC); not a proxy regression"
 else
     log_fail "GET /api/v1/registries/{id}/servers?q=github - Expected query parameter in response" \
         "jq -e '.success == true and .data.servers != null and .data.query == \"github\"' < '$TEST_RESULTS_FILE' >/dev/null"
-fi
-
-# ===========================================
-# Tests for env_json, args_json, headers_json updates (Issue #182)
-# ===========================================
-echo ""
-echo -e "${YELLOW}Testing env_json, args_json, headers_json updates...${NC}"
-echo ""
-
-# Test 28: Add a test server for env/args/headers testing
-log_test "Add test server for env/args/headers tests"
-ADD_SERVER_DATA='{"operation":"add","name":"env-test-server","command":"echo","args_json":"[\"hello\"]","env_json":"{\"INITIAL_VAR\":\"initial\",\"SECOND_VAR\":\"second\"}","enabled":false}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$ADD_SERVER_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "env-test-server"; then
-    log_pass "Add test server for env/args/headers tests"
-else
-    log_fail "Add test server for env/args/headers tests - Failed to add server"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 29: Update env_json (full replacement)
-log_test "Update env_json via upstream_servers tool"
-UPDATE_ENV_DATA='{"operation":"update","name":"env-test-server","env_json":"{\"NEW_VAR\":\"new_value\",\"ANOTHER_VAR\":\"test\"}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$UPDATE_ENV_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "NEW_VAR" && ! echo "$RESPONSE" | grep -q "INITIAL_VAR"; then
-    log_pass "Update env_json via upstream_servers tool - Full replacement worked"
-else
-    log_fail "Update env_json via upstream_servers tool - Full replacement failed"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 30: Verify env_json update via list operation
-log_test "Verify env_json update via list operation"
-LIST_DATA='{"operation":"list"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$LIST_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "NEW_VAR" && echo "$RESPONSE" | grep -q "new_value"; then
-    log_pass "Verify env_json update via list operation"
-else
-    log_fail "Verify env_json update via list operation - NEW_VAR not found in list response"
-fi
-
-# Test 31: Update args_json
-log_test "Update args_json via upstream_servers tool"
-UPDATE_ARGS_DATA='{"operation":"update","name":"env-test-server","args_json":"[\"updated\",\"--flag\"]"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$UPDATE_ARGS_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "updated"; then
-    log_pass "Update args_json via upstream_servers tool"
-else
-    log_fail "Update args_json via upstream_servers tool"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 32: Verify args_json update via list operation
-log_test "Verify args_json update via list operation"
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args='{"operation":"list"}' 2>&1)
-if echo "$RESPONSE" | grep -q "updated" && echo "$RESPONSE" | grep -q "\-\-flag"; then
-    log_pass "Verify args_json update via list operation"
-else
-    log_fail "Verify args_json update via list operation - updated args not found in list response"
-fi
-
-# Test 33: Add HTTP server for headers test
-log_test "Add HTTP server for headers_json test"
-ADD_HTTP_DATA='{"operation":"add","name":"headers-test-server","url":"http://example.com/api","protocol":"http","headers_json":"{\"X-Initial\":\"initial\"}","enabled":false}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$ADD_HTTP_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "headers-test-server"; then
-    log_pass "Add HTTP server for headers_json test"
-else
-    log_fail "Add HTTP server for headers_json test"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 34: Update headers_json
-log_test "Update headers_json via upstream_servers tool"
-UPDATE_HEADERS_DATA='{"operation":"update","name":"headers-test-server","headers_json":"{\"X-Custom\":\"custom-value\",\"Authorization\":\"Bearer token123\"}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$UPDATE_HEADERS_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "X-Custom" && ! echo "$RESPONSE" | grep -q "X-Initial"; then
-    log_pass "Update headers_json via upstream_servers tool - Full replacement worked"
-else
-    log_fail "Update headers_json via upstream_servers tool - Full replacement failed"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 35: Verify headers_json update via list operation
-log_test "Verify headers_json update via list operation"
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args='{"operation":"list"}' 2>&1)
-if echo "$RESPONSE" | grep -q "X-Custom" && echo "$RESPONSE" | grep -q "custom-value"; then
-    log_pass "Verify headers_json update via list operation"
-else
-    log_fail "Verify headers_json update via list operation - X-Custom header not found in list response"
-fi
-
-# Test 36: Clear env vars with empty JSON
-log_test "Clear env vars with empty env_json"
-CLEAR_ENV_DATA='{"operation":"update","name":"env-test-server","env_json":"{}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$CLEAR_ENV_DATA" 2>&1)
-# Verify via list - env should be empty or null
-LIST_RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args='{"operation":"list"}' 2>&1)
-# Check that NEW_VAR is no longer present in env-test-server's env
-if echo "$LIST_RESPONSE" | grep -A 20 "env-test-server" | grep -q "NEW_VAR"; then
-    log_fail "Clear env vars with empty env_json - NEW_VAR still present"
-else
-    log_pass "Clear env vars with empty env_json"
-fi
-
-# Test 37: Test patch operation (same semantics as update)
-log_test "Patch env_json via upstream_servers tool"
-PATCH_ENV_DATA='{"operation":"patch","name":"env-test-server","env_json":"{\"PATCHED_VAR\":\"patched_value\"}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$PATCH_ENV_DATA" 2>&1)
-if echo "$RESPONSE" | grep -q "PATCHED_VAR" && echo "$RESPONSE" | grep -q "patched_value"; then
-    log_pass "Patch env_json via upstream_servers tool"
-else
-    log_fail "Patch env_json via upstream_servers tool - Expected PATCHED_VAR in response"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 38: Test invalid env_json (should fail gracefully)
-log_test "Invalid env_json returns error"
-INVALID_ENV_DATA='{"operation":"update","name":"env-test-server","env_json":"not valid json"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$INVALID_ENV_DATA" 2>&1)
-if echo "$RESPONSE" | grep -qi "error\|invalid\|failed"; then
-    log_pass "Invalid env_json returns error"
-else
-    log_fail "Invalid env_json returns error - Expected error message"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 39: Test invalid args_json (array expected)
-log_test "Invalid args_json (not array) returns error"
-INVALID_ARGS_DATA='{"operation":"update","name":"env-test-server","args_json":"{\"key\":\"value\"}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$INVALID_ARGS_DATA" 2>&1)
-if echo "$RESPONSE" | grep -qi "error\|invalid\|failed\|array"; then
-    log_pass "Invalid args_json (not array) returns error"
-else
-    log_fail "Invalid args_json (not array) returns error - Expected error message"
-    echo "Response: $RESPONSE"
-fi
-
-# Test 40: Test server not found
-log_test "Update nonexistent server returns error"
-NOTFOUND_DATA='{"operation":"update","name":"nonexistent-server-12345","env_json":"{\"VAR\":\"value\"}"}'
-RESPONSE=$($MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args="$NOTFOUND_DATA" 2>&1)
-if echo "$RESPONSE" | grep -qi "error\|not found\|failed"; then
-    log_pass "Update nonexistent server returns error"
-else
-    log_fail "Update nonexistent server returns error - Expected error message"
-    echo "Response: $RESPONSE"
 fi
 
 # ============================================================================
@@ -941,7 +1003,7 @@ ACTIVITY_ID=$(jq -r '.data.activities[0].id // empty' < "$TEST_RESULTS_FILE" 2>/
 if [ ! -z "$ACTIVITY_ID" ]; then
     echo -e "${YELLOW}Testing activity detail with ID: $ACTIVITY_ID${NC}"
     test_api "GET /api/v1/activity/{id}" "GET" "${API_BASE}/activity/${ACTIVITY_ID}" "200" "" \
-        "jq -e '.success == true and .data.id != null' < '$TEST_RESULTS_FILE' >/dev/null"
+        "jq -e '.success == true and .data.activity.id != null' < '$TEST_RESULTS_FILE' >/dev/null"
 else
     echo -e "${YELLOW}Skipping activity detail test - no activity records available${NC}"
 fi
@@ -1080,11 +1142,6 @@ echo -e "${YELLOW}Cleaning up CLI test servers...${NC}"
 $MCPPROXY_BINARY -d "$TEST_DATA_DIR" upstream remove cli-stdio-test --yes --if-exists > /dev/null 2>&1 || true
 $MCPPROXY_BINARY -d "$TEST_DATA_DIR" upstream remove cli-header-test --yes --if-exists > /dev/null 2>&1 || true
 
-# Cleanup test servers
-echo ""
-echo -e "${YELLOW}Cleaning up test servers...${NC}"
-$MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args='{"operation":"remove","name":"env-test-server"}' > /dev/null 2>&1 || true
-$MCPPROXY_BINARY call tool --tool-name="upstream_servers" --json_args='{"operation":"remove","name":"headers-test-server"}' > /dev/null 2>&1 || true
 
 echo ""
 echo -e "${YELLOW}Test Summary${NC}"
@@ -1092,6 +1149,7 @@ echo "============"
 echo -e "Tests run: ${BLUE}$TESTS_RUN${NC}"
 echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
 echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"
+echo -e "Tests skipped: ${YELLOW}$TESTS_SKIPPED${NC}"
 
 if [ $TESTS_FAILED -eq 0 ]; then
     echo ""

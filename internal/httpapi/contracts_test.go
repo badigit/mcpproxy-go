@@ -168,6 +168,7 @@ func (m *MockServerController) GetDockerRecoveryStatus() *storage.DockerRecovery
 		LastError:       "",
 	}
 }
+func (m *MockServerController) IsDockerAvailable() bool { return true }
 func (m *MockServerController) GetRecentSessions(_ int) ([]*contracts.MCPSession, int, error) {
 	return []*contracts.MCPSession{}, 0, nil
 }
@@ -258,6 +259,10 @@ func (m *MockServerController) ListActivities(_ storage.ActivityFilter) ([]*stor
 func (m *MockServerController) GetActivity(_ string) (*storage.ActivityRecord, error) {
 	return nil, nil
 }
+func (m *MockServerController) AggregateToolUsage(_ time.Time) (map[string]storage.ToolUsageStat, error) {
+	return map[string]storage.ToolUsageStat{}, nil
+}
+func (m *MockServerController) UsageSnapshot() *internalRuntime.UsageAggregate { return nil }
 func (m *MockServerController) StreamActivities(_ storage.ActivityFilter) <-chan *storage.ActivityRecord {
 	ch := make(chan *storage.ActivityRecord)
 	close(ch)
@@ -285,6 +290,10 @@ func (m *MockServerController) GetConfig() (*config.Config, error) {
 	}, nil
 }
 
+func (m *MockServerController) DefaultInstructions() string {
+	return "test built-in default: use retrieve_tools to discover tools"
+}
+
 // Readiness method
 func (m *MockServerController) IsReady() bool { return true }
 
@@ -302,8 +311,23 @@ func (m *MockServerController) CallTool(_ context.Context, _ string, _ map[strin
 func (m *MockServerController) ListRegistries() ([]interface{}, error) {
 	return []interface{}{}, nil
 }
-func (m *MockServerController) SearchRegistryServers(_, _, _ string, _ int) ([]interface{}, error) {
-	return []interface{}{}, nil
+func (m *MockServerController) SearchRegistryServers(_, _, _ string, _ int) ([]interface{}, *contracts.RegistryCacheInfo, error) {
+	return []interface{}{}, nil, nil
+}
+func (m *MockServerController) RefreshRegistryCache(_ string) (int, error) {
+	return 0, nil
+}
+func (m *MockServerController) AddServerFromRegistryRef(_ context.Context, _, _, _ string, _ map[string]string, _ *bool) (*config.ServerConfig, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *MockServerController) AddRegistrySourceRef(_, _, _, _ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *MockServerController) RemoveRegistrySourceRef(_ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *MockServerController) EditRegistrySourceRef(_, _, _, _ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
 }
 
 // Version and updates
@@ -337,10 +361,19 @@ func (m *MockServerController) ListToolApprovals(_ string) ([]*storage.ToolAppro
 }
 func (m *MockServerController) ApproveTools(_ string, _ []string, _ string) error { return nil }
 func (m *MockServerController) ApproveAllTools(_ string, _ string) (int, error)   { return 0, nil }
+func (m *MockServerController) BlockTools(_ string, _ []string, _ string) (int, error) {
+	return 0, nil
+}
+func (m *MockServerController) BlockAllTools(_ string, _ string) (int, error) { return 0, nil }
 func (m *MockServerController) GetToolApproval(_, _ string) (*storage.ToolApprovalRecord, error) {
 	return nil, nil
 }
 func (m *MockServerController) GetToolApprovalStatus(_, _ string) (string, error) { return "", nil }
+func (m *MockServerController) GetOnboardingState() (*storage.OnboardingState, error) {
+	return &storage.OnboardingState{}, nil
+}
+func (m *MockServerController) SaveOnboardingState(_ *storage.OnboardingState) error { return nil }
+func (m *MockServerController) GetActivationFirstMCPClient() (bool, []string)        { return false, nil }
 
 // Test contract compliance for API responses
 func TestAPIContractCompliance(t *testing.T) {
@@ -650,9 +683,24 @@ func TestInfoEndpointIncludesUpdateInfo(t *testing.T) {
 	updateInfo, ok := data["update"].(map[string]interface{})
 	assert.True(t, ok, "update should be a map")
 
-	// Verify update info structure
-	assert.Contains(t, updateInfo, "available", "update info should have available field")
-	assert.Contains(t, updateInfo, "latest_version", "update info should have latest_version field")
+	// Verify update info structure. Spec 079 FR-021 contract: the six
+	// pre-existing update fields MUST survive the additive
+	// install_channel/update_command extension.
+	for _, key := range []string{
+		"available", "latest_version", "release_url", "checked_at", "is_prerelease", "check_error",
+	} {
+		assert.Contains(t, updateInfo, key, "update info must retain existing field %q (FR-021)", key)
+	}
+
+	// The two additive Spec 079 US2 fields.
+	assert.Equal(t, "homebrew", updateInfo["install_channel"], "update info should carry the detected install channel")
+	assert.Equal(t, "brew upgrade mcpproxy", updateInfo["update_command"], "update info should carry the channel update command when an update is available")
+
+	// The top-level version must match the checker's current version: they
+	// are identical for packaged builds, and for go-install builds the
+	// checker promotes the build-info module version while the ldflags
+	// default would read "development" (Spec 079 US2).
+	assert.Equal(t, "v1.0.0", data["version"], "top-level version should prefer the checker's current version")
 }
 
 // MockControllerWithUpdateInfo extends MockServerController with update info
@@ -661,11 +709,17 @@ type MockControllerWithUpdateInfo struct {
 }
 
 func (m *MockControllerWithUpdateInfo) GetVersionInfo() *updatecheck.VersionInfo {
+	checkedAt := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 	return &updatecheck.VersionInfo{
 		CurrentVersion:  "v1.0.0",
 		LatestVersion:   "v1.1.0",
 		UpdateAvailable: true,
 		ReleaseURL:      "https://github.com/user/mcpproxy-go/releases/tag/v1.1.0",
+		CheckedAt:       &checkedAt,
+		IsPrerelease:    true,
+		CheckError:      "transient: rate limited",
+		InstallChannel:  updatecheck.ChannelHomebrew,
+		UpdateCommand:   updatecheck.UpdateCommand(updatecheck.ChannelHomebrew),
 	}
 }
 

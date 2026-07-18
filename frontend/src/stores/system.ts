@@ -21,6 +21,8 @@ export const useSystemStore = defineStore('system', () => {
   const toasts = ref<Toast[]>([])
   const info = ref<InfoResponse | null>(null)
   const routing = ref<RoutingInfo | null>(null)
+  const checkingForUpdates = ref(false)
+  const updateCheckedAt = ref<string | null>(null)
 
   // Available themes
   const themes: Theme[] = [
@@ -68,6 +70,10 @@ export const useSystemStore = defineStore('system', () => {
   const version = computed(() => info.value?.version ?? '')
   const updateAvailable = computed(() => info.value?.update?.available ?? false)
   const latestVersion = computed(() => info.value?.update?.latest_version ?? '')
+  // Spec 079 US2: detected install channel + channel-aware one-line update
+  // command (empty when the channel has no safe command, FR-009).
+  const installChannel = computed(() => info.value?.update?.install_channel ?? '')
+  const updateCommand = computed(() => info.value?.update?.update_command ?? '')
 
   // Routing mode
   const routingMode = computed(() => routing.value?.routing_mode ?? status.value?.routing_mode ?? 'retrieve_tools')
@@ -180,6 +186,19 @@ export const useSystemStore = defineStore('system', () => {
         window.dispatchEvent(new CustomEvent('mcpproxy:scanner-changed', { detail: data }))
       } catch (error) {
         console.error('Failed to parse SSE security.scanner_changed event:', error)
+      }
+    })
+
+    // Spec 077 US4 (MCP-2207): a single debounced settled event per server per
+    // scan replaces the per-scanner scan_started/progress/completed/failed
+    // storm. Forward it so scan-status consumers can refresh once per scan.
+    es.addEventListener('security.scan_settled', (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        const payload = data.payload || data
+        window.dispatchEvent(new CustomEvent('mcpproxy:scan-settled', { detail: payload }))
+      } catch (error) {
+        console.error('Failed to parse SSE security.scan_settled event:', error)
       }
     })
 
@@ -378,9 +397,61 @@ export const useSystemStore = defineStore('system', () => {
       const response = await api.getInfo()
       if (response.success && response.data) {
         info.value = response.data
+        if (response.data.update?.checked_at) {
+          updateCheckedAt.value = response.data.update.checked_at
+        }
       }
     } catch (error) {
       console.error('Failed to fetch info:', error)
+    }
+  }
+
+  async function checkForUpdates(): Promise<{ ok: boolean; error?: string }> {
+    if (checkingForUpdates.value) return { ok: false, error: 'already checking' }
+    checkingForUpdates.value = true
+    try {
+      const response = await api.getInfo({ refresh: true })
+      if (response.success && response.data) {
+        info.value = response.data
+        // Spec 079 FR-015: when update checking is disabled
+        // (update_check.enabled=false or MCPPROXY_DISABLE_AUTO_UPDATE), the
+        // daemon performs no check and omits the update object — say so
+        // instead of a misleading "latest version" toast.
+        if (!response.data.update) {
+          addToast({
+            type: 'info',
+            title: 'Update checks are disabled',
+            message: 'Enable update_check in the configuration to check for updates.',
+          })
+          return { ok: true }
+        }
+        updateCheckedAt.value = response.data.update?.checked_at ?? new Date().toISOString()
+        const checkErr = response.data.update?.check_error
+        if (checkErr) {
+          addToast({ type: 'error', title: 'Update check failed', message: checkErr })
+          return { ok: false, error: checkErr }
+        }
+        if (response.data.update?.available) {
+          addToast({
+            type: 'info',
+            title: 'Update available',
+            message: response.data.update.latest_version || '',
+          })
+        } else {
+          addToast({ type: 'success', title: 'You are running the latest version.' })
+        }
+        return { ok: true }
+      }
+      const err = response.error || 'Request failed'
+      addToast({ type: 'error', title: 'Update check failed', message: err })
+      return { ok: false, error: err }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error('Failed to check for updates:', error)
+      addToast({ type: 'error', title: 'Update check failed', message: msg })
+      return { ok: false, error: msg }
+    } finally {
+      checkingForUpdates.value = false
     }
   }
 
@@ -407,6 +478,8 @@ export const useSystemStore = defineStore('system', () => {
     themes,
     info,
     routing,
+    checkingForUpdates,
+    updateCheckedAt,
 
     // Computed
     isRunning,
@@ -416,6 +489,8 @@ export const useSystemStore = defineStore('system', () => {
     version,
     updateAvailable,
     latestVersion,
+    installChannel,
+    updateCommand,
     routingMode,
     sidebarCollapsed,
 
@@ -430,5 +505,6 @@ export const useSystemStore = defineStore('system', () => {
     clearToasts,
     fetchInfo,
     fetchRouting,
+    checkForUpdates,
   }
 })

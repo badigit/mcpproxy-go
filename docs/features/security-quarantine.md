@@ -55,26 +55,42 @@ When a server is unquarantined (approved):
 1. The server connects to discover its tools
 2. Tools are **indexed and become searchable**
 3. Tool calls are allowed to execute normally
+4. Any **pending** (newly-discovered, never-reviewed) tool-approval records for
+   the server are **auto-promoted to approved** — approving a server means you
+   trust its current tool snapshot (baseline trust). Tools whose description or
+   schema later **changes** (`changed`, i.e. rug-pull) are *not* affected and
+   stay blocked until you re-approve them explicitly.
 
 ### Security Analysis
 
-When a quarantined server's tool is called, MCPProxy returns:
+When a tool from a quarantined server is called, MCPProxy **blocks the call** and
+returns a structured security response instead of invoking it — so the tool's
+description can be reviewed before it ever runs:
 
 ```json
 {
-  "status": "quarantined",
-  "server": "suspicious-server",
-  "analysis": {
-    "tool_count": 15,
-    "suspicious_patterns": [
-      "Tool 'fetch_data' description contains external URL",
-      "Tool 'execute' has overly broad permissions"
-    ],
-    "risk_level": "medium",
-    "recommendation": "Review tool descriptions before approving"
+  "status": "QUARANTINED_SERVER_BLOCKED",
+  "serverName": "suspicious-server",
+  "toolName": "fetch_data",
+  "message": "🔒 SECURITY BLOCK: Server 'suspicious-server' is currently in quarantine for security review. Tool calls are blocked to prevent potential Tool Poisoning Attacks (TPAs).",
+  "instructions": "To use tools from this server, please: 1) Review the server and its tools for malicious content, 2) Use the 'upstream_servers' tool with operation 'list_quarantined' to inspect tools, 3) remove from quarantine if verified safe",
+  "toolAnalysis": {
+    "name": "fetch_data",
+    "description": "…",
+    "inputSchema": { "…": "…" },
+    "serverName": "suspicious-server",
+    "analysis": "SECURITY ANALYSIS: This tool is from a quarantined server. Please carefully review the description and input schema for potential hidden instructions, embedded prompts, or suspicious behavior patterns."
   }
 }
 ```
+
+The actual pattern **detection** — hidden-Unicode smuggling, cross-server
+shadowing, decoded shell payloads, injection/exfiltration phrases, and embedded
+secrets — is performed by the deterministic offline detect engine that backs the
+built-in `tpa-descriptions` scanner. Its findings appear in the scan report
+(`mcpproxy security report <server>`), each carrying a `rule_id`, `severity`,
+`threat_level`, `confidence`, and the contributing check `signals`. See
+[Tool Scanner](/features/tool-scanner) for the full rule reference.
 
 ## Managing Quarantine
 
@@ -145,15 +161,24 @@ Before approving a server, verify:
 
 ## Detection Patterns
 
-MCPProxy checks for these suspicious patterns:
+Tool-description analysis is performed by the deterministic, fully-offline
+**detect engine** that backs the built-in `tpa-descriptions` scanner. It runs
+**seven checks across two tiers** — four **hard** checks that auto-quarantine and
+block approval, and three **soft** checks that raise a human-review item:
 
-| Pattern | Risk Level | Description |
-|---------|------------|-------------|
-| External URLs in descriptions | Medium | May indicate data exfiltration |
-| Credential keywords | High | Mentions of "password", "token", "key" |
-| Execution commands | High | Shell execution capabilities |
-| Hidden instructions | Critical | Base64 encoded or obfuscated content |
-| Overly broad permissions | Medium | Access to all files or network |
+| Check | Tier | Catches |
+|-------|------|---------|
+| `unicode.hidden` | hard | Zero-width / bidi / TAG-block / PUA character smuggling |
+| `shadowing.cross_server` | hard | Distinctive tool-name collision or cross-server reference |
+| `payload.decoded` | hard | base64/hex blob that decodes to a shell/exfil command |
+| `phrase.injection` | hard | Curated instruction-override / exfiltration directives |
+| `directive.imperative` | soft | Injection directives, secrecy imperatives, instruction overrides |
+| `capability.mismatch` | soft | Compute/string tool touching `~/.ssh` etc.; unexplained data-sink param |
+| `secret.embedded` | soft | Hardcoded live credential (confidence-scored, placeholders dropped) |
+
+Each check is deterministic and reliability is enforced by a CI eval gate. See
+[Tool Scanner](/features/tool-scanner) for the full rule reference, the two-tier
+model, normalization, and the eval gate.
 
 ## Best Practices
 
@@ -170,8 +195,25 @@ In addition to server-level quarantine, MCPProxy provides **tool-level quarantin
 See [Tool Quarantine](./tool-quarantine.md) for complete documentation on:
 - SHA256 hash-based tool approval
 - CLI commands: `mcpproxy upstream inspect` and `mcpproxy upstream approve`
-- Configuration: `quarantine_enabled` and `skip_quarantine`
+- Configuration: `quarantine_enabled` (global) and `auto_approve_tool_changes` (per-server; deprecates `skip_quarantine`)
 - REST API endpoints for tool approval management
+
+### Block (approve + disable)
+
+When reviewing a pending or changed tool you may want to **acknowledge it but
+keep it hidden** from MCP clients — for example, dismissing a noisy "changed"
+flag for a tool you never intend to use. The **block** operation does this
+atomically: it approves the tool (clearing the quarantine flag) **and** disables
+it in a single, all-or-nothing server-side write, so a tool is never left in the
+approved+enabled state.
+
+- **REST**: `POST /api/v1/servers/{id}/tools/block` with `{"tools":[...]}` or
+  `{"block_all": true}`.
+- **MCP**: `quarantine_security` operations `block_tool` (with `name` +
+  `tool_name`) and `block_all_tools` (with `name`).
+
+A blocked tool can be re-exposed later with the normal enable operation
+(`POST /api/v1/servers/{id}/tools/{tool}/enabled` with `{"enabled": true}`).
 
 ## Disabling Quarantine
 
@@ -193,7 +235,7 @@ When `quarantine_enabled` is `false`:
 
 An explicit `quarantined` field in an add-server request still wins over
 the default, so client code can always override on a per-server basis.
-Per-server `skip_quarantine: true` continues to apply at the tool level.
+Per-server `auto_approve_tool_changes: true` auto-approves all post-baseline tool changes and additions for that server (the deprecated `skip_quarantine: true` is migrated onto it automatically).
 
 Warning: Disabling quarantine exposes your system to Tool Poisoning
 Attacks. Only do this on machines where every MCP server you connect to

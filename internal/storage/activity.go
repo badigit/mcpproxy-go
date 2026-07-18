@@ -158,25 +158,15 @@ func (m *Manager) ListActivities(filter ActivityFilter) ([]*ActivityRecord, int,
 			}
 
 			if len(records) < filter.Limit {
-				records = append(records, &ActivityRecord{
-					ID:                record.ID,
-					Type:              record.Type,
-					Source:            record.Source,
-					ServerName:        record.ServerName,
-					ToolName:          record.ToolName,
-					Arguments:         record.Arguments,
-					Response:          record.Response,
-					ResponseTruncated: record.ResponseTruncated,
-					Status:            record.Status,
-					ErrorMessage:      record.ErrorMessage,
-					DurationMs:        record.DurationMs,
-					Timestamp:         record.Timestamp,
-					SessionID:         record.SessionID,
-					RequestID:         record.RequestID,
-					Metadata:          record.Metadata,
-					UserID:            record.UserID,
-					UserEmail:         record.UserEmail,
-				})
+				// Copy the whole struct rather than listing fields.
+				//
+				// This used to be a field-by-field copy, which silently dropped
+				// any field nobody remembered to add here — WorkSessionID was
+				// written to BBolt correctly and then thrown away on the way out,
+				// which is a genuinely nasty way to lose data. `record` is
+				// declared fresh each iteration, so taking its address is safe.
+				rec := record
+				records = append(records, &rec)
 			}
 		}
 
@@ -225,6 +215,70 @@ func (m *Manager) CountActivities() (int, error) {
 	})
 
 	return count, err
+}
+
+// ToolUsageStat is a per-tool rollup of activity over a bounded window.
+// Used by the global tools view (spec 050). A zero LastUsed means the tool
+// was never used within the window.
+type ToolUsageStat struct {
+	Count    int
+	LastUsed time.Time
+}
+
+// toolUsageKey builds the map key for AggregateToolUsage. A NUL separator is
+// used so it cannot collide with ':' or other characters valid in server/tool
+// names.
+func toolUsageKey(serverName, toolName string) string {
+	return serverName + "\x00" + toolName
+}
+
+// AggregateToolUsage performs a single pass over the activity bucket and
+// returns per-(server,tool) call counts and last-used time for tool_call
+// records with Timestamp >= since. Records outside the window and non
+// tool_call records are skipped. An empty/absent bucket yields an empty map
+// (not an error). This is the consolidated usage source for GET /api/v1/tools
+// (spec 050) — read-only, no schema change.
+func (m *Manager) AggregateToolUsage(since time.Time) (map[string]ToolUsageStat, error) {
+	stats := make(map[string]ToolUsageStat)
+
+	err := m.db.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil // no activity yet
+		}
+
+		cursor := bucket.Cursor()
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			var record ActivityRecord
+			if err := record.UnmarshalBinary(v); err != nil {
+				m.logger.Warnw("Failed to unmarshal activity record during usage aggregation",
+					"key", string(k), "error", err)
+				continue
+			}
+
+			if record.Type != ActivityTypeToolCall {
+				continue
+			}
+			if record.ToolName == "" {
+				continue
+			}
+			if record.Timestamp.Before(since) {
+				continue
+			}
+
+			key := toolUsageKey(record.ServerName, record.ToolName)
+			st := stats[key]
+			st.Count++
+			if record.Timestamp.After(st.LastUsed) {
+				st.LastUsed = record.Timestamp
+			}
+			stats[key] = st
+		}
+
+		return nil
+	})
+
+	return stats, err
 }
 
 // StreamActivities returns a channel that yields activity records matching the filter.
@@ -383,6 +437,76 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 		m.logger.Infow("Pruned excess activity records",
 			"deleted", deleted,
 			"max_records", maxRecords)
+	}
+
+	return deleted, nil
+}
+
+// PruneActivitiesToSize deletes the oldest activity records until the activity
+// log's stored data (sum of key+value bytes) is at or below maxBytes. Activity
+// keys are timestamp-ordered, so a single forward cursor pass removes
+// oldest-first. The newest record is ALWAYS retained — the log is never emptied
+// while any record exists, even if that newest record alone exceeds the budget.
+// maxBytes <= 0 disables size pruning (no-op). Returns the number deleted.
+func (m *Manager) PruneActivitiesToSize(maxBytes int64) (int, error) {
+	if maxBytes <= 0 {
+		return 0, nil
+	}
+
+	var deleted int
+
+	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil
+		}
+
+		keyCount := bucket.Stats().KeyN
+		if keyCount <= 1 {
+			return nil // never empty the log (always keep the newest record)
+		}
+
+		// Total stored bytes for the bucket.
+		var total int64
+		_ = bucket.ForEach(func(k, v []byte) error {
+			total += int64(len(k) + len(v))
+			return nil
+		})
+		if total <= maxBytes {
+			return nil
+		}
+
+		// Delete oldest-first (smallest keys) until within budget, but NEVER the
+		// last (newest) record — stop before processing it.
+		var keysToDelete [][]byte
+		cursor := bucket.Cursor()
+		processed := 0
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			if total <= maxBytes || processed == keyCount-1 {
+				break
+			}
+			keysToDelete = append(keysToDelete, append([]byte{}, k...))
+			total -= int64(len(k) + len(v))
+			processed++
+		}
+
+		for _, key := range keysToDelete {
+			if err := bucket.Delete(key); err != nil {
+				return fmt.Errorf("failed to delete activity for size cap: %w", err)
+			}
+			deleted++
+		}
+		return nil
+	})
+
+	if err != nil {
+		return deleted, err
+	}
+
+	if deleted > 0 {
+		m.logger.Infow("Pruned activity records to size budget",
+			"deleted", deleted,
+			"max_bytes", maxBytes)
 	}
 
 	return deleted, nil

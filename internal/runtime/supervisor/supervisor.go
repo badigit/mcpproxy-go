@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,10 +13,99 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
+	transportpkg "github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 )
+
+// classifyAndAttach converts a raw connection error into a DiagnosticError and
+// stores it on the server status. Called from the supervisor's reconcile and
+// event paths. Spec 044.
+func classifyAndAttach(status *stateview.ServerStatus, err error, hints diagnostics.ClassifierHints) {
+	if err == nil {
+		status.Diagnostic = nil
+		return
+	}
+	hints.ServerID = status.Name
+	code := diagnostics.Classify(err, hints)
+	if code == "" {
+		// Classify always returns at least UnknownUnclassified for non-nil err,
+		// so reaching here means a logic regression. Defensive fallback keeps
+		// the UI useful instead of silently dropping the signal.
+		code = diagnostics.UnknownUnclassified
+	}
+	entry, _ := diagnostics.Get(code)
+	msg := err.Error()
+	const maxCause = 256
+	if len(msg) > maxCause {
+		msg = msg[:maxCause] + "..."
+	}
+	status.Diagnostic = &diagnostics.DiagnosticError{
+		Code:     code,
+		Severity: entry.Severity,
+		Cause:    msg,
+		// MCP-2909: runtime-aware override of the static catalog message when
+		// context (detected runtime + recommended image + override culprit) is
+		// available; empty otherwise so the generic UserMessage is used.
+		Remediation: diagnostics.RuntimeAwareRemediation(code, hints),
+		ServerID:    status.Name,
+		DetectedAt:  time.Now(),
+	}
+}
+
+// classifierHints builds the diagnostics.ClassifierHints for a server's failure,
+// including the Docker-isolation enrichment context (MCP-2909) the
+// DockerExecNotFound remediation needs: the configured command (→ detected
+// runtime), the per-server isolation.image override (likely culprit), and the
+// global default_images map (→ recommended image). The enrichment fields are
+// only populated for Docker-isolated servers; they are inert for every other
+// code.
+func (s *Supervisor) classifierHints(srv *config.ServerConfig, transport string) diagnostics.ClassifierHints {
+	hints := diagnostics.ClassifierHints{
+		Transport:      transport,
+		DockerIsolated: s.usesDockerIsolation(srv),
+	}
+	if hints.DockerIsolated && srv != nil {
+		hints.DockerCommand = srv.Command
+		if srv.Isolation != nil {
+			hints.DockerImageOverride = srv.Isolation.Image
+		}
+		if snap := s.configSvc.Current(); snap != nil && snap.Config != nil && snap.Config.DockerIsolation != nil {
+			hints.DockerDefaultImages = snap.Config.DockerIsolation.DefaultImages
+		}
+	}
+	return hints
+}
+
+// usesDockerIsolation reports whether the given server would be launched
+// through Docker isolation, so the classifier can attribute spawn/exec failures
+// to DOCKER codes (#696 CLI missing, in-container interpreter missing) rather
+// than a generic stdio ENOENT. This is a side-effect-free mirror of
+// core.IsolationManager.ShouldIsolate (internal/upstream/core/isolation.go) —
+// it is only a classifier hint, so faithfulness matters more than sharing the
+// (logging) implementation.
+func (s *Supervisor) usesDockerIsolation(srv *config.ServerConfig) bool {
+	if srv == nil || srv.Command == "" {
+		return false
+	}
+	snap := s.configSvc.Current()
+	if snap == nil || snap.Config == nil || snap.Config.DockerIsolation == nil ||
+		!snap.Config.DockerIsolation.Enabled {
+		return false
+	}
+	// Per-server explicit opt-out wins over the global enable.
+	if srv.Isolation != nil && srv.Isolation.Enabled != nil && !*srv.Isolation.Enabled {
+		return false
+	}
+	// Servers already running docker themselves are not double-isolated.
+	cmdBase := filepath.Base(srv.Command)
+	if cmdBase == "docker" || strings.Contains(srv.Command, "docker") {
+		return false
+	}
+	return true
+}
 
 // Supervisor manages the desired vs actual state reconciliation for upstream servers.
 // It subscribes to config changes and emits events when server states change.
@@ -45,6 +135,12 @@ type Supervisor struct {
 	onServerConnectedCallback func(serverName string)
 	callbackMu                sync.RWMutex
 
+	// errorCodeNotifier is an optional hook called whenever a DiagnosticError
+	// is classified and attached to a server status. Used by the telemetry
+	// layer to increment diagnostics counters (Spec 044 Phase H). The argument
+	// is a stable MCPX_* code string. Safe to leave nil; calls are no-ops.
+	errorCodeNotifier func(code string)
+
 	// Inspection exemptions for temporary connections to quarantined servers
 	inspectionExemptions   map[string]time.Time
 	inspectionExemptionsMu sync.RWMutex
@@ -57,6 +153,15 @@ type Supervisor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// actionWg tracks in-flight reconcile action goroutines (Connect/Disconnect/
+	// Reconnect/Remove). Stop() drains it BEFORE disconnecting upstream clients so
+	// a Connect can never overlap a Disconnect on the same client (root fix for the
+	// MCP-770 race cascade, MCP-783). stopping (guarded by stateMu) gates dispatch
+	// so no new action is added once Stop() begins — preventing a WaitGroup
+	// Add-after-Wait.
+	actionWg sync.WaitGroup
+	stopping bool
 }
 
 // inspectionFailureInfo tracks inspection failures for circuit breaker pattern
@@ -135,9 +240,25 @@ func (s *Supervisor) Start() {
 	s.wg.Add(1)
 	go s.exemptionCleanupLoop()
 
-	// Phase 7.1: Trigger initial reconciliation to populate StateView
+	// Phase 7.1: Trigger initial reconciliation to populate StateView.
+	// Registered in s.wg with a ctx-aware timer (Spec 080 FR-010/FR-011,
+	// review round 5): Stop() cancels s.ctx and then waits on s.wg, so it
+	// either cancels this goroutine inside the 500ms warm-up window or waits
+	// for the reconcile to finish. A bare time.Sleep goroutine here could wake
+	// AFTER Stop() returned and write last_error_code/diagnostics via
+	// reconcile()/updateStateView()/notifyErrorCode() — after the clean-
+	// shutdown marker resolved, or against a closed DB.
+	s.wg.Add(1)
 	go func() {
-		time.Sleep(500 * time.Millisecond) // Give servers time to connect
+		defer s.wg.Done()
+		timer := time.NewTimer(500 * time.Millisecond) // Give servers time to connect
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			s.logger.Debug("Supervisor stopping before initial reconciliation")
+			return
+		case <-timer.C:
+		}
 		currentConfig := s.configSvc.Current()
 		if err := s.reconcile(currentConfig); err != nil {
 			s.logger.Error("Initial reconciliation failed", zap.Error(err))
@@ -271,6 +392,16 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 
 	plan := s.computeReconcilePlan(configSnapshot, actualStates, userLoggedOut)
 
+	// MCP-783: once Stop() has begun (stopping set under stateMu), do not dispatch
+	// new action goroutines. This keeps all actionWg.Add calls strictly ordered
+	// before Stop()'s actionWg.Wait (no Add-after-Wait) and guarantees no Connect
+	// can start after we begin draining for disconnect.
+	if s.stopping {
+		s.logger.Debug("Supervisor stopping, skipping reconcile action dispatch")
+		s.updateSnapshot(configSnapshot, actualStates)
+		return nil
+	}
+
 	// Phase 6 Fix: Execute actions asynchronously to prevent blocking
 	// Each action runs in its own goroutine with timeout
 	actionCount := 0
@@ -284,8 +415,12 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 			zap.String("server", serverName),
 			zap.String("action", string(action)))
 
-		// Launch each action in a goroutine - no waiting!
+		// Launch each action in a goroutine. Tracked by actionWg (Add under stateMu,
+		// before the goroutine starts) so Stop() can drain in-flight actions before
+		// disconnecting clients.
+		s.actionWg.Add(1)
 		go func(name string, act ReconcileAction, snapshot *configsvc.Snapshot) {
+			defer s.actionWg.Done()
 			if err := s.executeAction(name, act, snapshot); err != nil {
 				s.logger.Error("Failed to execute action",
 					zap.String("server", name),
@@ -557,6 +692,7 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, actualSt
 
 // updateStateView updates the stateview with current server state.
 func (s *Supervisor) updateStateView(name string, state *ServerState) {
+	var classifiedCode string
 	s.stateView.UpdateServer(name, func(status *stateview.ServerStatus) {
 		oldState := status.State
 		status.Config = state.Config
@@ -566,30 +702,7 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 		status.ToolCount = state.ToolCount
 
 		// Phase 7.1: Convert ToolMetadata to ToolInfo and cache in StateView
-		if state.Tools != nil {
-			status.Tools = make([]stateview.ToolInfo, len(state.Tools))
-			for i, tool := range state.Tools {
-				// Parse ParamsJSON into InputSchema
-				var inputSchema map[string]interface{}
-				if tool.ParamsJSON != "" {
-					// ParamsJSON is already a JSON string, we'll store it as-is
-					// The API endpoint will parse it if needed
-					inputSchema = map[string]interface{}{
-						"type":       "object",
-						"properties": map[string]interface{}{}, // TODO: Parse ParamsJSON
-					}
-				}
-
-				status.Tools[i] = stateview.ToolInfo{
-					Name:        tool.Name,
-					Description: tool.Description,
-					InputSchema: inputSchema,
-					Annotations: tool.Annotations,
-				}
-			}
-		} else {
-			status.Tools = nil
-		}
+		status.Tools = toolInfosFromMetadata(state.Tools)
 
 		// Map connection state to string
 		// Use detailed state from ConnectionInfo when available to avoid mislabeling disconnected servers as "connecting"
@@ -616,6 +729,7 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 		if state.Connected {
 			status.LastError = ""
 			status.LastErrorTime = nil
+			status.Diagnostic = nil
 		}
 
 		// Update connection info if available
@@ -629,6 +743,22 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 					errorStr = errorStr[:maxErrorLen] + "... (truncated)"
 				}
 				status.LastError = errorStr
+
+				// Spec 044: classify raw error into stable diagnostic code.
+				// Use the RESOLVED transport, not the raw Config.Protocol: an
+				// auto-detected stdio server has Protocol=="" + Command!="" and
+				// would otherwise miss the stdio-gated classifier rules (#599).
+				transport := ""
+				if state.Config != nil {
+					transport = transportpkg.DetermineTransportType(state.Config)
+				}
+				classifyAndAttach(status, state.ConnectionInfo.LastError, s.classifierHints(state.Config, transport))
+				// Spec 044 Phase H / Spec 080 FR-012: capture the classified
+				// code; delivered synchronously after the stateview lock is
+				// released (see notifyErrorCode).
+				if status.Diagnostic != nil {
+					classifiedCode = string(status.Diagnostic.Code)
+				}
 
 				// Set last error time if available
 				if !state.ConnectionInfo.LastRetryTime.IsZero() {
@@ -659,6 +789,28 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 				zap.Bool("has_conn_info", state.ConnectionInfo != nil))
 		}
 	})
+	s.notifyErrorCode(classifiedCode)
+}
+
+// notifyErrorCode delivers a freshly classified MCPX_* code to the registered
+// error-code notifier, synchronously, outside the stateview lock. Spec 080
+// (US3, FR-012): the pre-churn last_error_code write must complete at the
+// classification site — a crash right after classification is exactly the
+// moment the field exists for, and an async hand-off could lose the final
+// pre-crash code. Locking: callbackMu is released before invoking the
+// callback; callers (reconcile / the event loop) may hold stateMu, which is
+// safe because the telemetry callback only performs BBolt writes and never
+// re-enters the supervisor — no lock cycle, and the write is sub-ms.
+func (s *Supervisor) notifyErrorCode(code string) {
+	if code == "" {
+		return
+	}
+	s.callbackMu.RLock()
+	notifier := s.errorCodeNotifier
+	s.callbackMu.RUnlock()
+	if notifier != nil {
+		notifier(code)
+	}
 }
 
 // SetOnServerConnectedCallback sets a callback to be invoked when a server connects.
@@ -667,6 +819,54 @@ func (s *Supervisor) SetOnServerConnectedCallback(callback func(serverName strin
 	s.callbackMu.Lock()
 	defer s.callbackMu.Unlock()
 	s.onServerConnectedCallback = callback
+}
+
+// SetErrorCodeNotifier registers a callback that fires whenever a diagnostic
+// error code is classified and attached to a server (Spec 044 Phase H). The
+// callback receives the stable MCPX_* code string and is invoked
+// SYNCHRONOUSLY at the classification site (Spec 080 FR-012: the pre-churn
+// last_error_code must be durable before a crash can follow the
+// classification). The callback must be fast (sub-ms), must not call back
+// into the Supervisor, and must NOT spawn goroutines that outlive the call:
+// Runtime.Close relies on Supervisor.Stop() as a barrier — once Stop returns,
+// no callback-driven DB write may remain in flight, or it could land after
+// the clean-shutdown marker resolves or after the DB closes (Spec 080
+// FR-010).
+func (s *Supervisor) SetErrorCodeNotifier(fn func(code string)) {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
+	s.errorCodeNotifier = fn
+}
+
+// toolInfosFromMetadata converts cached upstream tool metadata into the
+// StateView ToolInfo representation. Shared by reconcile, background-discovery
+// refresh, and reconnect repopulation so all three paths produce an identical
+// StateView tool set (MCP-2094).
+func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
+	if tools == nil {
+		return nil
+	}
+	infos := make([]stateview.ToolInfo, len(tools))
+	for i, tool := range tools {
+		// Parse ParamsJSON into InputSchema
+		var inputSchema map[string]interface{}
+		if tool.ParamsJSON != "" {
+			// ParamsJSON is already a JSON string; the API endpoint parses it if needed.
+			inputSchema = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{}, // TODO: Parse ParamsJSON
+			}
+		}
+
+		infos[i] = stateview.ToolInfo{
+			Name:             tool.Name,
+			Description:      tool.Description,
+			InputSchema:      inputSchema,
+			Annotations:      tool.Annotations,
+			OutputSchemaJSON: tool.OutputSchemaJSON,
+		}
+	}
+	return infos
 }
 
 // RefreshToolsFromDiscovery updates both the Supervisor snapshot and StateView with tools from background discovery.
@@ -715,38 +915,16 @@ func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata) err
 	// Update StateView for each server
 	for serverName, serverTools := range toolsByServer {
 		s.stateView.UpdateServer(serverName, func(status *stateview.ServerStatus) {
-			// Defensive check: Only update if we have more or equal tools than currently shown
-			// This prevents overwriting valid tools with stale data from delayed discoveries
-			// Exception: Always update if current tools is 0 (initial population)
-			if len(status.Tools) > 0 && len(serverTools) < len(status.Tools) {
-				s.logger.Debug("StateView already has more tools, skipping update to prevent stale data",
-					zap.String("server", serverName),
-					zap.Int("current_tools", len(status.Tools)),
-					zap.Int("new_tools", len(serverTools)))
-				return
-			}
-
+			// StateView mirrors the Supervisor snapshot (updated unconditionally
+			// above), so apply discovery results as last-writer-wins. A prior
+			// size-based guard skipped updates whenever the new set was smaller,
+			// which pinned StateView to a stale higher count when a server
+			// legitimately dropped tools — diverging from the snapshot and from
+			// the bleve index. Servers with zero discovered tools never reach
+			// this loop (they're absent from toolsByServer), so a size guard
+			// could not protect against empty/stale discoveries anyway (MCP-2094).
 			status.ToolCount = len(serverTools)
-			status.Tools = make([]stateview.ToolInfo, len(serverTools))
-
-			for i, tool := range serverTools {
-				// Parse ParamsJSON into InputSchema
-				var inputSchema map[string]interface{}
-				if tool.ParamsJSON != "" {
-					// ParamsJSON is already a JSON string
-					inputSchema = map[string]interface{}{
-						"type":       "object",
-						"properties": map[string]interface{}{}, // TODO: Parse ParamsJSON
-					}
-				}
-
-				status.Tools[i] = stateview.ToolInfo{
-					Name:        tool.Name,
-					Description: tool.Description,
-					InputSchema: inputSchema,
-					Annotations: tool.Annotations,
-				}
-			}
+			status.Tools = toolInfosFromMetadata(serverTools)
 		})
 	}
 
@@ -821,6 +999,7 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 			}
 
 			// Update stateview
+			var classifiedCode string
 			s.stateView.UpdateServer(event.ServerName, func(status *stateview.ServerStatus) {
 				oldState := status.State
 				status.Connected = connected
@@ -845,18 +1024,33 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 				if connected {
 					t := event.Timestamp
 					status.ConnectedAt = &t
-					// Don't populate Tools here - background indexing will handle it
-					// Only update the count if tools haven't been discovered yet
-					// This prevents overwriting tool data from background discovery
+					// Repopulate the per-server tool set from the retained
+					// Supervisor snapshot so StateView stays the consistent
+					// source of truth across a reconnect/unquarantine. The
+					// disconnect branch below clears StateView.Tools, but the
+					// snapshot keeps them (Tools are never cleared in the
+					// snapshot), so we can restore immediately instead of
+					// waiting for background discovery to re-run. Background
+					// discovery (RefreshToolsFromDiscovery) later overwrites
+					// with fresh data. Without this, StateView consumers that
+					// don't use the #635 read fallback (tray counts, SSE
+					// servers.changed, health/diagnostics) report 0 tools for a
+					// connected server that has tools (MCP-2094).
 					if len(status.Tools) == 0 {
-						status.ToolCount = toolCount
+						if len(state.Tools) > 0 {
+							status.Tools = toolInfosFromMetadata(state.Tools)
+							status.ToolCount = len(state.Tools)
+						} else {
+							status.ToolCount = toolCount
+						}
 					}
-					// If tools are already populated, keep the existing count
+					// If tools are already populated, keep the existing set/count
 
 					// CRITICAL: Clear error when connected, even if connInfo is unavailable
 					// This ensures stale OAuth/connection errors don't persist after successful reconnection
 					status.LastError = ""
 					status.LastErrorTime = nil
+					status.Diagnostic = nil
 				} else {
 					t := event.Timestamp
 					status.DisconnectedAt = &t
@@ -874,6 +1068,22 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 						}
 						status.LastError = errorStr
 
+						// Spec 044: classify raw error into stable diagnostic code.
+						// Resolved transport (not raw Config.Protocol) so auto-detected
+						// stdio servers (Protocol=="" + Command!="") hit the stdio
+						// classifier rules (#599).
+						transport := ""
+						if status.Config != nil {
+							transport = transportpkg.DetermineTransportType(status.Config)
+						}
+						classifyAndAttach(status, connInfo.LastError, s.classifierHints(status.Config, transport))
+						// Spec 044 Phase H / Spec 080 FR-012: capture the
+						// classified code; delivered synchronously after the
+						// stateview lock is released (see notifyErrorCode).
+						if status.Diagnostic != nil {
+							classifiedCode = string(status.Diagnostic.Code)
+						}
+
 						if !connInfo.LastRetryTime.IsZero() {
 							t := connInfo.LastRetryTime
 							status.LastErrorTime = &t
@@ -884,6 +1094,7 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 					status.RetryCount = connInfo.RetryCount
 				}
 			})
+			s.notifyErrorCode(classifiedCode)
 
 			// Trigger reactive tool discovery when server connects
 			if connected {
@@ -950,11 +1161,31 @@ func (s *Supervisor) emitEvent(event Event) {
 	}
 }
 
+// actionDrainTimeout bounds how long Stop() waits for in-flight reconcile action
+// goroutines to finish before disconnecting clients. It exceeds the per-action
+// context timeout (executeAction, 30s) so a well-behaved action that observes the
+// cancelled context returns first; the timeout is only a backstop against a wedged
+// Connect so shutdown can't hang forever.
+const actionDrainTimeout = 35 * time.Second
+
 // Stop gracefully stops the supervisor.
 func (s *Supervisor) Stop() {
 	s.logger.Info("Stopping supervisor")
+
+	// MCP-783: mark stopping under stateMu so reconcile() dispatches no further
+	// action goroutines. Serializing on stateMu (the same lock reconcile holds while
+	// dispatching) ensures every actionWg.Add has happened before the drain below.
+	s.stateMu.Lock()
+	s.stopping = true
+	s.stateMu.Unlock()
+
 	s.cancel()
 	s.wg.Wait()
+
+	// Drain in-flight reconcile actions (Connect/Disconnect/...) BEFORE disconnecting
+	// upstream clients. Without this, ShutdownAll -> Disconnect overlaps an in-flight
+	// Connect on the same client — the root of the MCP-770 race cascade.
+	s.drainActions()
 
 	// Close upstream adapter
 	s.upstream.Close()
@@ -968,6 +1199,26 @@ func (s *Supervisor) Stop() {
 	s.eventMu.Unlock()
 
 	s.logger.Info("Supervisor stopped")
+}
+
+// drainActions waits for in-flight reconcile action goroutines to finish, bounded
+// by actionDrainTimeout. Called from Stop() before disconnecting clients so a
+// Connect can never overlap a Disconnect on the same client (MCP-783).
+func (s *Supervisor) drainActions() {
+	done := make(chan struct{})
+	go func() {
+		s.actionWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.logger.Debug("Drained in-flight reconcile actions before disconnect")
+	case <-time.After(actionDrainTimeout):
+		s.logger.Warn("Timed out draining in-flight reconcile actions before disconnect; "+
+			"proceeding to disconnect (a Connect may still be in flight)",
+			zap.Duration("timeout", actionDrainTimeout))
+	}
 }
 
 // RequestInspectionExemption grants temporary connection permission for a quarantined server.

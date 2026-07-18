@@ -14,7 +14,6 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
 )
 
 var (
@@ -23,6 +22,7 @@ var (
 	tokenServers     string
 	tokenPermissions string
 	tokenExpires     string
+	tokenProfilePin  string
 )
 
 // GetTokenCommand returns the token parent command.
@@ -48,6 +48,7 @@ Examples:
 	tokenCmd.AddCommand(newTokenListCmd())
 	tokenCmd.AddCommand(newTokenShowCmd())
 	tokenCmd.AddCommand(newTokenRevokeCmd())
+	tokenCmd.AddCommand(newTokenDeleteCmd())
 	tokenCmd.AddCommand(newTokenRegenerateCmd())
 
 	return tokenCmd
@@ -73,6 +74,7 @@ Examples:
 	cmd.Flags().StringVar(&tokenServers, "servers", "", "Comma-separated list of allowed server names, or \"*\" for all (required)")
 	cmd.Flags().StringVar(&tokenPermissions, "permissions", "", "Comma-separated permission tiers: read, write, destructive (required, must include read)")
 	cmd.Flags().StringVar(&tokenExpires, "expires", "30d", "Token expiry duration (e.g., 7d, 30d, 90d, 365d)")
+	cmd.Flags().StringVar(&tokenProfilePin, "profile-pin", "", "Pin this token to a profile; it can only operate in that profile (cannot switch via set_profile or /mcp/p/<other>)")
 	_ = cmd.MarkFlagRequired("name")
 	_ = cmd.MarkFlagRequired("servers")
 	_ = cmd.MarkFlagRequired("permissions")
@@ -126,19 +128,15 @@ func newTokenCLIClient() (*cliclient.Client, *config.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
-	cfg.EnsureAPIKey()
-
-	socketPath := socket.DetectSocketPath(cfg.DataDir)
 
 	logger, _ := zap.NewProduction()
 	defer func() { _ = logger.Sync() }()
 
-	var client *cliclient.Client
-	if socket.IsSocketAvailable(socketPath) {
-		client = cliclient.NewClient(socketPath, logger.Sugar())
-	} else {
-		endpoint := fmt.Sprintf("http://%s", cfg.Listen)
-		client = cliclient.NewClientWithAPIKey(endpoint, cfg.APIKey, logger.Sugar())
+	// Socket first, then TCP fallback. Never generate an API key here —
+	// a fabricated key cannot match the running daemon's.
+	client, ok := newDaemonClient(cfg, logger.Sugar())
+	if !ok {
+		return nil, nil, fmt.Errorf("mcpproxy daemon is not reachable. Start with: mcpproxy serve")
 	}
 
 	return client, cfg, nil
@@ -159,6 +157,9 @@ func runTokenCreate(_ *cobra.Command, _ []string) error {
 		"allowed_servers": servers,
 		"permissions":     permissions,
 		"expires_in":      tokenExpires,
+	}
+	if tokenProfilePin != "" {
+		body["profile_pin"] = tokenProfilePin
 	}
 
 	bodyJSON, err := json.Marshal(body)
@@ -209,6 +210,9 @@ func runTokenCreate(_ *cobra.Command, _ []string) error {
 	printField("  Name:        ", result, "name")
 	printListField("  Servers:     ", result, "allowed_servers")
 	printListField("  Permissions: ", result, "permissions")
+	if pin := getMapString(result, "profile_pin"); pin != "" {
+		fmt.Printf("  Profile Pin: %s\n", pin)
+	}
 	printField("  Expires:     ", result, "expires_at")
 
 	return nil
@@ -257,9 +261,9 @@ func runTokenList(_ *cobra.Command, _ []string) error {
 	}
 
 	// Table format
-	fmt.Printf("%-20s %-14s %-25s %-20s %-8s %-25s\n",
-		"NAME", "PREFIX", "SERVERS", "PERMISSIONS", "REVOKED", "EXPIRES")
-	fmt.Println(strings.Repeat("-", 115))
+	fmt.Printf("%-20s %-14s %-25s %-20s %-8s %-12s %-25s\n",
+		"NAME", "PREFIX", "SERVERS", "PERMISSIONS", "REVOKED", "PROFILE PIN", "EXPIRES")
+	fmt.Println(strings.Repeat("-", 128))
 
 	for _, t := range tokens {
 		tok, ok := t.(map[string]interface{})
@@ -276,6 +280,11 @@ func runTokenList(_ *cobra.Command, _ []string) error {
 		serverList := joinInterfaceSlice(tok, "allowed_servers", 23)
 		permList := joinInterfaceSlice(tok, "permissions", 0)
 
+		pin := getMapString(tok, "profile_pin")
+		if pin == "" {
+			pin = "-"
+		}
+
 		expiresAt := getMapString(tok, "expires_at")
 		if expiresAt != "" {
 			if t, parseErr := time.Parse(time.RFC3339, expiresAt); parseErr == nil {
@@ -283,8 +292,8 @@ func runTokenList(_ *cobra.Command, _ []string) error {
 			}
 		}
 
-		fmt.Printf("%-20s %-14s %-25s %-20s %-8s %-25s\n",
-			name, prefix, serverList, permList, revoked, expiresAt)
+		fmt.Printf("%-20s %-14s %-25s %-20s %-8s %-12s %-25s\n",
+			name, prefix, serverList, permList, revoked, pin, expiresAt)
 	}
 
 	return nil
@@ -335,6 +344,9 @@ func runTokenShow(_ *cobra.Command, args []string) error {
 	printField("Token Prefix:   ", result, "token_prefix")
 	printListField("Servers:        ", result, "allowed_servers")
 	printListField("Permissions:    ", result, "permissions")
+	if pin := getMapString(result, "profile_pin"); pin != "" {
+		fmt.Printf("Profile Pin:    %s\n", pin)
+	}
 	if revoked, ok := result["revoked"].(bool); ok {
 		fmt.Printf("Revoked:        %v\n", revoked)
 	}
@@ -376,6 +388,54 @@ func runTokenRevoke(_ *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Token %q has been revoked.\n", name)
+	return nil
+}
+
+func newTokenDeleteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "delete <name>",
+		Aliases: []string{"rm", "remove"},
+		Short:   "Permanently delete an agent token",
+		Long: `Permanently delete an agent token, removing it entirely and freeing its
+name for reuse. Unlike revoke (a soft delete that keeps the record so the name
+stays reserved), delete removes the token completely.
+
+Examples:
+  mcpproxy token delete deploy-bot`,
+		Args: cobra.ExactArgs(1),
+		RunE: runTokenDelete,
+	}
+}
+
+func runTokenDelete(_ *cobra.Command, args []string) error {
+	client, _, err := newTokenCLIClient()
+	if err != nil {
+		return err
+	}
+
+	name := args[0]
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.DoRaw(ctx, http.MethodDelete, "/api/v1/tokens/"+name+"/permanent", nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("token %q not found", name)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return parseAPIError(respBody, resp.StatusCode, "delete token")
+	}
+
+	fmt.Printf("Token %q has been permanently deleted.\n", name)
 	return nil
 }
 

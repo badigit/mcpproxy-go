@@ -11,10 +11,59 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+func TestConnect_OpenCode_AllowsTrailingCommaJSON(t *testing.T) {
+	svc, home := testService(t)
+	cfgPath := ConfigPath("opencode", home)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{
+	  "theme": "dark",
+	  "mcp": {
+	  },
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.Connect("opencode", "mcpproxy", false)
+	if err != nil {
+		t.Fatalf("expected OpenCode JSONC-style config to parse, got %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got %+v", res)
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("expected normalized strict JSON output, got %v", err)
+	}
+	if data["theme"] != "dark" {
+		t.Fatalf("expected theme preserved, got %v", data["theme"])
+	}
+	servers, ok := data["mcp"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected mcp object")
+	}
+	if _, ok := servers["mcpproxy"]; !ok {
+		t.Fatal("expected mcpproxy entry")
+	}
+}
+
 // helper to create a service pointing at a temp home directory
 func testService(t *testing.T) (*Service, string) {
 	t.Helper()
 	homeDir := t.TempDir()
+	// On Windows, ConfigPath reads %LOCALAPPDATA% (opencode) and %APPDATA%
+	// (claude-desktop, vscode) from the real environment, ignoring homeDir,
+	// and only falls back to homeDir when those env vars are unset. Pin both
+	// under the test temp dir so every client's config path is isolated
+	// per-test regardless of CI runner state. No-op on macOS/Linux.
+	t.Setenv("LOCALAPPDATA", filepath.Join(homeDir, "AppData", "Local"))
+	t.Setenv("APPDATA", filepath.Join(homeDir, "AppData", "Roaming"))
 	svc := NewServiceWithHome("127.0.0.1:8080", "", homeDir)
 	return svc, homeDir
 }
@@ -22,8 +71,165 @@ func testService(t *testing.T) (*Service, string) {
 func testServiceWithKey(t *testing.T) (*Service, string) {
 	t.Helper()
 	homeDir := t.TempDir()
+	t.Setenv("LOCALAPPDATA", filepath.Join(homeDir, "AppData", "Local"))
+	t.Setenv("APPDATA", filepath.Join(homeDir, "AppData", "Roaming"))
 	svc := NewServiceWithHome("127.0.0.1:8080", "test-key-123", homeDir)
 	return svc, homeDir
+}
+
+func TestFindClient_OpenCode(t *testing.T) {
+	client := FindClient("opencode")
+	if client == nil {
+		t.Fatal("expected opencode client definition")
+	}
+	if client.Format != "json" {
+		t.Fatalf("expected json format, got %s", client.Format)
+	}
+	if client.ServerKey != "mcp" {
+		t.Fatalf("expected mcp key, got %s", client.ServerKey)
+	}
+}
+
+func TestConfigPath_OpenCode_GlobalConfigPath(t *testing.T) {
+	home := "/tmp/home"
+	path := ConfigPath("opencode", home)
+	if runtime.GOOS == "windows" {
+		expected := filepath.Join(home, "AppData", "Local", "opencode", "opencode.json")
+		if os.Getenv("LOCALAPPDATA") != "" {
+			expected = filepath.Join(os.Getenv("LOCALAPPDATA"), "opencode", "opencode.json")
+		}
+		if path != expected {
+			t.Fatalf("expected %s, got %s", expected, path)
+		}
+		return
+	}
+	expected := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if path != expected {
+		t.Fatalf("expected %s, got %s", expected, path)
+	}
+}
+
+func TestConnect_OpenCode_RequiresExistingConfigFile(t *testing.T) {
+	svc, _ := testService(t)
+
+	_, err := svc.Connect("opencode", "", false)
+	if err == nil {
+		t.Fatal("expected missing-config error for OpenCode")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConnect_OpenCode_PreservesNonMCPRootKeys(t *testing.T) {
+	svc, home := testService(t)
+	cfgPath := ConfigPath("opencode", home)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"theme":"dark","mcp":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := svc.Connect("opencode", "mcpproxy", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data["theme"] != "dark" {
+		t.Fatalf("expected theme preserved, got %v", data["theme"])
+	}
+}
+
+func TestConnect_OpenCode_AdoptsEquivalentEntryWithoutForce(t *testing.T) {
+	svc, home := testService(t)
+	cfgPath := ConfigPath("opencode", home)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{
+	  "mcp": {
+	    "proxy-alt": {"type":"remote","url":"http://127.0.0.1:8080/mcp"}
+	  }
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.Connect("opencode", "mcpproxy", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success || res.Action != "already_exists" {
+		t.Fatalf("expected idempotent already_exists success, got %+v", res)
+	}
+	if res.ServerName != "proxy-alt" {
+		t.Fatalf("expected adopted name proxy-alt, got %s", res.ServerName)
+	}
+}
+
+func TestConnect_OpenCode_ForceNormalizesAdoptedName(t *testing.T) {
+	svc, home := testService(t)
+	cfgPath := ConfigPath("opencode", home)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{
+	  "mcp": {
+	    "proxy-alt": {"type":"remote","url":"http://127.0.0.1:8080/mcp"}
+	  }
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.Connect("opencode", "mcpproxy", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success || res.Action != "updated" {
+		t.Fatalf("expected updated success, got %+v", res)
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "proxy-alt") {
+		t.Fatal("expected alias removed after normalization")
+	}
+	if !strings.Contains(string(raw), "mcpproxy") {
+		t.Fatal("expected canonical entry written after normalization")
+	}
+}
+
+func TestDisconnect_OpenCode_RemovesAdoptedAliasWhenSpecified(t *testing.T) {
+	svc, home := testService(t)
+	cfgPath := ConfigPath("opencode", home)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{
+	  "mcp": {
+	    "proxy-alt": {"type":"remote","url":"http://127.0.0.1:8080/mcp"}
+	  }
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.Disconnect("opencode", "proxy-alt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got %+v", res)
+	}
 }
 
 // ---------- JSON client tests ----------
@@ -77,8 +283,10 @@ func TestConnect_ClaudeCode_NewFile(t *testing.T) {
 	}
 }
 
-func TestConnect_ClaudeCode_WithAPIKey(t *testing.T) {
-	svc, _ := testServiceWithKey(t)
+// Spec 078 security fix: with require_mcp_auth off (default), claude-code gets a
+// clean, keyless entry — the REST-admin key is NOT leaked into the config.
+func TestConnect_ClaudeCode_AuthOff_NoKeyWritten(t *testing.T) {
+	svc, _ := testServiceWithKey(t) // key set but require_mcp_auth off
 
 	result, err := svc.Connect("claude-code", "", false)
 	if err != nil {
@@ -92,18 +300,49 @@ func TestConnect_ClaudeCode_WithAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read config failed: %v", err)
 	}
+	if strings.Contains(string(raw), "apikey") || strings.Contains(string(raw), "test-key-123") || strings.Contains(string(raw), "headers") {
+		t.Fatalf("auth-off connect must not embed a credential, got: %s", raw)
+	}
 
 	var data map[string]interface{}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		t.Fatalf("Parse config failed: %v", err)
 	}
+	entry := data["mcpServers"].(map[string]interface{})["mcpproxy"].(map[string]interface{})
+	if entry["url"] != "http://127.0.0.1:8080/mcp" {
+		t.Errorf("Expected clean url, got %v", entry["url"])
+	}
+}
 
-	servers := data["mcpServers"].(map[string]interface{})
-	entry := servers["mcpproxy"].(map[string]interface{})
+// With require_mcp_auth on, claude-code carries the credential in an X-API-Key
+// header (its config schema supports one) and the URL stays clean.
+func TestConnect_ClaudeCode_AuthOn_UsesHeader(t *testing.T) {
+	svc, _ := testServiceWithKey(t)
+	svc.WithRequireMCPAuth(true)
 
-	expectedURL := "http://127.0.0.1:8080/mcp?apikey=test-key-123"
-	if entry["url"] != expectedURL {
-		t.Errorf("Expected url=%s, got %v", expectedURL, entry["url"])
+	result, err := svc.Connect("claude-code", "", false)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatalf("Read config failed: %v", err)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("Parse config failed: %v", err)
+	}
+	entry := data["mcpServers"].(map[string]interface{})["mcpproxy"].(map[string]interface{})
+	if entry["url"] != "http://127.0.0.1:8080/mcp" {
+		t.Errorf("Expected clean url with header carrier, got %v", entry["url"])
+	}
+	headers, ok := entry["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected headers object, got %T", entry["headers"])
+	}
+	if headers["X-API-Key"] != "test-key-123" {
+		t.Errorf("Expected X-API-Key header, got %v", headers["X-API-Key"])
 	}
 }
 
@@ -532,17 +771,197 @@ func TestDisconnect_TOML(t *testing.T) {
 	}
 }
 
-// ---------- Unsupported client tests ----------
+// ---------- Claude Desktop stdio-bridge tests (MCP-2479) ----------
 
-func TestConnect_UnsupportedClient(t *testing.T) {
-	svc, _ := testService(t)
-
-	_, err := svc.Connect("claude-desktop", "", false)
-	if err == nil {
-		t.Fatal("Expected error for unsupported client")
+// Claude Desktop only speaks stdio, so mcpproxy connects via an mcp-remote
+// stdio bridge instead of a direct HTTP/SSE URL. It must be a supported,
+// one-click client.
+func TestClaudeDesktop_SupportedWithBridgeNote(t *testing.T) {
+	client := FindClient("claude-desktop")
+	if client == nil {
+		t.Fatal("expected claude-desktop client definition")
 	}
-	if !strings.Contains(err.Error(), "not supported") {
-		t.Errorf("Expected 'not supported' in error, got: %v", err)
+	if !client.Supported {
+		t.Error("claude-desktop should be supported via the mcp-remote stdio bridge")
+	}
+	if client.Note == "" {
+		t.Error("claude-desktop should carry a note explaining the mcp-remote bridge")
+	}
+	if !strings.Contains(strings.ToLower(client.Note), "mcp-remote") {
+		t.Errorf("claude-desktop note should mention mcp-remote, got: %q", client.Note)
+	}
+	// Bridge clients can be connected even when no config file exists yet
+	// (Connect creates it), so the frontend must offer the button on fresh
+	// installs.
+	if !client.Bridge {
+		t.Error("claude-desktop should be flagged as a bridge client")
+	}
+}
+
+func TestBuildServerEntry_ClaudeDesktop_StdioBridge(t *testing.T) {
+	entry := buildServerEntry("claude-desktop", serverEntryParams{baseURL: "http://127.0.0.1:8080/mcp"})
+
+	if entry["command"] != "npx" {
+		t.Errorf("expected command=npx, got %v", entry["command"])
+	}
+	args, ok := entry["args"].([]string)
+	if !ok {
+		t.Fatalf("expected args []string, got %T", entry["args"])
+	}
+	want := []string{"-y", "mcp-remote", "http://127.0.0.1:8080/mcp"}
+	if len(args) != len(want) {
+		t.Fatalf("expected args %v, got %v", want, args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("args[%d]=%q, want %q", i, args[i], want[i])
+		}
+	}
+	// A stdio bridge has no direct URL/type fields.
+	if _, ok := entry["url"]; ok {
+		t.Error("stdio-bridge entry should not contain a url field")
+	}
+}
+
+func TestConnect_ClaudeDesktop_WritesStdioBridge(t *testing.T) {
+	svc, homeDir := testService(t)
+
+	cfgPath := ConfigPath("claude-desktop", homeDir)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := svc.Connect("claude-desktop", "", false)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Expected success, got: %s", result.Message)
+	}
+
+	raw, _ := os.ReadFile(result.ConfigPath)
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("Parse config failed: %v", err)
+	}
+
+	servers, ok := data["mcpServers"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Missing mcpServers key")
+	}
+	entry, ok := servers["mcpproxy"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Missing mcpproxy entry")
+	}
+	if entry["command"] != "npx" {
+		t.Errorf("Expected command=npx, got %v", entry["command"])
+	}
+	args, ok := entry["args"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected args array, got %T", entry["args"])
+	}
+	want := []string{"-y", "mcp-remote", "http://127.0.0.1:8080/mcp"}
+	if len(args) != len(want) {
+		t.Fatalf("Expected args %v, got %v", want, args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("args[%d]=%v, want %q", i, args[i], want[i])
+		}
+	}
+}
+
+// With require_mcp_auth on, the Claude Desktop bridge forwards the credential
+// via an mcp-remote --header arg (no space after the colon), and the URL arg
+// stays clean. With auth off it embeds no credential at all.
+func TestConnect_ClaudeDesktop_BridgeCredentialCarrier(t *testing.T) {
+	for _, authOn := range []bool{false, true} {
+		authOn := authOn
+		t.Run(map[bool]string{true: "auth-on", false: "auth-off"}[authOn], func(t *testing.T) {
+			svc, homeDir := testServiceWithKey(t)
+			svc.WithRequireMCPAuth(authOn)
+
+			cfgPath := ConfigPath("claude-desktop", homeDir)
+			if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := svc.Connect("claude-desktop", "", false)
+			if err != nil {
+				t.Fatalf("Connect failed: %v", err)
+			}
+
+			raw, _ := os.ReadFile(result.ConfigPath)
+			var data map[string]interface{}
+			if err := json.Unmarshal(raw, &data); err != nil {
+				t.Fatal(err)
+			}
+			entry := data["mcpServers"].(map[string]interface{})["mcpproxy"].(map[string]interface{})
+			args := entry["args"].([]interface{})
+			// The mcpproxy URL arg (index 2) is always the clean base URL.
+			if args[2] != "http://127.0.0.1:8080/mcp" {
+				t.Errorf("Expected clean bridge URL arg, got %v", args[2])
+			}
+			if authOn {
+				lastArg, _ := args[len(args)-1].(string)
+				if lastArg != "X-API-Key:test-key-123" {
+					t.Errorf("Expected --header X-API-Key:test-key-123, got %v", lastArg)
+				}
+				if args[len(args)-2] != "--header" {
+					t.Errorf("Expected --header flag before value, got %v", args[len(args)-2])
+				}
+			} else if strings.Contains(string(raw), "test-key-123") || strings.Contains(string(raw), "--header") {
+				t.Errorf("auth-off bridge must embed no credential, got: %s", raw)
+			}
+		})
+	}
+}
+
+func TestGetAllStatus_ClaudeDesktop_DetectsBridgeConnection(t *testing.T) {
+	svc, homeDir := testService(t)
+
+	cfgPath := ConfigPath("claude-desktop", homeDir)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Connect("claude-desktop", "", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Spec 075: bridge-connected detection is now resolved on demand.
+	st, err := svc.GetStatus("claude-desktop")
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if !st.Connected {
+		t.Error("expected claude-desktop connected=true after bridge connect")
+	}
+}
+
+// Gap 2 (Codex review): a bridge written under a custom server_name has no
+// URL field and a non-"mcpproxy" key, so it must be detected by inspecting
+// the entry's args (mcp-remote + mcpURL).
+func TestGetAllStatus_ClaudeDesktop_DetectsBridgeUnderCustomName(t *testing.T) {
+	svc, homeDir := testService(t)
+
+	cfgPath := ConfigPath("claude-desktop", homeDir)
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Connect("claude-desktop", "my-bridge", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Spec 075: resolved on demand rather than from the overall listing.
+	st, err := svc.GetStatus("claude-desktop")
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if !st.Connected {
+		t.Error("expected claude-desktop connected via bridge args under a custom name")
+	}
+	if st.ServerName != "my-bridge" {
+		t.Errorf("expected server_name=my-bridge, got %q", st.ServerName)
 	}
 }
 
@@ -594,14 +1013,18 @@ func TestGetAllStatus(t *testing.T) {
 		t.Errorf("Expected %d statuses, got %d", len(allClients), len(statuses))
 	}
 
-	// Verify claude-desktop is not supported
+	// Verify claude-desktop is supported via the mcp-remote stdio bridge and
+	// surfaces a note explaining the bridge.
 	for _, s := range statuses {
 		if s.ID == "claude-desktop" {
-			if s.Supported {
-				t.Error("claude-desktop should not be supported")
+			if !s.Supported {
+				t.Error("claude-desktop should be supported via the mcp-remote bridge")
 			}
-			if s.Reason == "" {
-				t.Error("claude-desktop should have a reason")
+			if s.Note == "" {
+				t.Error("claude-desktop should expose a bridge note")
+			}
+			if !s.Bridge {
+				t.Error("claude-desktop status should expose bridge=true")
 			}
 		}
 	}
@@ -616,17 +1039,33 @@ func TestGetAllStatus_AfterConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	statuses := svc.GetAllStatus()
-	for _, s := range statuses {
+	// Spec 075: GetAllStatus is content-read-free, so Connected is resolved via
+	// the on-demand GetStatus path rather than the overall listing.
+	overall := svc.GetAllStatus()
+	for _, s := range overall {
 		if s.ID == "claude-code" {
 			if !s.Exists {
 				t.Error("Expected exists=true for claude-code after connect")
 			}
-			if !s.Connected {
-				t.Error("Expected connected=true for claude-code after connect")
+			if s.Connected {
+				t.Error("Expected overall status Connected=false (content-read-free) for claude-code")
+			}
+			if s.AccessState != accessUnknown {
+				t.Errorf("Expected overall access_state=unknown, got %q", s.AccessState)
 			}
 			break
 		}
+	}
+
+	st, err := svc.GetStatus("claude-code")
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if !st.Exists {
+		t.Error("Expected exists=true for claude-code after connect")
+	}
+	if !st.Connected {
+		t.Error("Expected connected=true for claude-code after connect (on-demand)")
 	}
 }
 
@@ -711,33 +1150,46 @@ func TestConfigPath_UnknownClient(t *testing.T) {
 	}
 }
 
-// ---------- mcpURL tests ----------
+// ---------- baseURL / credential-carrier tests ----------
 
-func TestMcpURL_NoAPIKey(t *testing.T) {
-	svc := NewService("127.0.0.1:8080", "")
-	url := svc.mcpURL()
-	if url != "http://127.0.0.1:8080/mcp" {
-		t.Errorf("Expected http://127.0.0.1:8080/mcp, got %s", url)
-	}
-}
-
-func TestMcpURL_WithAPIKey(t *testing.T) {
+func TestBaseURL_NoQuery(t *testing.T) {
+	// The endpoint anchor is always credential-free, regardless of api key.
 	svc := NewService("127.0.0.1:8080", "my-secret")
-	url := svc.mcpURL()
-	if url != "http://127.0.0.1:8080/mcp?apikey=my-secret" {
-		t.Errorf("Expected url with apikey, got %s", url)
+	if got := svc.baseURL(); got != "http://127.0.0.1:8080/mcp" {
+		t.Errorf("Expected clean base URL, got %s", got)
 	}
 }
 
-func TestMcpURL_APIKeyWithSpecialChars(t *testing.T) {
-	svc := NewService("127.0.0.1:8080", "key with spaces&special=chars")
-	url := svc.mcpURL()
-	if !strings.Contains(url, "apikey=") {
-		t.Errorf("Expected apikey param in URL, got %s", url)
+// Spec 078 security fix: with require_mcp_auth off (the default), no credential
+// is written into a client config even when an API key is configured.
+func TestEntryParams_AuthOff_NoCredential(t *testing.T) {
+	svc := NewService("127.0.0.1:8080", "my-secret") // require_mcp_auth defaults false
+	p := svc.entryParams(false)
+	if p.credential != "" {
+		t.Errorf("expected no credential when auth is off, got %q", p.credential)
 	}
-	// Should be URL-encoded
-	if strings.Contains(url, " ") {
-		t.Error("URL should not contain raw spaces")
+	if svc.containsCredential() {
+		t.Error("containsCredential must be false when auth is off")
+	}
+}
+
+// With require_mcp_auth on, the credential is present and the query carrier
+// URL-escapes special characters.
+func TestEntryParams_AuthOn_CredentialPresent(t *testing.T) {
+	svc := NewService("127.0.0.1:8080", "key with spaces&x=1").WithRequireMCPAuth(true)
+	p := svc.entryParams(false)
+	if p.credential != "key with spaces&x=1" {
+		t.Errorf("expected raw credential, got %q", p.credential)
+	}
+	if !svc.containsCredential() {
+		t.Error("containsCredential must be true when auth is on with a key")
+	}
+	q := credentialQuery(p.baseURL, p.credential)
+	if strings.Contains(q, " ") {
+		t.Errorf("query carrier must URL-escape spaces, got %s", q)
+	}
+	if !strings.Contains(q, "apikey=") {
+		t.Errorf("expected apikey query, got %s", q)
 	}
 }
 
@@ -760,8 +1212,8 @@ func TestFindClient(t *testing.T) {
 
 func TestGetAllClients(t *testing.T) {
 	clients := GetAllClients()
-	if len(clients) != 7 {
-		t.Errorf("Expected 7 clients, got %d", len(clients))
+	if len(clients) != 8 {
+		t.Errorf("Expected 8 clients, got %d", len(clients))
 	}
 
 	// Verify all have non-empty IDs and names

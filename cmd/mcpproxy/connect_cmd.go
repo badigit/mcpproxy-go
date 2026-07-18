@@ -27,7 +27,7 @@ func GetConnectCommand() *cobra.Command {
 AI coding clients. This modifies the client's config file to add an HTTP/SSE
 entry pointing to the running MCPProxy instance.
 
-Supported clients: claude-code, cursor, windsurf, vscode, codex, gemini
+Supported clients: claude-code, cursor, windsurf, vscode, codex, gemini, opencode
 
 A backup of the original config file is created before any modification.
 
@@ -36,6 +36,7 @@ Examples:
   mcpproxy connect claude-code               # Register in Claude Code
   mcpproxy connect cursor --force            # Overwrite existing entry
   mcpproxy connect codex --name my-proxy     # Custom server name
+  mcpproxy connect opencode                  # Register in OpenCode
   mcpproxy connect --all                     # Register in all supported clients`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: runConnect,
@@ -75,7 +76,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	svc := connect.NewService(cfg.Listen, cfg.APIKey)
+	svc := connect.NewService(cfg.Listen, cfg.APIKey).WithRequireMCPAuth(cfg.RequireMCPAuth)
 
 	format := clioutput.ResolveFormat(globalOutputFormat, globalJSONOutput)
 	formatter, err := clioutput.NewFormatter(format)
@@ -113,7 +114,7 @@ func runDisconnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	svc := connect.NewService(cfg.Listen, cfg.APIKey)
+	svc := connect.NewService(cfg.Listen, cfg.APIKey).WithRequireMCPAuth(cfg.RequireMCPAuth)
 
 	format := clioutput.ResolveFormat(globalOutputFormat, globalJSONOutput)
 	formatter, err := clioutput.NewFormatter(format)
@@ -131,7 +132,19 @@ func runDisconnect(cmd *cobra.Command, args []string) error {
 }
 
 func printConnectStatus(svc *connect.Service, formatter clioutput.OutputFormatter, format string) error {
+	// Spec 075: GetAllStatus is content-read-free and leaves Connected/AccessState
+	// unresolved. Running `mcpproxy connect` is an explicit user action, so resolve
+	// each supported+installed client's connected state on demand via GetStatus to
+	// preserve the CONNECTED column. Unsupported/absent clients keep the cheap
+	// metadata-only listing (no content read).
 	statuses := svc.GetAllStatus()
+	for i := range statuses {
+		if statuses[i].Supported && statuses[i].Exists {
+			if st, err := svc.GetStatus(statuses[i].ID); err == nil {
+				statuses[i] = st
+			}
+		}
+	}
 
 	if format == "table" {
 		headers := []string{"CLIENT", "STATUS", "CONFIG PATH", "CONNECTED"}

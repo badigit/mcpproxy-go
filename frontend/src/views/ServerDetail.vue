@@ -42,23 +42,19 @@
           <div class="breadcrumbs text-sm mb-2">
             <ul>
               <li><router-link to="/servers">Servers</router-link></li>
-              <li>{{ server.name }}</li>
+              <li>{{ displayName }}</li>
             </ul>
           </div>
-          <h1 class="text-3xl font-bold">{{ server.name }}</h1>
+          <h1 class="text-3xl font-bold" :title="server.name">{{ displayName }}</h1>
           <p class="text-base-content/70 mt-1">{{ server.protocol }} • {{ server.url || server.command || 'No endpoint' }}</p>
         </div>
 
         <div class="flex items-center space-x-2">
           <div
-            :class="[
-              'badge badge-lg',
-              server.connected ? 'badge-success' :
-              server.connecting ? 'badge-warning' :
-              'badge-error'
-            ]"
+            :class="['badge badge-lg', statusBadgeClass]"
+            data-test="server-status-badge"
           >
-            {{ server.connected ? 'Connected' : server.connecting ? 'Connecting' : 'Disconnected' }}
+            {{ statusBadgeText }}
           </div>
           <div class="dropdown dropdown-end">
             <div tabindex="0" role="button" class="btn btn-outline">
@@ -120,7 +116,12 @@
             </div>
             <div class="stat-title">Tools</div>
             <div class="stat-value">{{ serverTools.length }}</div>
-            <div class="stat-desc">available tools</div>
+            <div
+              class="stat-desc"
+              :class="blockedToolCount > 0 ? 'text-error' : ''"
+            >
+              {{ blockedToolCount > 0 ? `${blockedToolCount} disabled` : 'available tools' }}
+            </div>
           </div>
         </div>
 
@@ -168,7 +169,30 @@
 
       <!-- Alerts -->
       <div class="space-y-4">
-        <div v-if="server.last_error" class="alert alert-error">
+        <!-- MCP-1821 — calm OAuth Sign-in CTA. Takes precedence over the red
+             ErrorPanel whenever the server simply needs the user to sign in
+             (health.action==='login' or an MCPX_OAUTH_* code). -->
+        <SignInPanel
+          v-if="signInState"
+          :server-name="server.name"
+          :state="signInState"
+          :docs-url="server.diagnostic?.docs_url"
+          :quarantined="server.quarantined"
+          :loading="actionLoading"
+          @login="triggerOAuth"
+        />
+
+        <!-- Spec 044 — structured diagnostic panel (shown when a diagnostic
+             with warn/error severity is attached). Replaces the generic
+             last_error alert for those cases. -->
+        <ErrorPanel
+          v-else-if="showDiagnosticPanel"
+          :diagnostic="server.diagnostic"
+          :server-name="server.name"
+          @fixed="handleDiagnosticFixed"
+        />
+
+        <div v-else-if="server.last_error" class="alert alert-error">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
@@ -178,7 +202,7 @@
           </div>
         </div>
 
-        <div v-if="server.quarantined" class="alert alert-warning">
+        <div v-if="server.quarantined" data-test="security-quarantine-banner" class="alert alert-warning">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.732-.833-2.5 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
           </svg>
@@ -197,11 +221,11 @@
       <div v-if="showApproveConfirmation" class="modal modal-open">
         <div class="modal-box">
           <h3 class="font-bold text-lg mb-4">
-            {{ approveDialogMode === 'no_scan' ? 'No Security Scan Run' : 'Critical Findings Detected' }}
+            {{ approveDialogMode === 'no_scan' ? 'No Security Scan Run' : 'Dangerous Findings Detected' }}
           </h3>
           <p v-if="approveDialogMode === 'critical'" class="mb-4">
             <strong>{{ server.name }}</strong> has
-            <span class="text-error font-semibold">{{ criticalFindingCount }} critical finding{{ criticalFindingCount === 1 ? '' : 's' }}</span>
+            <span class="text-error font-semibold">{{ dangerousFindingCount }} dangerous finding{{ dangerousFindingCount === 1 ? '' : 's' }}</span>
             in its most recent security scan. Approving will allow this server to run despite these warnings.
           </p>
           <p v-else class="mb-4">
@@ -239,7 +263,7 @@
       </div>
 
       <!-- Tabs -->
-      <div class="tabs tabs-bordered">
+      <div class="tabs tabs-border">
         <button
           :class="['tab tab-lg', activeTab === 'tools' ? 'tab-active' : '']"
           @click="activeTab = 'tools'"
@@ -307,7 +331,7 @@
 
           <div v-else class="space-y-4">
             <!-- Tool Quarantine Panel (Spec 032) -->
-            <div v-if="quarantinedTools.length > 0" class="alert alert-warning shadow-lg mb-4">
+            <div v-if="quarantinedTools.length > 0" data-test="tool-quarantine-banner" class="alert alert-warning shadow-lg mb-4">
               <svg class="w-6 h-6 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>
@@ -316,19 +340,52 @@
                 <div class="text-sm">
                   {{ quarantinedTools.length }} tool(s) require approval before they can be used by AI agents.
                 </div>
+                <!-- MCP-2917: subtle, dismissible hint explaining where pending
+                     tools come from and how to opt out of tool-level approval. -->
+                <div
+                  v-if="!quarantineHintDismissed"
+                  data-test="quarantine-hint"
+                  class="text-xs opacity-70 mt-1 flex items-start gap-1"
+                >
+                  <span>
+                    Pending tools come from tool-level quarantine. To approve them automatically, set
+                    <code class="text-[11px]">skip_quarantine: true</code> for this server or
+                    <code class="text-[11px]">quarantine_enabled: false</code> globally.
+                  </span>
+                  <button
+                    type="button"
+                    data-test="quarantine-hint-dismiss"
+                    @click="quarantineHintDismissed = true"
+                    class="btn btn-ghost btn-xs px-1 -mt-0.5"
+                    aria-label="Dismiss hint"
+                  >✕</button>
+                </div>
               </div>
-              <button
-                @click="approveAllTools"
-                :disabled="approvalLoading"
-                class="btn btn-sm btn-warning"
-              >
-                <span v-if="approvalLoading" class="loading loading-spinner loading-xs"></span>
-                Approve All
-              </button>
+              <div class="flex items-center gap-2">
+                <button
+                  data-test="quarantine-approve-all"
+                  @click="approveAllTools"
+                  :disabled="approvalLoading"
+                  class="btn btn-sm btn-warning"
+                >
+                  <span v-if="approvalLoading" class="loading loading-spinner loading-xs"></span>
+                  Approve All
+                </button>
+                <!-- MCP-2199: reject every quarantined tool (reversible). -->
+                <button
+                  data-test="quarantine-block-all"
+                  @click="blockAllTools"
+                  :disabled="approvalLoading"
+                  class="btn btn-sm btn-outline btn-error"
+                >
+                  <span v-if="approvalLoading" class="loading loading-spinner loading-xs"></span>
+                  Block All
+                </button>
+              </div>
             </div>
 
             <!-- Quarantined Tools List -->
-            <div v-if="quarantinedTools.length > 0" class="space-y-3 mb-6">
+            <div v-if="quarantinedTools.length > 0" data-test="tool-quarantine-list" class="space-y-3 mb-6">
               <div
                 v-for="tool in quarantinedTools"
                 :key="'q-' + tool.tool_name"
@@ -347,42 +404,121 @@
                           {{ tool.status }}
                         </span>
                       </div>
-                      <p class="text-sm text-base-content/70 mt-1">{{ tool.description }}</p>
-                      <!-- Show word-level diff for changed tools -->
-                      <div v-if="tool.status === 'changed' && tool.previous_description" class="mt-2 text-xs">
-                        <div class="bg-base-300/50 px-2 py-1.5 rounded font-mono leading-relaxed">
-                          <template v-for="(part, i) in computeWordDiff(tool.previous_description, tool.current_description || tool.description)" :key="i">
-                            <span v-if="part.type === 'removed'" class="bg-error/20 text-error line-through px-0.5 rounded">{{ part.text }}</span>
-                            <span v-else-if="part.type === 'added'" class="bg-success/20 text-success font-semibold px-0.5 rounded">{{ part.text }}</span>
-                            <span v-else>{{ part.text }}</span>
-                          </template>
+                      <p
+                        v-if="tool.status !== 'changed' || computeToolDiffSections(tool).length === 0"
+                        class="text-sm text-base-content/70 mt-1"
+                      >{{ tool.description }}</p>
+                      <!-- Per-field before/after diff for changed tools: a tool is
+                           flagged "changed" when its description, input schema, OR
+                           output schema differs from the approved version (MCP-2096).
+                           Render one section per field that actually changed so a
+                           schema-only change isn't an invisible phantom diff. -->
+                      <div
+                        v-if="tool.status === 'changed' && computeToolDiffSections(tool).length > 0"
+                        class="mt-2 space-y-3 text-xs"
+                        data-test="tool-diff"
+                      >
+                        <div
+                          v-for="section in computeToolDiffSections(tool)"
+                          :key="section.key"
+                          :data-test="'tool-diff-' + section.key"
+                        >
+                          <div class="text-[11px] font-semibold text-base-content/80 mb-0.5">{{ section.label }}</div>
+                          <div v-if="section.hint" class="text-[10px] text-base-content/50 mb-1">{{ section.hint }}</div>
+                          <div class="space-y-2">
+                            <div>
+                              <div class="text-[10px] font-semibold uppercase tracking-wide text-base-content/60 mb-1">Before (approved)</div>
+                              <div class="bg-error/5 border border-error/20 px-2 py-1.5 rounded font-mono leading-relaxed whitespace-pre-wrap">
+                                <template v-for="(part, i) in computeWordDiff(section.before, section.after)" :key="'b'+i">
+                                  <span v-if="part.type === 'removed'" class="bg-error/20 text-error font-semibold px-0.5 rounded">{{ part.text }}</span>
+                                  <span v-else-if="part.type === 'same'">{{ part.text }}</span>
+                                </template>
+                              </div>
+                            </div>
+                            <div>
+                              <div class="text-[10px] font-semibold uppercase tracking-wide text-base-content/60 mb-1">After (current)</div>
+                              <div class="bg-success/5 border border-success/20 px-2 py-1.5 rounded font-mono leading-relaxed whitespace-pre-wrap">
+                                <template v-for="(part, i) in computeWordDiff(section.before, section.after)" :key="'a'+i">
+                                  <span v-if="part.type === 'added'" class="bg-success/20 text-success font-semibold px-0.5 rounded">{{ part.text }}</span>
+                                  <span v-else-if="part.type === 'same'">{{ part.text }}</span>
+                                </template>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
                     </div>
-                    <button
-                      @click="approveTool(tool.tool_name)"
-                      :disabled="approvalLoading"
-                      class="btn btn-sm btn-outline ml-4"
-                    >
-                      Approve
-                    </button>
+                    <template v-if="isToolConfigDenied(tool.tool_name)">
+                      <span
+                        class="badge badge-neutral badge-sm ml-4 self-center"
+                        title="Tool is denied by mcp_config.json; approval has no effect while the config lock is active"
+                      >🔒 locked by config</span>
+                    </template>
+                    <div v-else class="flex items-center gap-2 ml-4 self-center">
+                      <button
+                        :data-test="'quarantine-approve-' + tool.tool_name"
+                        @click="approveTool(tool.tool_name)"
+                        :disabled="approvalLoading"
+                        class="btn btn-sm btn-outline"
+                      >
+                        Approve
+                      </button>
+                      <!-- MCP-2199: reject this quarantined tool (reversible). -->
+                      <button
+                        :data-test="'quarantine-block-' + tool.tool_name"
+                        @click="blockTool(tool.tool_name)"
+                        :disabled="approvalLoading"
+                        class="btn btn-sm btn-outline btn-error"
+                      >
+                        Block
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div class="flex justify-between items-center">
+            <div class="flex flex-col lg:flex-row lg:justify-between lg:items-center gap-3">
               <div>
                 <h3 class="text-lg font-semibold">Available Tools</h3>
                 <p class="text-base-content/70">Tools provided by {{ server.name }}</p>
               </div>
-              <div class="form-control">
-                <input
-                  v-model="toolSearch"
-                  type="text"
-                  placeholder="Search tools..."
-                  class="input input-bordered input-sm w-64"
-                />
+              <div class="flex items-center gap-2 flex-wrap">
+                <!--
+                  Bulk Enable/Disable. Both buttons surface only when there's
+                  something for them to do — "Enable All" appears when at
+                  least one tool is currently disabled, "Disable All" when at
+                  least one is currently enabled. That way the action label
+                  always matches a real, observable outcome.
+                -->
+                <button
+                  v-if="hasDisabledTool"
+                  class="btn btn-sm btn-success"
+                  :disabled="bulkToolToggleLoading"
+                  @click="bulkToggleAllTools(true)"
+                  data-test="tools-enable-all"
+                >
+                  <span v-if="bulkToolToggleLoading" class="loading loading-spinner loading-xs"></span>
+                  Enable All
+                </button>
+                <button
+                  v-if="hasEnabledTool"
+                  class="btn btn-sm btn-warning"
+                  :disabled="bulkToolToggleLoading"
+                  @click="bulkToggleAllTools(false)"
+                  data-test="tools-disable-all"
+                >
+                  <span v-if="bulkToolToggleLoading" class="loading loading-spinner loading-xs"></span>
+                  Disable All
+                </button>
+                <div class="form-control">
+                  <input
+                    v-model="toolSearch"
+                    type="text"
+                    placeholder="Search tools..."
+                    class="input input-bordered input-sm w-64"
+                  />
+                </div>
               </div>
             </div>
 
@@ -390,35 +526,93 @@
               <div
                 v-for="tool in filteredTools"
                 :key="tool.name"
-                class="card bg-base-100 shadow-md"
+                class="card shadow-md transition-colors"
+                :class="isToolEnabled(tool.name)
+                  ? 'bg-base-100'
+                  : 'bg-base-200/70 border border-base-300'"
               >
                 <div class="card-body">
-                  <div class="flex items-center gap-2">
-                    <h4 class="card-title text-lg">{{ tool.name }}</h4>
-                    <span
-                      v-if="getToolApprovalStatus(tool.name) === 'pending'"
-                      class="badge badge-info badge-sm"
-                    >new</span>
-                    <span
-                      v-else-if="getToolApprovalStatus(tool.name) === 'changed'"
-                      class="badge badge-warning badge-sm"
-                    >changed</span>
-                  </div>
-                  <p class="text-sm text-base-content/70">
-                    {{ tool.description || 'No description available' }}
-                  </p>
-                  <AnnotationBadges
-                    v-if="tool.annotations"
-                    :annotations="tool.annotations"
-                    class="mt-2"
-                  />
-                  <div v-if="tool.input_schema" class="card-actions justify-end mt-4">
-                    <button
-                      class="btn btn-sm btn-outline"
-                      @click="viewToolSchema(tool)"
+                  <!--
+                    Header row: title + status badges on the left, the
+                    per-tool toggle pinned to the top-right corner so it's
+                    the first thing the eye lands on. The toggle itself
+                    stays in the bright base-content layer (no opacity)
+                    even when the tool is disabled — only the description /
+                    annotations / View Schema button below dim so the user
+                    can tell at a glance the tool is off but the control to
+                    bring it back is still a "live affordance".
+                    Using `toggle-primary` gives the on-state a saturated
+                    color so the off-state can't be confused with a
+                    visually-disabled widget.
+
+                    Hidden for pending/changed tools because the right
+                    next action there is Approve, not Disable. For
+                    approved or never-quarantined tools the daemon
+                    synthesizes the approval record on demand, so the
+                    toggle works regardless of quarantine state.
+                  -->
+                  <div class="flex justify-between items-start gap-3">
+                    <div
+                      class="flex items-center gap-2 flex-wrap min-w-0 transition-opacity"
+                      :class="isToolEnabled(tool.name) ? '' : 'opacity-60'"
                     >
-                      View Schema
-                    </button>
+                      <h4 class="card-title text-lg break-all">{{ tool.name }}</h4>
+                      <span
+                        v-if="getToolApprovalStatus(tool.name) === 'pending'"
+                        class="badge badge-info badge-sm"
+                      >new</span>
+                      <span
+                        v-else-if="getToolApprovalStatus(tool.name) === 'changed'"
+                        class="badge badge-warning badge-sm"
+                      >changed</span>
+                      <span
+                        v-if="isToolConfigDenied(tool.name)"
+                        class="badge badge-neutral badge-sm"
+                        title="Disabled by mcp_config.json (enabled_tools / disabled_tools)"
+                      >🔒 locked by config</span>
+                    </div>
+                    <label
+                      v-if="isToolToggleAvailable(tool.name)"
+                      class="flex items-center gap-2 cursor-pointer shrink-0"
+                    >
+                      <span class="text-xs text-base-content/70">
+                        <span v-if="isToolToggleLoading(tool.name)" class="loading loading-spinner loading-xs mr-1"></span>
+                        {{ isToolEnabled(tool.name) ? 'Enabled' : 'Disabled' }}
+                      </span>
+                      <input
+                        type="checkbox"
+                        class="toggle toggle-sm toggle-primary"
+                        :checked="isToolEnabled(tool.name)"
+                        :disabled="isToolToggleLoading(tool.name) || bulkToolToggleLoading"
+                        @change="toggleToolEnabled(tool.name, ($event.target as HTMLInputElement).checked)"
+                      />
+                    </label>
+                    <span
+                      v-else-if="isToolConfigDenied(tool.name)"
+                      class="text-xs text-base-content/40 shrink-0 italic"
+                      title="Remove from disabled_tools or add to enabled_tools in mcp_config.json to unlock"
+                    >🔒 locked by config</span>
+                  </div>
+                  <div
+                    class="transition-opacity"
+                    :class="isToolEnabled(tool.name) ? '' : 'opacity-60'"
+                  >
+                    <p class="text-sm text-base-content/70 mt-2">
+                      {{ tool.description || 'No description available' }}
+                    </p>
+                    <AnnotationBadges
+                      v-if="tool.annotations"
+                      :annotations="tool.annotations"
+                      class="mt-2"
+                    />
+                    <div v-if="tool.input_schema" class="card-actions justify-end mt-4">
+                      <button
+                        class="btn btn-sm btn-outline"
+                        @click="viewToolSchema(tool)"
+                      >
+                        View Schema
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -473,70 +667,363 @@
           </div>
         </div>
 
-        <!-- Configuration Tab -->
+        <!-- Configuration Tab
+             Sections mirror the macOS tray (native/macos/MCPProxy/.../ServerDetailView.swift):
+             General, Connection/Process, Environment Variables, Docker Isolation
+             Overrides, Status, Health. All fields come from /api/v1/servers/{id} —
+             no new API surface needed. Read-only here; the existing Edit page is
+             the dedicated mutation surface. -->
         <div v-if="activeTab === 'config'">
           <div class="space-y-6">
-            <div>
-              <h3 class="text-lg font-semibold mb-4">Server Configuration</h3>
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div class="space-y-4">
-                  <div>
-                    <label class="label">
-                      <span class="label-text font-medium">Name</span>
-                    </label>
-                    <input :value="server.name" readonly class="input input-bordered w-full" />
-                  </div>
-                  <div>
-                    <label class="label">
-                      <span class="label-text font-medium">Protocol</span>
-                    </label>
-                    <input :value="server.protocol" readonly class="input input-bordered w-full" />
-                  </div>
-                  <div v-if="server.url">
-                    <label class="label">
-                      <span class="label-text font-medium">URL</span>
-                    </label>
-                    <input :value="server.url" readonly class="input input-bordered w-full" />
-                  </div>
-                  <div v-if="server.command">
-                    <label class="label">
-                      <span class="label-text font-medium">Command</span>
-                    </label>
-                    <input :value="server.command" readonly class="input input-bordered w-full" />
-                  </div>
-                </div>
-                <div class="space-y-4">
-                  <div class="form-control">
-                    <label class="label">
-                      <span class="label-text font-medium">Enabled</span>
-                    </label>
+            <!-- General -->
+            <div class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">General</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">Name</dt>
+                  <dd class="font-medium">{{ server.name }}</dd>
+                  <dt class="text-base-content/60">Protocol</dt>
+                  <dd><code class="bg-base-200 px-1.5 py-0.5 rounded text-xs">{{ server.protocol }}</code></dd>
+                  <dt class="text-base-content/60">Enabled</dt>
+                  <dd class="flex items-center gap-2">
                     <input
                       type="checkbox"
                       :checked="server.enabled"
                       @change="toggleEnabled"
-                      class="toggle"
+                      class="toggle toggle-sm"
                       :disabled="actionLoading"
                     />
-                  </div>
-                  <div class="form-control">
-                    <label class="label">
-                      <span class="label-text font-medium">Quarantined</span>
-                    </label>
-                    <input
-                      type="checkbox"
-                      :checked="server.quarantined"
-                      readonly
-                      class="toggle"
-                      disabled
-                    />
-                  </div>
-                  <div>
-                    <label class="label">
-                      <span class="label-text font-medium">Tools Count</span>
-                    </label>
-                    <input :value="server.tool_count" readonly class="input input-bordered w-full" />
-                  </div>
+                    <span class="text-base-content/70">{{ server.enabled ? 'Yes' : 'No' }}</span>
+                  </dd>
+                  <dt class="text-base-content/60">Quarantined</dt>
+                  <dd>
+                    <span :class="server.quarantined ? 'badge badge-warning badge-sm' : 'badge badge-ghost badge-sm'">
+                      {{ server.quarantined ? 'Yes' : 'No' }}
+                    </span>
+                  </dd>
+                </dl>
+              </div>
+            </div>
+
+            <!-- Tool-change approval (rug-pull protection) — MCP-2932.
+                 Bound to the per-server `auto_approve_tool_changes` config flag
+                 (MCP-2930). OFF by default = protected: a tool whose
+                 description/schema changes, or a newly-added tool, is held for
+                 review before AI agents can use it. ON trusts those changes
+                 automatically, disabling rug-pull protection for this server. -->
+            <div class="card bg-base-100 shadow-sm" data-test="auto-approve-card">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Tool-change approval</h3>
+                <label class="flex items-center gap-3 mt-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-test="auto-approve-tool-changes"
+                    :checked="autoApproveToolChanges"
+                    @change="toggleAutoApproveToolChanges"
+                    class="toggle toggle-sm toggle-warning"
+                    :disabled="kvPatchInFlight"
+                  />
+                  <span class="text-sm font-medium">Auto-approve tool changes</span>
+                </label>
+                <!-- Rug-pull warning sits directly beneath the toggle. Always
+                     visible so the trade-off is clear before enabling; it
+                     escalates to an alert once the protection is actually off. -->
+                <div
+                  v-if="autoApproveToolChanges"
+                  data-test="auto-approve-warning"
+                  role="alert"
+                  class="alert alert-warning mt-2 py-2 text-sm"
+                >
+                  <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  <span>
+                    Rug-pull protection is <strong>disabled</strong> for this server.
+                    Future changes to a tool's description or schema — and newly
+                    added tools — are trusted automatically instead of held for review.
+                  </span>
                 </div>
+                <p
+                  v-else
+                  data-test="auto-approve-warning"
+                  class="text-xs text-base-content/60 mt-2 flex items-start gap-1.5"
+                >
+                  <span aria-hidden="true">⚠️</span>
+                  <span>
+                    Enabling this <strong>disables rug-pull protection</strong>: changed
+                    tool descriptions/schemas and newly added tools will be trusted
+                    automatically instead of held for review. Protected (default) is
+                    recommended.
+                  </span>
+                </p>
+              </div>
+            </div>
+
+            <!-- Connection (HTTP/SSE) -->
+            <div v-if="server.url" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Connection</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">URL</dt>
+                  <dd><code class="bg-base-200 px-1.5 py-0.5 rounded text-xs break-all">{{ server.url }}</code></dd>
+                </dl>
+              </div>
+            </div>
+
+            <!-- Process (stdio) -->
+            <div v-if="server.command" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Process</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">Command</dt>
+                  <dd><code class="bg-base-200 px-1.5 py-0.5 rounded text-xs">{{ server.command }}</code></dd>
+                  <template v-if="server.args && server.args.length">
+                    <dt class="text-base-content/60">Args</dt>
+                    <dd><code class="bg-base-200 px-1.5 py-0.5 rounded text-xs break-all">{{ server.args.join(' ') }}</code></dd>
+                  </template>
+                  <template v-if="server.working_dir">
+                    <dt class="text-base-content/60">Working Dir</dt>
+                    <dd><code class="bg-base-200 px-1.5 py-0.5 rounded text-xs break-all">{{ server.working_dir }}</code></dd>
+                  </template>
+                </dl>
+              </div>
+            </div>
+
+            <!-- Headers (HTTP servers): redacted by default per backend
+                 redaction policy. Click the eye icon on a row to reveal the
+                 raw value, which only works if the loaded config has
+                 `reveal_secret_headers: true` — otherwise the API returns
+                 `***REDACTED***` and there is nothing to reveal. -->
+            <div v-if="(server.url || hasHeaders) && server.protocol !== 'stdio'" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <div class="flex items-center justify-between">
+                  <h3 class="card-title text-base">Headers</h3>
+                  <button
+                    v-if="!addingHeader"
+                    class="btn btn-xs btn-ghost"
+                    @click="startAddingHeader"
+                    :disabled="kvPatchInFlight"
+                  >+ Add header</button>
+                </div>
+                <p class="text-xs text-base-content/50 mt-1">
+                  Sent with every request to this server. Storing the value as a secret keeps the literal token out of the config file.
+                </p>
+                <table v-if="hasHeaders || addingHeader" class="table table-sm mt-2">
+                  <tbody>
+                    <tr v-for="k in headerKeys" :key="`hdr-${k}`">
+                      <td class="font-mono text-xs w-1/3 align-top">{{ k }}</td>
+                      <td>
+                        <KVValueCell
+                          scope="header"
+                          :k="k"
+                          :raw-value="serverHeaders[k]"
+                          :is-editing="editingKey === `hdr::${k}`"
+                          :busy="kvPatchInFlight"
+                          @start-edit="startEdit('hdr', k)"
+                          @cancel-edit="cancelEdit"
+                          @save="(val) => saveEdit('header', k, val)"
+                          @delete="deleteKv('header', k)"
+                          @convert="openConvertModal('header', k, serverHeaders[k])"
+                        />
+                      </td>
+                    </tr>
+                    <tr v-if="addingHeader">
+                      <td>
+                        <input
+                          v-model="newHeaderKey"
+                          class="input input-bordered input-xs w-full font-mono"
+                          placeholder="Header-Name"
+                          @keyup.enter="commitNewHeader"
+                          ref="newHeaderKeyInput"
+                        />
+                      </td>
+                      <td>
+                        <div class="flex gap-2 items-center">
+                          <input
+                            v-model="newHeaderValue"
+                            type="text"
+                            class="input input-bordered input-xs flex-1 font-mono"
+                            placeholder="value (literal or ${keyring:name})"
+                            @keyup.enter="commitNewHeader"
+                          />
+                          <button class="btn btn-xs btn-primary" @click="commitNewHeader" :disabled="!newHeaderKey || !newHeaderValue || kvPatchInFlight">Add</button>
+                          <button class="btn btn-xs btn-ghost" @click="addingHeader = false" :disabled="kvPatchInFlight">Cancel</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div v-else class="text-xs text-base-content/50 mt-2">No headers configured.</div>
+              </div>
+            </div>
+
+            <!-- Environment Variables: same affordances as Headers — redact /
+                 reveal / inline edit / delete / convert literal values into
+                 ${keyring:name} references. Visible for any server that has
+                 env vars or for stdio servers (which is where most env lives). -->
+            <div v-if="hasEnv || server.protocol === 'stdio'" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <div class="flex items-center justify-between">
+                  <h3 class="card-title text-base">Environment Variables</h3>
+                  <button
+                    v-if="!addingEnv"
+                    class="btn btn-xs btn-ghost"
+                    @click="startAddingEnv"
+                    :disabled="kvPatchInFlight"
+                  >+ Add variable</button>
+                </div>
+                <table v-if="hasEnv || addingEnv" class="table table-sm mt-2">
+                  <tbody>
+                    <tr v-for="k in envKeys" :key="`env-${k}`">
+                      <td class="font-mono text-xs w-1/3 align-top">{{ k }}</td>
+                      <td>
+                        <KVValueCell
+                          scope="env"
+                          :k="k"
+                          :raw-value="serverEnv[k]"
+                          :is-editing="editingKey === `env::${k}`"
+                          :busy="kvPatchInFlight"
+                          @start-edit="startEdit('env', k)"
+                          @cancel-edit="cancelEdit"
+                          @save="(val) => saveEdit('env', k, val)"
+                          @delete="deleteKv('env', k)"
+                          @convert="openConvertModal('env', k, serverEnv[k])"
+                        />
+                      </td>
+                    </tr>
+                    <tr v-if="addingEnv">
+                      <td>
+                        <input
+                          v-model="newEnvKey"
+                          class="input input-bordered input-xs w-full font-mono"
+                          placeholder="VAR_NAME"
+                          @keyup.enter="commitNewEnv"
+                          ref="newEnvKeyInput"
+                        />
+                      </td>
+                      <td>
+                        <div class="flex gap-2 items-center">
+                          <input
+                            v-model="newEnvValue"
+                            type="text"
+                            class="input input-bordered input-xs flex-1 font-mono"
+                            placeholder="value (literal or ${keyring:name})"
+                            @keyup.enter="commitNewEnv"
+                          />
+                          <button class="btn btn-xs btn-primary" @click="commitNewEnv" :disabled="!newEnvKey || !newEnvValue || kvPatchInFlight">Add</button>
+                          <button class="btn btn-xs btn-ghost" @click="addingEnv = false" :disabled="kvPatchInFlight">Cancel</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div v-else class="text-xs text-base-content/50 mt-2">No environment variables configured.</div>
+              </div>
+            </div>
+
+            <!-- Docker Isolation Overrides: show the per-server override when
+                 set, otherwise show the resolved default ('placeholder') so
+                 the user can see what's actually in effect. Mirrors the
+                 macOS tray's placeholder behavior. -->
+            <div v-if="hasIsolationData" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Docker Isolation Overrides</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">Image</dt>
+                  <dd>
+                    <code v-if="server.isolation?.image" class="bg-base-200 px-1.5 py-0.5 rounded text-xs break-all">{{ server.isolation.image }}</code>
+                    <span v-else-if="server.isolation_defaults?.image" class="text-base-content/40 text-xs italic">default: {{ server.isolation_defaults.image }}</span>
+                    <span v-else class="text-base-content/40 text-xs">—</span>
+                  </dd>
+                  <dt class="text-base-content/60">Network Mode</dt>
+                  <dd>
+                    <span v-if="server.isolation?.network_mode" class="badge badge-outline badge-sm">{{ server.isolation.network_mode }}</span>
+                    <span v-else-if="server.isolation_defaults?.network_mode" class="text-base-content/40 text-xs italic">default: {{ server.isolation_defaults.network_mode }}</span>
+                    <span v-else class="text-base-content/40 text-xs">—</span>
+                  </dd>
+                  <dt class="text-base-content/60">Extra Args</dt>
+                  <dd>
+                    <code v-if="server.isolation?.extra_args && server.isolation.extra_args.length" class="bg-base-200 px-1.5 py-0.5 rounded text-xs break-all">{{ server.isolation.extra_args.join(' ') }}</code>
+                    <span v-else-if="server.isolation_defaults?.extra_args && server.isolation_defaults.extra_args.length" class="text-base-content/40 text-xs italic">default: {{ server.isolation_defaults.extra_args.join(' ') }}</span>
+                    <span v-else class="text-base-content/40 text-xs">—</span>
+                  </dd>
+                  <dt class="text-base-content/60">Container Working Dir</dt>
+                  <dd>
+                    <code v-if="server.isolation?.working_dir" class="bg-base-200 px-1.5 py-0.5 rounded text-xs">{{ server.isolation.working_dir }}</code>
+                    <span v-else-if="server.isolation_defaults?.working_dir" class="text-base-content/40 text-xs italic">default: {{ server.isolation_defaults.working_dir }}</span>
+                    <span v-else class="text-base-content/40 text-xs">—</span>
+                  </dd>
+                  <template v-if="server.isolation?.memory_limit">
+                    <dt class="text-base-content/60">Memory Limit</dt>
+                    <dd>{{ server.isolation.memory_limit }}</dd>
+                  </template>
+                  <template v-if="server.isolation?.cpu_limit">
+                    <dt class="text-base-content/60">CPU Limit</dt>
+                    <dd>{{ server.isolation.cpu_limit }}</dd>
+                  </template>
+                  <template v-if="server.isolation_defaults?.runtime_type">
+                    <dt class="text-base-content/60">Runtime</dt>
+                    <dd><span class="badge badge-ghost badge-sm">{{ server.isolation_defaults.runtime_type }}</span></dd>
+                  </template>
+                </dl>
+              </div>
+            </div>
+
+            <!-- Status (live runtime state) -->
+            <div class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Status</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">Connected</dt>
+                  <dd>
+                    <span :class="server.connected ? 'badge badge-success badge-sm' : 'badge badge-ghost badge-sm'">
+                      {{ server.connected ? 'Yes' : 'No' }}
+                    </span>
+                  </dd>
+                  <template v-if="server.connected_at">
+                    <dt class="text-base-content/60">Connected At</dt>
+                    <dd>{{ formatConfigTime(server.connected_at) }}</dd>
+                  </template>
+                  <template v-if="(server.reconnect_count ?? 0) > 0">
+                    <dt class="text-base-content/60">Reconnect Count</dt>
+                    <dd>{{ server.reconnect_count }}</dd>
+                  </template>
+                  <dt class="text-base-content/60">Tool Count</dt>
+                  <dd>{{ server.tool_count ?? 0 }}</dd>
+                  <template v-if="server.tool_list_token_size">
+                    <dt class="text-base-content/60">Tool List Tokens</dt>
+                    <dd>{{ server.tool_list_token_size }}</dd>
+                  </template>
+                  <template v-if="server.last_error">
+                    <dt class="text-base-content/60">Last Error</dt>
+                    <dd class="text-error/80 break-words whitespace-pre-wrap">{{ server.last_error }}</dd>
+                  </template>
+                </dl>
+              </div>
+            </div>
+
+            <!-- Health (calculated by backend; same shape consumed by macOS tray) -->
+            <div v-if="server.health" class="card bg-base-100 shadow-sm">
+              <div class="card-body py-4">
+                <h3 class="card-title text-base">Health</h3>
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 mt-2 text-sm">
+                  <dt class="text-base-content/60">Level</dt>
+                  <dd>
+                    <span :class="healthLevelBadgeClass(server.health.level)">{{ server.health.level }}</span>
+                  </dd>
+                  <dt class="text-base-content/60">Admin State</dt>
+                  <dd><span class="badge badge-ghost badge-sm">{{ server.health.admin_state }}</span></dd>
+                  <dt class="text-base-content/60">Summary</dt>
+                  <dd>{{ server.health.summary }}</dd>
+                  <template v-if="server.health.detail">
+                    <dt class="text-base-content/60">Detail</dt>
+                    <dd class="text-base-content/70 break-words whitespace-pre-wrap">{{ server.health.detail }}</dd>
+                  </template>
+                  <template v-if="server.health.action">
+                    <dt class="text-base-content/60">Suggested Action</dt>
+                    <dd><span class="badge badge-info badge-outline badge-sm">{{ server.health.action }}</span></dd>
+                  </template>
+                </dl>
               </div>
             </div>
           </div>
@@ -547,12 +1034,13 @@
           <div class="space-y-6">
             <!-- Header: Scan button + Risk Score -->
             <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
-              <div class="tooltip" :data-tip="!dockerAvailable ? 'Docker is required to run security scanners' : (!hasEnabledScanners() ? 'No scanners enabled — install one from Security Scanners' : '')">
+              <div class="tooltip tooltip-bottom" :data-tip="!dockerAvailable ? 'Docker is required to run security scanners' : (!hasEnabledScanners() ? 'No scanners enabled — install one from Security Scanners' : '')">
                 <button
                   v-if="hasEnabledScanners()"
                   @click="startSecurityScan"
                   :disabled="scanLoading || !dockerAvailable"
                   class="btn btn-primary"
+                  data-test="scan-button"
                 >
                   <span v-if="scanLoading" class="loading loading-spinner loading-xs"></span>
                   <svg v-else class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -598,7 +1086,7 @@
             </div>
 
             <!-- Scan Progress (visible during active scan) -->
-            <div v-if="scanLoading" class="space-y-3">
+            <div v-if="scanLoading" class="space-y-3" data-test="scan-progress">
               <template v-if="scanProgress && scanProgress.total > 0">
                 <div class="flex items-center justify-between text-sm">
                   <span class="font-medium">Scanning with {{ scanProgress.total }} scanner{{ scanProgress.total !== 1 ? 's' : '' }}...</span>
@@ -742,10 +1230,10 @@
                   <div class="text-xs text-base-content/50">Risk Score</div>
                 </div>
                 <div class="flex gap-4 text-sm">
-                  <span v-if="scanReport.summary?.dangerous" class="text-error font-semibold">{{ scanReport.summary.dangerous }} dangerous</span>
-                  <span v-if="scanReport.summary?.warnings" class="text-warning font-semibold">{{ scanReport.summary.warnings }} warnings</span>
-                  <span v-if="scanReport.summary?.info_level" class="text-info">{{ scanReport.summary.info_level }} info</span>
-                  <span v-if="scanReport.summary?.total === 0" class="text-success font-semibold">No findings</span>
+                  <span v-if="scanThreatCounts.dangerous" class="text-error font-semibold">{{ scanThreatCounts.dangerous }} dangerous</span>
+                  <span v-if="scanThreatCounts.warnings" class="text-warning font-semibold">{{ scanThreatCounts.warnings }} warnings</span>
+                  <span v-if="scanThreatCounts.info" class="text-info">{{ scanThreatCounts.info }} info</span>
+                  <span v-if="scanThreatCounts.total === 0" class="text-success font-semibold">No findings</span>
                 </div>
               </div>
 
@@ -759,7 +1247,7 @@
 
               <!-- Action buttons -->
               <div class="flex gap-3">
-                <router-link v-if="scanReport.job_id" :to="`/security/scans/${scanReport.job_id}`" class="btn btn-primary btn-sm">
+                <router-link v-if="scanReport.job_id" :to="scanReportPath(scanReport.job_id)" class="btn btn-primary btn-sm" data-test="scan-report-link">
                   View Full Report &rarr;
                 </router-link>
               </div>
@@ -782,6 +1270,39 @@
       </div>
     </div>
 
+    <!-- Convert-to-secret modal: prompts for a keyring secret name, then
+         calls POST /api/v1/secrets followed by a PATCH replacing the
+         literal value with `${keyring:NAME}`. -->
+    <div v-if="convertModal.open" class="modal modal-open">
+      <div class="modal-box max-w-md">
+        <h3 class="font-bold text-lg">Convert to secret</h3>
+        <p class="text-sm text-base-content/70 mt-2">
+          Store the value of <code class="font-mono">{{ convertModal.key }}</code> in the OS keyring and
+          replace it with a <code class="font-mono">{{ '${keyring:NAME}' }}</code> reference. The
+          server config will then no longer contain the literal value.
+        </p>
+        <div class="form-control mt-4">
+          <label class="label py-1"><span class="label-text">Secret name</span></label>
+          <input
+            v-model="convertModal.secretName"
+            class="input input-bordered input-sm font-mono"
+            placeholder="my-server-token"
+            @keyup.enter="commitConvert"
+          />
+          <label class="label py-1">
+            <span class="label-text-alt text-base-content/50">Will be referenced as <code>{{ '${keyring:' + (convertModal.secretName || 'NAME') + '}' }}</code></span>
+          </label>
+        </div>
+        <div class="modal-action">
+          <button class="btn btn-ghost btn-sm" @click="closeConvertModal" :disabled="convertModal.busy">Cancel</button>
+          <button class="btn btn-primary btn-sm" @click="commitConvert" :disabled="!convertModal.secretName || convertModal.busy">
+            <span v-if="convertModal.busy" class="loading loading-spinner loading-xs"></span>
+            Convert
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Hints Panel (Bottom of Page) -->
     <CollapsibleHintsPanel :hints="serverDetailHints" />
   </div>
@@ -794,12 +1315,23 @@ import { useServersStore } from '@/stores/servers'
 import { useSystemStore } from '@/stores/system'
 import CollapsibleHintsPanel from '@/components/CollapsibleHintsPanel.vue'
 import AnnotationBadges from '@/components/AnnotationBadges.vue'
+import ErrorPanel from '@/components/diagnostics/ErrorPanel.vue'
+import SignInPanel from '@/components/diagnostics/SignInPanel.vue'
+import KVValueCell from '@/components/KVValueCell.vue'
 import type { Hint } from '@/components/CollapsibleHintsPanel.vue'
 import type { Server, Tool, ToolApproval, SecurityScanReport } from '@/types'
 import api from '@/services/api'
 import { useSecurityScannerStatus } from '@/composables/useSecurityScannerStatus'
+import { serverDisplayName, scanReportPath } from '@/utils/serverRoute'
+import { isTerminalScanStatus, decideScanReconcile, finalizeToastKind } from '@/utils/scanState'
+import { selectQuarantinedTools } from '@/utils/toolQuarantine'
+import { oauthSignInState } from '@/utils/health'
+import { computeToolDiffSections } from '@/utils/toolDiff'
 
 interface Props {
+  // MCP-1112: vue-router decodes the percent-encoded ':serverName' param, so
+  // this is the plain server name (which may contain '/', e.g.
+  // "io.github.owner/repo") and matches the stored config `name` directly.
   serverName: string
 }
 
@@ -812,7 +1344,47 @@ const systemStore = useSystemStore()
 // State
 const loading = ref(true)
 const error = ref<string | null>(null)
-const server = ref<Server | null>(null)
+// SYSTEMATIC FIX for the "stale local snapshot" class of bugs:
+//
+// `server` is a *computed* derived from the Pinia store, not a manually
+// reassigned ref. That means every property access (`server.value.enabled`,
+// `server.value.quarantine.blocked_count`, …) reads through the store's
+// reactive proxy, and every SSE-driven store mutation — whether it lands
+// via the spec-047 embedded payload, the spec-048 server-merge, or the
+// notify-only fallback that re-fetches /api/v1/servers — automatically
+// propagates to every template binding and computed in this view.
+//
+// The previous shape was a snapshot ref reassigned at ~10 action-handler
+// sites. Any new handler that forgot the reassignment introduced a fresh
+// staleness bug (latest examples: the "N disabled" pill not clearing on
+// re-enable, and the big Tools counter freezing across a server-level
+// Disable/Enable cycle). The computed makes the whole class structurally
+// impossible.
+//
+// Mutations: anywhere we previously did `server.value.X = Y` to nudge the
+// UI ahead of a network round-trip (the optimistic blocked_count bump),
+// we now mutate the store's server object directly via `mutateStoreServer`.
+// Pinia is reactive to direct mutation, so the computed observers see
+// the change immediately and the subsequent `fetchServers` reconciles
+// to authoritative state.
+const server = computed<Server | null>(() => {
+  return serversStore.servers.find(s => s.name === props.serverName) || null
+})
+
+// MCP-1112: prefer the registry-provided human-friendly title over the raw
+// reverse-DNS `name` identifier for display. Falls back to the name (or the
+// route param before the server loads).
+const displayName = computed(() =>
+  server.value ? serverDisplayName(server.value) : props.serverName
+)
+
+// mutateStoreServer applies fn to the live store object for this view's
+// server. Lets optimistic updates land where the rest of the app will
+// see them, without forking a parallel local copy.
+function mutateStoreServer(fn: (s: Server) => void) {
+  const s = serversStore.servers.find(srv => srv.name === props.serverName)
+  if (s) fn(s)
+}
 const activeTab = ref<'tools' | 'logs' | 'config' | 'security'>('tools')
 const actionLoading = ref(false)
 
@@ -826,9 +1398,27 @@ const selectedToolSchema = ref<Tool | null>(null)
 // Tool quarantine (Spec 032)
 const toolApprovals = ref<ToolApproval[]>([])
 const approvalLoading = ref(false)
+// MCP-2917: the Tool-Quarantine banner carries a one-line hint about how to
+// auto-approve pending tools; let the operator dismiss it for the session.
+const quarantineHintDismissed = ref(false)
+const toolToggleLoading = ref<Record<string, boolean>>({})
+// Single in-flight flag for the bulk Enable All / Disable All buttons so
+// they're mutually exclusive with each other and with any per-tool toggle.
+const bulkToolToggleLoading = ref(false)
 
+// MCP-2917 (Spec 032): the Tool-Quarantine banner / list surfaces every
+// `pending` (awaiting first approval) or `changed` (rug-pull) tool while the
+// server itself is NOT quarantined (both are blocked by the backend until the
+// operator acts), and is suppressed entirely while the server-level Security
+// Quarantine banner is showing. See selectQuarantinedTools for the rationale.
 const quarantinedTools = computed(() => {
-  return toolApprovals.value.filter(t => t.status === 'pending' || t.status === 'changed')
+  return selectQuarantinedTools(toolApprovals.value, server.value?.quarantined ?? false)
+})
+
+const blockedToolCount = computed(() => {
+  const q = server.value?.quarantine
+  if (!q) return 0
+  return q.blocked_count ?? 0
 })
 
 // Security scan (Spec 039)
@@ -877,6 +1467,42 @@ const isHttpProtocol = computed(() => {
 const healthAction = computed(() => {
   return server.value?.health?.action || ''
 })
+
+// MCP-1821 — OAuth sign-in state (null when no sign-in is required). Drives the
+// calm SignInPanel and the amber "Sign-in required" status badge.
+const signInState = computed(() => {
+  return server.value ? oauthSignInState(server.value) : null
+})
+
+const statusBadgeClass = computed(() => {
+  if (signInState.value) return 'badge-warning'
+  if (server.value?.connected) return 'badge-success'
+  if (server.value?.connecting) return 'badge-warning'
+  return 'badge-error'
+})
+
+const statusBadgeText = computed(() => {
+  if (signInState.value) return 'Sign-in required'
+  if (server.value?.connected) return 'Connected'
+  if (server.value?.connecting) return 'Connecting'
+  return 'Disconnected'
+})
+
+// Spec 044 — render the structured diagnostic panel whenever a warn/error
+// diagnostic is attached. Info-level diagnostics are ignored (shown only in
+// verbose/admin views, per spec).
+const showDiagnosticPanel = computed(() => {
+  const d = server.value?.diagnostic
+  if (!d || !d.code) return false
+  return d.severity === 'warn' || d.severity === 'error'
+})
+
+function handleDiagnosticFixed(_payload: { fixerKey: string; mode: 'dry_run' | 'execute' }) {
+  // Trigger a silent refresh so the diagnostic disappears once the server
+  // reconnects. The SSE stream will also push an update, but an explicit
+  // refresh provides a more responsive UI when the user clicks "Execute".
+  void serversStore.fetchServers(true)
+}
 
 // Security scan computed properties
 const securityScanStatus = computed(() => {
@@ -946,24 +1572,139 @@ function getToolApprovalStatus(toolName: string): string | null {
   return approval.status
 }
 
+function getToolApproval(toolName: string): ToolApproval | null {
+  return toolApprovals.value.find(t => t.tool_name === toolName) || null
+}
+
+function isToolConfigDenied(toolName: string): boolean {
+  const tool = serverTools.value.find(t => t.name === toolName)
+  return tool?.config_denied === true
+}
+
+function isToolEnabled(toolName: string): boolean {
+  // GET /api/v1/servers/{id}/tools returns each tool with a top-level
+  // `disabled` boolean (see contracts.Tool.Disabled in Go) when an approval
+  // record exists. The approvals endpoint also exposes `enabled`/`disabled`.
+  // Cross-check both so the toggle reflects reality regardless of which
+  // payload the frontend already loaded.
+  const tool = serverTools.value.find(t => t.name === toolName)
+  if (tool) {
+    if (typeof tool.disabled === 'boolean') return !tool.disabled
+  }
+  const approval = getToolApproval(toolName)
+  if (!approval) return true
+  if (typeof approval.enabled === 'boolean') return approval.enabled
+  if (typeof approval.disabled === 'boolean') return !approval.disabled
+  return true
+}
+
+function isToolToggleLoading(toolName: string): boolean {
+  return !!toolToggleLoading.value[toolName]
+}
+
+// The toggle is hidden for pending/changed tools because the right next
+// action there is "Approve", not "Disable". For approved or never-quarantined
+// tools the daemon synthesizes an approval record on demand, so the toggle
+// works in every other case.
+function isToolToggleAvailable(toolName: string): boolean {
+  if (isToolConfigDenied(toolName)) return false
+  const status = getToolApprovalStatus(toolName)
+  return status === null || status === 'approved'
+}
+
+// Whether the bulk buttons should appear. We only render "Enable All" when
+// at least one tool can actually be enabled, and "Disable All" only when at
+// least one tool can be disabled — otherwise the label promises a no-op.
+const hasEnabledTool = computed(() =>
+  serverTools.value.some(t => isToolToggleAvailable(t.name) && isToolEnabled(t.name))
+)
+const hasDisabledTool = computed(() =>
+  serverTools.value.some(t => isToolToggleAvailable(t.name) && !isToolEnabled(t.name))
+)
+
+// Vue Router 4 reuses the ServerDetail.vue component instance across
+// /servers/foo → /servers/bar (same route, just a different param). The
+// `server` computed correctly retargets via the store, but the local
+// data refs (serverTools, toolApprovals, serverLogs, scan*) stay populated
+// with the previous server's data until something refetches them. Without
+// this watch, navigating between server detail pages briefly shows server
+// B's name + stats with server A's tool list — looks like a data-corruption
+// bug. Reset eagerly, then kick off a fresh load.
+//
+// Race protection: loadGeneration is bumped by loadServerDetails so an
+// in-flight load for the previous server can't overwrite the new server's
+// refs when its fetch finally resolves. See loadTools / loadToolApprovals
+// / loadLogs for the gen-check pattern.
+watch(
+  () => props.serverName,
+  (next, prev) => {
+    if (next === prev) return
+    serverTools.value = []
+    toolsError.value = null
+    selectedToolSchema.value = null
+    toolApprovals.value = []
+    toolToggleLoading.value = {}
+    serverLogs.value = []
+    logsError.value = null
+    scanReport.value = null
+    scanStatus.value = null
+    scanError.value = null
+    scanReportLoading.value = false
+    activeScanJobId.value = null
+    scanFiles.value = []
+    scanFilesLoaded.value = false
+    void loadServerDetails()
+  }
+)
+
+// Reload tools (and approvals) whenever the server's runtime state
+// changes between enabled/disconnected/connected. Without this, toggling
+// a server enabled/disabled would leave the local serverTools list
+// stuck at its previous value: enabling shows "Connected" but tool
+// count stays 0 until manual refresh; disabling shows "Disconnected"
+// but the prior count lingers. Both directions snap to the right state
+// here by re-fetching once the store-backed server status flips. The
+// store itself receives status updates via the SSE handler in
+// frontend/src/stores/servers.ts, so this watch piggybacks on that
+// path instead of polling.
+watch(
+  () => [server.value?.connected, server.value?.enabled] as const,
+  ([connected, enabled], prev) => {
+    if (!server.value) return
+    const [prevConnected, prevEnabled] = prev ?? [undefined, undefined]
+    if (connected === prevConnected && enabled === prevEnabled) return
+    if (!enabled) {
+      // A disabled server reports tool_count=0 immediately; reflect
+      // that locally so the big "Tools" counter doesn't lag.
+      serverTools.value = []
+      toolApprovals.value = []
+      return
+    }
+    if (connected) {
+      void loadTools()
+      void loadToolApprovals()
+    }
+  }
+)
+
 // Word-level diff for changed tool descriptions
 interface DiffPart {
   type: 'same' | 'added' | 'removed'
   text: string
 }
 
-function computeWordDiff(oldText: string, newText: string): DiffPart[] {
-  const oldWords = oldText.split(/(\s+)/)
-  const newWords = newText.split(/(\s+)/)
+/// Generic LCS over arrays of strings (works for word tokens or single chars).
+function lcsDiff(oldElems: string[], newElems: string[]): DiffPart[] {
+  const m = oldElems.length
+  const n = newElems.length
+  if (m === 0 && n === 0) return []
+  if (m === 0) return newElems.map(t => ({ type: 'added', text: t }))
+  if (n === 0) return oldElems.map(t => ({ type: 'removed', text: t }))
 
-  // Longest Common Subsequence to find matching words
-  const m = oldWords.length
-  const n = newWords.length
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
-
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      if (oldWords[i - 1] === newWords[j - 1]) {
+      if (oldElems[i - 1] === newElems[j - 1]) {
         dp[i][j] = dp[i - 1][j - 1] + 1
       } else {
         dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1])
@@ -971,48 +1712,96 @@ function computeWordDiff(oldText: string, newText: string): DiffPart[] {
     }
   }
 
-  // Backtrack to build diff
-  const parts: DiffPart[] = []
+  const out: DiffPart[] = []
   let i = m, j = n
-  const stack: DiffPart[] = []
-
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldWords[i - 1] === newWords[j - 1]) {
-      stack.push({ type: 'same', text: oldWords[i - 1] })
-      i--
-      j--
+    if (i > 0 && j > 0 && oldElems[i - 1] === newElems[j - 1]) {
+      out.push({ type: 'same', text: oldElems[i - 1] })
+      i--; j--
     } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-      stack.push({ type: 'added', text: newWords[j - 1] })
+      out.push({ type: 'added', text: newElems[j - 1] })
       j--
     } else {
-      stack.push({ type: 'removed', text: oldWords[i - 1] })
+      out.push({ type: 'removed', text: oldElems[i - 1] })
       i--
     }
   }
+  return out.reverse()
+}
 
-  // Reverse since we built from end to start
-  stack.reverse()
+/// Char-level diff for short strings, with a safety cap on input length
+/// to keep the O(N×M) dp table bounded.
+function characterLevelDiff(oldText: string, newText: string, maxChars = 1500): DiffPart[] {
+  if (oldText.length > maxChars || newText.length > maxChars) {
+    return [
+      { type: 'removed', text: oldText },
+      { type: 'added', text: newText },
+    ]
+  }
+  return lcsDiff(Array.from(oldText), Array.from(newText))
+}
 
-  // Merge consecutive parts of the same type
-  for (const part of stack) {
-    if (parts.length > 0 && parts[parts.length - 1].type === part.type) {
-      parts[parts.length - 1].text += part.text
+function mergeSameKind(parts: DiffPart[]): DiffPart[] {
+  const out: DiffPart[] = []
+  for (const p of parts) {
+    const last = out[out.length - 1]
+    if (last && last.type === p.type) {
+      last.text += p.text
     } else {
-      parts.push({ ...part })
+      out.push({ ...p })
     }
   }
+  return out
+}
 
-  return parts
+/// Word-level diff with character-level refinement inside adjacent
+/// (removed, added) pairs. Keeps whole-token highlights for large docstring
+/// expansions while narrowing substring changes like "1 April" → "8 April"
+/// down to just the differing characters.
+function computeWordDiff(oldText: string, newText: string): DiffPart[] {
+  const oldWords = oldText.split(/(\s+)/).filter(t => t.length > 0)
+  const newWords = newText.split(/(\s+)/).filter(t => t.length > 0)
+  const wordDiff = mergeSameKind(lcsDiff(oldWords, newWords))
+
+  const refined: DiffPart[] = []
+  for (let idx = 0; idx < wordDiff.length; idx++) {
+    const current = wordDiff[idx]
+    const next = wordDiff[idx + 1]
+    if (
+      next &&
+      ((current.type === 'removed' && next.type === 'added') ||
+        (current.type === 'added' && next.type === 'removed'))
+    ) {
+      const removedText = current.type === 'removed' ? current.text : next.text
+      const addedText = current.type === 'added' ? current.text : next.text
+      refined.push(...characterLevelDiff(removedText, addedText))
+      idx++ // skip the paired part
+      continue
+    }
+    refined.push(current)
+  }
+  return mergeSameKind(refined)
 }
 
 // Methods
+// loadGeneration is bumped by every loadServerDetails entry. The three
+// per-server fetches (loadTools / loadToolApprovals / loadLogs) capture
+// the generation at the start of their call and only commit their result
+// if the generation hasn't advanced — which protects against the foo→bar
+// navigation race where foo's response arrives AFTER bar's load already
+// started. The counter is intentionally not a Vue ref: it's purely
+// internal flow control, no UI reactivity needed.
+let loadGeneration = 0
+
 async function loadServerDetails() {
+  const myGen = ++loadGeneration
   loading.value = true
   error.value = null
 
   try {
     await serversStore.fetchServers()
-    server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+    if (myGen !== loadGeneration) return
+    // server is a computed from the store — no manual reassignment needed.
 
     if (!server.value) {
       error.value = `Server "${props.serverName}" not found`
@@ -1021,18 +1810,28 @@ async function loadServerDetails() {
 
     // Load tools, approvals, and logs in parallel
     await Promise.all([
-      loadTools(),
-      loadToolApprovals(),
-      loadLogs()
+      _loadToolsWithGen(myGen),
+      _loadToolApprovalsWithGen(myGen),
+      _loadLogsWithGen(myGen)
     ])
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Failed to load server details'
+    if (myGen === loadGeneration) {
+      error.value = err instanceof Error ? err.message : 'Failed to load server details'
+    }
   } finally {
-    loading.value = false
+    if (myGen === loadGeneration) loading.value = false
   }
 }
 
-async function loadTools() {
+// loadTools is the public no-arg wrapper used by template @click handlers
+// and ad-hoc reloads (e.g. the connected/enabled watch). Internal gen-gated
+// impl lives in _loadToolsWithGen so loadServerDetails can pass an explicit
+// generation token for navigation-race protection.
+function loadTools() {
+  return _loadToolsWithGen(loadGeneration)
+}
+
+async function _loadToolsWithGen(gen: number) {
   if (!server.value) return
 
   toolsLoading.value = true
@@ -1040,27 +1839,46 @@ async function loadTools() {
 
   try {
     const response = await api.getServerTools(server.value.name)
+    if (gen !== loadGeneration) return
     if (response.success && response.data) {
       serverTools.value = response.data.tools || []
     } else {
       toolsError.value = response.error || 'Failed to load tools'
     }
   } catch (err) {
+    if (gen !== loadGeneration) return
     toolsError.value = err instanceof Error ? err.message : 'Failed to load tools'
   } finally {
-    toolsLoading.value = false
+    if (gen === loadGeneration) toolsLoading.value = false
   }
 }
 
 // Tool quarantine functions (Spec 032)
-async function loadToolApprovals() {
+function loadToolApprovals() {
+  return _loadToolApprovalsWithGen(loadGeneration)
+}
+
+async function _loadToolApprovalsWithGen(gen: number) {
   if (!server.value) return
   try {
     const response = await api.getToolApprovals(server.value.name)
+    if (gen !== loadGeneration) return
     if (response.success && response.data) {
-      const approvals = response.data.tools || []
+      const approvals = (response.data.tools || []).map((tool) => {
+        const disabled = typeof tool.disabled === 'boolean'
+          ? tool.disabled
+          : (typeof tool.enabled === 'boolean' ? !tool.enabled : false)
+        return {
+          ...tool,
+          disabled,
+          enabled: !disabled,
+        }
+      })
 
-      // Fetch diffs for changed tools to populate previous_description
+      // Fetch diffs for changed tools to populate the before/after fields used
+      // by computeToolDiffSections: description, input schema, AND output schema
+      // (MCP-2096 — output schema added in PR #638). Rendering only one field
+      // made schema-only changes look like phantom "changed" false positives.
       const changedTools = approvals.filter(t => t.status === 'changed')
       if (changedTools.length > 0) {
         const diffPromises = changedTools.map(async (tool) => {
@@ -1069,12 +1887,17 @@ async function loadToolApprovals() {
             if (diffResp.success && diffResp.data) {
               tool.previous_description = diffResp.data.previous_description
               tool.current_description = diffResp.data.current_description
+              tool.previous_schema = diffResp.data.previous_schema
+              tool.current_schema = diffResp.data.current_schema
+              tool.previous_output_schema = diffResp.data.previous_output_schema
+              tool.current_output_schema = diffResp.data.current_output_schema
             }
           } catch {
             // Diff fetch failed, continue without it
           }
         })
         await Promise.all(diffPromises)
+        if (gen !== loadGeneration) return
       }
 
       toolApprovals.value = approvals
@@ -1098,7 +1921,7 @@ async function approveTool(toolName: string) {
       await loadToolApprovals()
       // Refresh server data to update quarantine counts
       await serversStore.fetchServers()
-      server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+      // server is a computed from the store — no manual reassignment needed.
     } else {
       systemStore.addToast({
         type: 'error',
@@ -1131,7 +1954,7 @@ async function approveAllTools() {
       await loadToolApprovals()
       // Refresh server data to update quarantine counts
       await serversStore.fetchServers()
-      server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+      // server is a computed from the store — no manual reassignment needed.
     } else {
       systemStore.addToast({
         type: 'error',
@@ -1150,7 +1973,271 @@ async function approveAllTools() {
   }
 }
 
-async function loadLogs() {
+// MCP-2199: reject a quarantined tool — it leaves the quarantine list and is
+// disabled in the tools list. Reversible (re-enable via the tools toggle), so
+// no destructive-confirm modal. Mirrors approveTool, reusing approvalLoading.
+async function blockTool(toolName: string) {
+  if (!server.value) return
+  approvalLoading.value = true
+  try {
+    const response = await api.blockTools(server.value.name, [toolName])
+    if (response.success) {
+      systemStore.addToast({
+        type: 'success',
+        title: 'Tool Blocked',
+        message: `${toolName} has been blocked`,
+      })
+      await loadToolApprovals()
+      // Refresh serverTools so the Available Tools row/toggle shows the now-
+      // disabled state immediately (MCP-2217) — mirrors the enable/disable path.
+      await loadTools()
+      // Refresh server data to update quarantine counts
+      await serversStore.fetchServers()
+    } else {
+      systemStore.addToast({
+        type: 'error',
+        title: 'Block Failed',
+        message: response.error || 'Failed to block tool',
+      })
+    }
+  } catch (err) {
+    systemStore.addToast({
+      type: 'error',
+      title: 'Block Failed',
+      message: err instanceof Error ? err.message : 'Failed to block tool',
+    })
+  } finally {
+    approvalLoading.value = false
+  }
+}
+
+async function blockAllTools() {
+  if (!server.value) return
+  approvalLoading.value = true
+  try {
+    const response = await api.blockTools(server.value.name)
+    if (response.success) {
+      systemStore.addToast({
+        type: 'success',
+        title: 'Tools Blocked',
+        message: `All quarantined tools for ${server.value.name} have been blocked`,
+      })
+      await loadToolApprovals()
+      // Refresh serverTools so the Available Tools rows/toggles show the now-
+      // disabled state immediately (MCP-2217) — mirrors the enable/disable path.
+      await loadTools()
+      // Refresh server data to update quarantine counts
+      await serversStore.fetchServers()
+    } else {
+      systemStore.addToast({
+        type: 'error',
+        title: 'Block Failed',
+        message: response.error || 'Failed to block tools',
+      })
+    }
+  } catch (err) {
+    systemStore.addToast({
+      type: 'error',
+      title: 'Block Failed',
+      message: err instanceof Error ? err.message : 'Failed to block tools',
+    })
+  } finally {
+    approvalLoading.value = false
+  }
+}
+
+async function toggleToolEnabled(toolName: string, enabled: boolean) {
+  if (!server.value) return
+  toolToggleLoading.value = { ...toolToggleLoading.value, [toolName]: true }
+
+  // optimistic local UI update
+  const idx = toolApprovals.value.findIndex(t => t.tool_name === toolName)
+  const prev = idx >= 0 ? { ...toolApprovals.value[idx] } : null
+  if (idx >= 0) {
+    toolApprovals.value[idx] = {
+      ...toolApprovals.value[idx],
+      enabled,
+      disabled: !enabled,
+    }
+  }
+  // Optimistically bump the local quarantine.blocked_count so the
+  // "N disabled" stat-desc pill responds the instant the user flips the
+  // toggle, even before the round-trip + SSE + merge sequence completes.
+  // The subsequent syncAfterToolToggle() snaps it to server truth.
+  const prevQuarantine: Server['quarantine'] | undefined = server.value.quarantine
+    ? { ...server.value.quarantine }
+    : undefined
+  bumpStoreBlockedCount(enabled ? -1 : 1)
+
+  try {
+    const response = await api.setToolEnabled(server.value.name, toolName, enabled)
+    if (response.success) {
+      systemStore.addToast({
+        type: 'success',
+        title: enabled ? 'Tool Enabled' : 'Tool Disabled',
+        message: `${toolName} has been ${enabled ? 'enabled' : 'disabled'}`
+      })
+      // Re-fetch so blockedToolCount + serverTools.disabled reflect the new
+      // state. The runtime emits servers.changed via SSE, but local server.value
+      // is a snapshot of the store and doesn't auto-update — without this an
+      // Enable toggle leaves the stat-desc pill stuck on "N disabled".
+      await syncAfterToolToggle()
+    } else {
+      if (idx >= 0 && prev) toolApprovals.value[idx] = prev
+      restoreStoreQuarantine(prevQuarantine)
+      systemStore.addToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: response.error || 'Failed to update tool state',
+      })
+    }
+  } catch (err) {
+    if (idx >= 0 && prev) toolApprovals.value[idx] = prev
+    restoreStoreQuarantine(prevQuarantine)
+    systemStore.addToast({
+      type: 'error',
+      title: 'Update Failed',
+      message: err instanceof Error ? err.message : 'Failed to update tool state',
+    })
+  } finally {
+    const next = { ...toolToggleLoading.value }
+    delete next[toolName]
+    toolToggleLoading.value = next
+  }
+}
+
+// bumpStoreBlockedCount adjusts the store server's quarantine.blocked_count
+// so the "N disabled" stat-desc pill reflects the user's toggle action
+// immediately. Mutates the store directly (Pinia is reactive to direct
+// mutation) so every consumer — Server Detail, Server List, tray — sees
+// the update without a round-trip. The subsequent syncAfterToolToggle()
+// snaps everything back to authoritative server state.
+function bumpStoreBlockedCount(delta: number) {
+  mutateStoreServer(s => {
+    const current = s.quarantine
+    const nextBlocked = Math.max(0, (current?.blocked_count ?? 0) + delta)
+    const pending = current?.pending_count ?? 0
+    const changed = current?.changed_count ?? 0
+    if (nextBlocked === 0 && pending === 0 && changed === 0) {
+      // Match the backend's "omit when all-zero" rule so mergeServers
+      // doesn't leave a stale empty Quarantine block around.
+      delete (s as Server & { quarantine?: unknown }).quarantine
+    } else {
+      s.quarantine = {
+        pending_count: pending,
+        changed_count: changed,
+        blocked_count: nextBlocked,
+      }
+    }
+  })
+}
+
+function restoreStoreQuarantine(prev: Server['quarantine']) {
+  mutateStoreServer(s => {
+    if (prev) {
+      s.quarantine = prev
+    } else {
+      delete (s as Server & { quarantine?: unknown }).quarantine
+    }
+  })
+}
+
+// syncAfterToolToggle keeps the page state consistent after any tool enable/
+// disable: it refreshes the store-backed servers list (so blockedToolCount on
+// the Server List view loses staleness on navigation) and the per-tool /
+// approval caches (so toggle widgets pick up server-truth instead of
+// optimistic state). The `server` computed automatically reflects the store
+// update — no manual ref reassignment.
+async function syncAfterToolToggle() {
+  if (!server.value) return
+  await Promise.all([
+    serversStore.fetchServers(true),
+    loadTools(),
+    loadToolApprovals(),
+  ])
+}
+
+// bulkToggleAllTools dispatches one Enable-all / Disable-all request and
+// refreshes the local tool/approval state so the UI reflects the new
+// disabled-flags immediately (instead of waiting for the SSE event).
+async function bulkToggleAllTools(enabled: boolean) {
+  if (!server.value || bulkToolToggleLoading.value) return
+  bulkToolToggleLoading.value = true
+
+  // Optimistic store mutation — same idea as the single-tool path, but
+  // we drive blocked_count straight to 0 (Enable All) or the count of
+  // togglable tools (Disable All) so the "N disabled" pill snaps to the
+  // expected value instantly. The subsequent syncAfterToolToggle()
+  // reconciles to whatever the backend actually changed.
+  const prevQuarantine: Server['quarantine'] | undefined = server.value.quarantine
+    ? { ...server.value.quarantine }
+    : undefined
+  const togglable = serverTools.value.filter(t => isToolToggleAvailable(t.name)).length
+  mutateStoreServer(s => {
+    const current = s.quarantine
+    const pending = current?.pending_count ?? 0
+    const changed = current?.changed_count ?? 0
+    const nextBlocked = enabled ? 0 : togglable
+    if (nextBlocked === 0 && pending === 0 && changed === 0) {
+      delete (s as Server & { quarantine?: unknown }).quarantine
+    } else {
+      s.quarantine = {
+        pending_count: pending,
+        changed_count: changed,
+        blocked_count: nextBlocked,
+      }
+    }
+  })
+
+  try {
+    const response = await api.setAllToolsEnabled(server.value.name, enabled)
+    if (response.success && response.data) {
+      const changed = response.data.changed ?? 0
+      // "Enable All" intentionally skips tools the server config denies
+      // (enabled_tools/disabled_tools) — surface that so the user isn't
+      // left wondering why some toggles stayed locked.
+      const lockedByConfig = enabled
+        ? serverTools.value.filter(t => t.config_denied === true).length
+        : 0
+      const baseMsg = changed === 0
+        ? 'No tools needed changes.'
+        : `${changed} tool${changed === 1 ? '' : 's'} ${enabled ? 'enabled' : 'disabled'}.`
+      const lockedMsg = lockedByConfig > 0
+        ? ` ${lockedByConfig} tool${lockedByConfig === 1 ? '' : 's'} remain locked by config.`
+        : ''
+      systemStore.addToast({
+        type: 'success',
+        title: enabled ? 'Tools Enabled' : 'Tools Disabled',
+        message: baseMsg + lockedMsg,
+      })
+      // Refresh server data + tool caches so the per-tool toggle, the
+      // "N disabled" pill, and the Server List both lose any staleness.
+      await syncAfterToolToggle()
+    } else {
+      restoreStoreQuarantine(prevQuarantine)
+      systemStore.addToast({
+        type: 'error',
+        title: 'Bulk Update Failed',
+        message: response.error || 'Failed to update tools',
+      })
+    }
+  } catch (err) {
+    restoreStoreQuarantine(prevQuarantine)
+    systemStore.addToast({
+      type: 'error',
+      title: 'Bulk Update Failed',
+      message: err instanceof Error ? err.message : 'Failed to update tools',
+    })
+  } finally {
+    bulkToolToggleLoading.value = false
+  }
+}
+
+function loadLogs() {
+  return _loadLogsWithGen(loadGeneration)
+}
+
+async function _loadLogsWithGen(gen: number) {
   if (!server.value) return
 
   logsLoading.value = true
@@ -1158,15 +2245,17 @@ async function loadLogs() {
 
   try {
     const response = await api.getServerLogs(server.value.name, logTail.value)
+    if (gen !== loadGeneration) return
     if (response.success && response.data) {
       serverLogs.value = response.data.logs || []
     } else {
       logsError.value = response.error || 'Failed to load logs'
     }
   } catch (err) {
+    if (gen !== loadGeneration) return
     logsError.value = err instanceof Error ? err.message : 'Failed to load logs'
   } finally {
-    logsLoading.value = false
+    if (gen === loadGeneration) logsLoading.value = false
   }
 }
 
@@ -1192,7 +2281,7 @@ async function toggleEnabled() {
     }
     // Update local server reference
     await serversStore.fetchServers()
-    server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+    // server is a computed from the store — no manual reassignment needed.
   } catch (error) {
     systemStore.addToast({
       type: 'error',
@@ -1218,7 +2307,7 @@ async function restartServer() {
     // Refresh server data after restart
     setTimeout(async () => {
       await serversStore.fetchServers()
-      server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+      // server is a computed from the store — no manual reassignment needed.
     }, 2000)
   } catch (error) {
     systemStore.addToast({
@@ -1266,7 +2355,7 @@ async function quarantineServer() {
     })
     // Update local server reference
     await serversStore.fetchServers()
-    server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+    // server is a computed from the store — no manual reassignment needed.
   } catch (error) {
     systemStore.addToast({
       type: 'error',
@@ -1291,7 +2380,7 @@ async function unquarantineServer() {
     })
     // Update local server reference
     await serversStore.fetchServers()
-    server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+    // server is a computed from the store — no manual reassignment needed.
   } catch (error) {
     systemStore.addToast({
       type: 'error',
@@ -1310,14 +2399,40 @@ async function unquarantineServer() {
 const showApproveConfirmation = ref(false)
 const approveDialogMode = ref<'no_scan' | 'critical'>('no_scan')
 
-const criticalFindingCount = computed(() => {
-  // Prefer the loaded scan report summary if available; otherwise fall back
-  // to finding_counts on the server's security_scan summary (if populated).
+// Spec 077 FR-021: the approval gate blocks on baseline DANGEROUS findings only
+// (hard-tier). Deep-scan findings inform but never gate. The server-side verdict
+// is tier-driven, so the modal mirrors it via the TIER-DRIVEN finding_counts —
+// NOT the raw threat-level report summary, where a tierless deep-scan/external
+// finding can read "dangerous" and would show the "Dangerous Findings Detected"
+// dialog even though the backend gate (hard-tier only) would not block.
+const dangerousFindingCount = computed(() => {
+  // Prefer the tier-driven counts on the loaded report, then the server's
+  // security_scan summary; the raw report summary is only a last-resort
+  // fallback for cores that predate report-level finding_counts.
   const rep = scanReport.value as any
-  if (rep?.summary?.critical != null) return rep.summary.critical as number
+  if (rep?.finding_counts?.dangerous != null) return rep.finding_counts.dangerous as number
   const scan = server.value?.security_scan as any
-  if (scan?.finding_counts?.critical != null) return scan.finding_counts.critical as number
+  if (scan?.finding_counts?.dangerous != null) return scan.finding_counts.dangerous as number
+  if (rep?.summary?.dangerous != null) return rep.summary.dangerous as number
   return 0
+})
+
+// Tier-driven counts for the Security-tab summary strip (Spec 077 FR-014):
+// buckets findings exactly like the server list's finding_counts — a tierless
+// deep-scan/external "dangerous" finding shows as a warning on both surfaces.
+// Raw threat-level summary is only a fallback for pre-Spec-077 payloads.
+const scanThreatCounts = computed(() => {
+  const rep = scanReport.value as any
+  const fc = rep?.finding_counts
+  if (fc) {
+    return { dangerous: fc.dangerous ?? 0, warnings: fc.warning ?? 0, info: fc.info ?? 0, total: fc.total ?? 0 }
+  }
+  return {
+    dangerous: rep?.summary?.dangerous ?? 0,
+    warnings: rep?.summary?.warnings ?? 0,
+    info: rep?.summary?.info_level ?? 0,
+    total: rep?.summary?.total ?? 0,
+  }
 })
 
 const hasCompletedScanForApprove = computed(() => {
@@ -1332,7 +2447,7 @@ function handleApproveClick() {
     showApproveConfirmation.value = true
     return
   }
-  if (criticalFindingCount.value > 0) {
+  if (dangerousFindingCount.value > 0) {
     approveDialogMode.value = 'critical'
     showApproveConfirmation.value = true
     return
@@ -1352,7 +2467,7 @@ async function doSecurityApprove(force: boolean) {
     })
     showApproveConfirmation.value = false
     await serversStore.fetchServers()
-    server.value = serversStore.servers.find(s => s.name === props.serverName) || null
+    // server is a computed from the store — no manual reassignment needed.
   } catch (error) {
     systemStore.addToast({
       type: 'error',
@@ -1486,6 +2601,256 @@ function formatRelativeTime(isoString: string): string {
   return `${diffDay}d ago`
 }
 
+// --- Config tab helpers ---
+// Mask env var values in the Config tab so a casual viewer can see WHICH
+// variables are set without exposing the secret values. Matches the
+// "ALL_CAPS_KEY shown, value hidden" pattern from the macOS tray.
+function maskEnvValue(value: string): string {
+  if (!value) return '(empty)'
+  if (value.length <= 4) return '••••'
+  return '••••' + value.slice(-2) + ` (${value.length} chars)`
+}
+
+// --- Headers / Env display + edit state ---
+// Convention: composite key strings prefixed with the scope ("hdr::Name" or
+// "env::Name") so a single Set can drive reveal/edit state across both
+// cards without collision.
+
+const serverHeaders = computed<Record<string, string>>(() => (server.value?.headers ?? {}) as Record<string, string>)
+const serverEnv = computed<Record<string, string>>(() => (server.value?.env ?? {}) as Record<string, string>)
+const headerKeys = computed(() => Object.keys(serverHeaders.value).sort())
+const envKeys = computed(() => Object.keys(serverEnv.value).sort())
+const hasHeaders = computed(() => headerKeys.value.length > 0)
+const hasEnv = computed(() => envKeys.value.length > 0)
+
+const editingKey = ref<string | null>(null)
+const kvPatchInFlight = ref(false)
+
+const addingHeader = ref(false)
+const newHeaderKey = ref('')
+const newHeaderValue = ref('')
+const newHeaderKeyInput = ref<HTMLInputElement | null>(null)
+
+const addingEnv = ref(false)
+const newEnvKey = ref('')
+const newEnvValue = ref('')
+const newEnvKeyInput = ref<HTMLInputElement | null>(null)
+
+const convertModal = ref<{ open: boolean; scope: 'header' | 'env'; key: string; rawValue: string; secretName: string; busy: boolean }>({
+  open: false,
+  scope: 'header',
+  key: '',
+  rawValue: '',
+  secretName: '',
+  busy: false,
+})
+
+function startEdit(scope: 'hdr' | 'env', k: string) {
+  editingKey.value = `${scope}::${k}`
+}
+function cancelEdit() {
+  editingKey.value = null
+}
+
+async function startAddingHeader() {
+  addingHeader.value = true
+  newHeaderKey.value = ''
+  newHeaderValue.value = ''
+  await new Promise((r) => setTimeout(r, 0))
+  newHeaderKeyInput.value?.focus()
+}
+async function startAddingEnv() {
+  addingEnv.value = true
+  newEnvKey.value = ''
+  newEnvValue.value = ''
+  await new Promise((r) => setTimeout(r, 0))
+  newEnvKeyInput.value?.focus()
+}
+
+// patchServer with deep-merge semantics: the backend treats keys present
+// in `headers` / `env` as upserts, keys absent as preserved, and keys
+// listed in `headers_remove` / `env_remove` as deletes. This lets us send
+// the minimal diff for each user action — and crucially never round-trips
+// `***REDACTED***` values: any header whose redacted form was unchanged
+// simply stays out of the patch, so the backend keeps the real string.
+async function patchServerDiff(patch: Record<string, unknown>, action: string): Promise<boolean> {
+  if (!server.value) return false
+  kvPatchInFlight.value = true
+  try {
+    const resp = await api.patchServer(server.value.name, patch)
+    if (!resp.success) {
+      systemStore.addToast({ type: 'error', title: `${action} failed`, message: resp.error || 'Unknown error' })
+      return false
+    }
+    await serversStore.fetchServers(true)
+    systemStore.addToast({ type: 'success', title: action, message: '' })
+    return true
+  } catch (e: any) {
+    systemStore.addToast({ type: 'error', title: `${action} failed`, message: e?.message || String(e) })
+    return false
+  } finally {
+    kvPatchInFlight.value = false
+  }
+}
+
+function scopeKey(scope: 'header' | 'env'): 'headers' | 'env' {
+  return scope === 'header' ? 'headers' : 'env'
+}
+
+// MCP-2932: per-server "Auto-approve tool changes" toggle. Absent/undefined on
+// the status payload is treated as OFF (protected) — see the Server type note.
+const autoApproveToolChanges = computed(() => server.value?.auto_approve_tool_changes ?? false)
+
+async function toggleAutoApproveToolChanges(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  // Persist through the existing PATCH /api/v1/servers/{id} path. The backend
+  // auto-approves changed/added tools on the next discovery pass for this
+  // server (MCP-2931); patchServerDiff surfaces the success toast.
+  const ok = await patchServerDiff(
+    { auto_approve_tool_changes: checked },
+    checked ? 'Auto-approve tool changes enabled' : 'Auto-approve tool changes disabled'
+  )
+  // On failure, snap the checkbox back to the persisted value: patchServerDiff
+  // refetches servers on success, so the bound computed already reflects truth;
+  // an explicit no-op here keeps the control consistent with `server`.
+  if (!ok && event.target) {
+    ;(event.target as HTMLInputElement).checked = autoApproveToolChanges.value
+  }
+}
+
+async function saveEdit(scope: 'header' | 'env', k: string, val: string) {
+  const ok = await patchServerDiff({ [scopeKey(scope)]: { [k]: val } }, `Updated ${k}`)
+  if (ok) editingKey.value = null
+}
+
+// Deletion uses JSON Merge Patch (RFC 7396): a null value on the key
+// signals "delete this key" to the backend. JSON.stringify emits `null`
+// as the literal token, so the patch body becomes `{"headers": {"X-Old":
+// null}}` on the wire — symmetric with the MCP `upstream_servers patch`
+// tool's `{"X-Old": null}` convention. Note the explicit `null` literal:
+// passing `undefined` would be stripped by JSON.stringify (no key in the
+// output) and the backend would interpret that as "preserve".
+async function deleteKv(scope: 'header' | 'env', k: string) {
+  if (!confirm(`Delete ${scope === 'header' ? 'header' : 'env variable'} "${k}"?`)) return
+  await patchServerDiff({ [scopeKey(scope)]: { [k]: null } }, `Deleted ${k}`)
+}
+
+async function commitNewHeader() {
+  if (!newHeaderKey.value || !newHeaderValue.value) return
+  const ok = await patchServerDiff(
+    { headers: { [newHeaderKey.value]: newHeaderValue.value } },
+    `Added ${newHeaderKey.value}`
+  )
+  if (ok) addingHeader.value = false
+}
+
+async function commitNewEnv() {
+  if (!newEnvKey.value || !newEnvValue.value) return
+  const ok = await patchServerDiff(
+    { env: { [newEnvKey.value]: newEnvValue.value } },
+    `Added ${newEnvKey.value}`
+  )
+  if (ok) addingEnv.value = false
+}
+
+// Suggest a keyring secret name derived from the kv key. Keep it short,
+// lowercase, alphanumeric + hyphens — the same convention as the existing
+// Secrets view.
+function suggestSecretName(scope: 'header' | 'env', k: string): string {
+  const base = `${server.value?.name || 'server'}-${k}`
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64)
+}
+
+function openConvertModal(scope: 'header' | 'env', k: string, rawValue: string) {
+  convertModal.value = {
+    open: true,
+    scope,
+    key: k,
+    rawValue,
+    secretName: suggestSecretName(scope, k),
+    busy: false,
+  }
+}
+function closeConvertModal() {
+  convertModal.value.open = false
+  convertModal.value.busy = false
+}
+
+async function commitConvert() {
+  const m = convertModal.value
+  if (!m.secretName || !server.value) return
+  m.busy = true
+  try {
+    // Atomic server-side conversion: the backend reads the real value
+    // from the loaded config (so we don't need the plaintext on the
+    // client — important when the API redacts sensitive headers on the
+    // read path), stores it in keyring, and rewrites the config field
+    // with the ${keyring:NAME} reference. Single round-trip, single
+    // failure surface.
+    const resp = await api.convertConfigToSecret(server.value.name, m.scope, m.key, m.secretName)
+    if (!resp.success) {
+      systemStore.addToast({ type: 'error', title: 'Convert failed', message: resp.error || 'Unknown error' })
+      return
+    }
+    await serversStore.fetchServers(true)
+    systemStore.addToast({ type: 'success', title: `Converted ${m.key} to secret`, message: '' })
+    closeConvertModal()
+  } catch (e: any) {
+    systemStore.addToast({ type: 'error', title: 'Convert failed', message: e?.message || String(e) })
+  } finally {
+    convertModal.value.busy = false
+  }
+}
+
+// hasIsolationData is true when there's anything to show in the Docker
+// Isolation Overrides section — either a per-server override or a resolved
+// default the user might want to inspect. Stdio servers without docker
+// isolation enabled have neither and the section is hidden entirely.
+const hasIsolationData = computed(() => {
+  if (!server.value) return false
+  const iso = server.value.isolation
+  const def = server.value.isolation_defaults
+  if (iso && (iso.image || iso.network_mode || (iso.extra_args && iso.extra_args.length) || iso.working_dir || iso.memory_limit || iso.cpu_limit)) {
+    return true
+  }
+  if (def && (def.image || def.network_mode || (def.extra_args && def.extra_args.length) || def.working_dir || def.runtime_type)) {
+    return true
+  }
+  return false
+})
+
+// Locale-aware absolute timestamp for "Connected At" / similar fields.
+// We use the absolute form (not relative-time) because it matches what
+// users see in the macOS tray and in `mcpproxy upstream list` — a single
+// authoritative source-of-truth representation.
+function formatConfigTime(isoString: string | null | undefined): string {
+  if (!isoString) return ''
+  const date = new Date(isoString)
+  if (isNaN(date.getTime())) return isoString
+  return date.toLocaleString()
+}
+
+// healthLevelBadgeClass returns the daisyUI class set for a Health.Level
+// badge, mirroring the existing color choices used elsewhere in the app
+// (see e.g. server-list dot color logic).
+function healthLevelBadgeClass(level: string): string {
+  switch (level) {
+    case 'healthy':
+      return 'badge badge-success badge-sm'
+    case 'degraded':
+      return 'badge badge-warning badge-sm'
+    case 'unhealthy':
+      return 'badge badge-error badge-sm'
+    default:
+      return 'badge badge-ghost badge-sm'
+  }
+}
+
 function stopScanPolling() {
   if (scanPollTimer) {
     clearInterval(scanPollTimer)
@@ -1510,7 +2875,7 @@ async function loadScannerNames() {
   }
 }
 
-async function loadScanReport(force = false) {
+async function loadScanReport(force = false, skipPolling = false) {
   if (!server.value) return
   // Only load if we have a previous scan (skip check when force-loading after scan completion)
   if (!force && !server.value.security_scan?.last_scan_at && !scanReport.value) return
@@ -1534,17 +2899,63 @@ async function loadScanReport(force = false) {
     }
     if (statusRes.success && statusRes.data) {
       scanStatus.value = statusRes.data
-      // If scan is still running (e.g., page reload during scan), resume polling
-      if (statusRes.data.status === 'running' || statusRes.data.status === 'pending') {
+      const decision = decideScanReconcile(
+        { status: statusRes.data.status, jobId: statusRes.data.id, scanPass: statusRes.data.scan_pass },
+        { scanLoading: scanLoading.value, activeScanJobId: activeScanJobId.value },
+      )
+      if (decision.resumePolling && !skipPolling) {
+        // Scan still running (e.g., page reload during scan) — resume polling.
+        // skipPolling=true when called post-finalize: a concurrent Pass-2 job must
+        // not re-enable scanLoading and hide the just-completed Pass-1 report.
         activeScanJobId.value = statusRes.data.id
         scanLoading.value = true
         startScanPolling()
+      } else if (decision.finalize && scanLoading.value) {
+        // MCP-2740: authoritative status is terminal but the spinner is still up
+        // (stale flag from a sub-2s scan or one that finished while unmounted).
+        // Clear it here — no recursive report reload, we already have the freshest
+        // report above.
+        clearScanRunState()
+        if (decision.isError) scanError.value = statusRes.data.error || 'Scan failed'
       }
     }
   } catch (err) {
     // Silently fail - report may not exist yet
   } finally {
     scanReportLoading.value = false
+  }
+}
+
+// Clear the live-scan run state (spinner, polling timer, tracked job id). Pure
+// state reset — does NOT reload the report (callers that need it call separately),
+// which keeps it safe to invoke from inside loadScanReport without recursion.
+function clearScanRunState() {
+  stopScanPolling()
+  scanLoading.value = false
+  activeScanJobId.value = null
+}
+
+// Finalize the scan UI from an authoritative terminal (or newer Pass-2) status.
+// Idempotent: safe to call repeatedly. Only emits the success toast when a scan
+// was actually in flight, so reconciling on a fresh tab-open stays silent.
+async function finalizeScan(data: any, decision: { isError: boolean; isCancelled: boolean }) {
+  const wasLoading = scanLoading.value
+  clearScanRunState()
+  if (decision.isError) {
+    scanError.value = data?.error || 'Scan failed'
+    return
+  }
+  await loadScanReport(true, true)
+  await serversStore.fetchServers()
+  // server is a computed from the store — no manual reassignment needed.
+  // MCP-2755: a cancelled scan is terminal but NOT a success — suppress the "Scan
+  // Complete" toast and show a neutral "Scan cancelled" notice instead. Report/score
+  // rendering is left exactly as before (pre-existing behavior, out of scope).
+  const toast = finalizeToastKind(decision, wasLoading)
+  if (toast === 'success') {
+    systemStore.addToast({ type: 'success', title: 'Scan Complete', message: `Security scan for ${server.value?.name} finished.` })
+  } else if (toast === 'cancelled') {
+    systemStore.addToast({ type: 'info', title: 'Scan cancelled', message: `Security scan for ${server.value?.name} was cancelled.` })
   }
 }
 
@@ -1557,38 +2968,16 @@ function startScanPolling() {
       if (statusResp.success && statusResp.data) {
         // Update scan status for live progress display
         scanStatus.value = statusResp.data
-        const jobId = statusResp.data.id
-        const status = statusResp.data.status
-
-        // Only react to the active job (Pass 1). Ignore completed Pass 2 from previous runs.
-        if (activeScanJobId.value && jobId !== activeScanJobId.value) {
-          // Different job — could be Pass 2 starting after Pass 1 completed.
-          if (statusResp.data.scan_pass === 2) {
-            // Pass 2 started or completed — Pass 1 is done. Finish polling.
-            stopScanPolling()
-            scanLoading.value = false
-            activeScanJobId.value = null
-            await loadScanReport(true)
-            await serversStore.fetchServers()
-            server.value = serversStore.servers.find(s => s.name === props.serverName) || null
-            systemStore.addToast({ type: 'success', title: 'Scan Complete', message: `Security scan for ${server.value?.name} finished.` })
-          }
-          return
-        }
-
-        if (status === 'completed' || status === 'complete') {
-          stopScanPolling()
-          scanLoading.value = false
-          activeScanJobId.value = null
-          await loadScanReport(true)
-          await serversStore.fetchServers()
-          server.value = serversStore.servers.find(s => s.name === props.serverName) || null
-          systemStore.addToast({ type: 'success', title: 'Scan Complete', message: `Security scan for ${server.value?.name} finished.` })
-        } else if (status === 'failed' || status === 'error') {
-          stopScanPolling()
-          scanLoading.value = false
-          activeScanJobId.value = null
-          scanError.value = statusResp.data.error || 'Scan failed'
+        const decision = decideScanReconcile(
+          { status: statusResp.data.status, jobId: statusResp.data.id, scanPass: statusResp.data.scan_pass },
+          { scanLoading: scanLoading.value, activeScanJobId: activeScanJobId.value },
+        )
+        // MCP-2740: finalize the instant the backend reports a terminal status (or a
+        // newer Pass-2 job), regardless of activeScanJobId / scan_pass — a sub-2s scan
+        // can finalize before the polled id ever matches, which previously left the
+        // "Scanning…" spinner stuck and the Report button disabled forever.
+        if (decision.finalize) {
+          await finalizeScan(statusResp.data, decision)
         }
       }
     } catch {
@@ -1653,6 +3042,17 @@ async function cancelSecurityScan() {
     scanError.value = err.response?.data?.error || 'Failed to cancel scan'
   }
 }
+
+// Safety net (MCP-2740): the spinner must never outlive a terminal backend status.
+// If any path sets scanStatus to a terminal status while scanLoading is still true,
+// reconcile here so the UI can't get stuck on "Scanning…" regardless of poll-timer
+// lifecycle or job-id bookkeeping.
+watch(() => scanStatus.value?.status, (status) => {
+  if (scanLoading.value && isTerminalScanStatus(status)) {
+    clearScanRunState()
+    if (!scanReport.value) loadScanReport(true, true)
+  }
+})
 
 
 // Server detail hints

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -485,6 +486,77 @@ func setupTestStorage(t *testing.T) (*storage.Manager, func()) {
 	}
 }
 
+// TestActivityRecordsCarryClientName verifies that the MCP client is stamped onto
+// the activity record at WRITE time.
+//
+// This must not be a read-time lookup: activity is retained for 90 days but only
+// the 100 most recent sessions are, and an IDE reconnecting every few minutes
+// burns through 100 sessions in about a day. A name resolved by joining against
+// the session store therefore decays back to a bare session id — which is exactly
+// the bug this fixes. Persisting it on the record makes it permanent.
+func TestActivityRecordsCarryClientName(t *testing.T) {
+	store, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	svc := NewActivityService(store, zap.NewNop())
+	svc.SetSessionClientResolver(func(sessionID string) (string, string) {
+		if sessionID == "mcp-session-abc" {
+			return "claude-code", "1.0.60"
+		}
+		return "", ""
+	})
+
+	// A retrieve_tools call — an internal tool call, which is the bulk of
+	// session-bearing activity.
+	svc.handleEvent(Event{
+		Type:      EventTypeActivityInternalToolCall,
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"internal_tool_name": "retrieve_tools",
+			"session_id":         "mcp-session-abc",
+			"request_id":         "req-1",
+			"status":             "success",
+			"duration_ms":        int64(20),
+		},
+	})
+
+	records, _, err := store.ListActivities(storage.DefaultActivityFilter())
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	assert.Equal(t, "claude-code", records[0].Metadata["client_name"],
+		"the client name must be persisted on the record, not looked up later")
+	assert.Equal(t, "1.0.60", records[0].Metadata["client_version"])
+}
+
+// TestActivityRecordsUnknownSessionHasNoClientName verifies we add nothing when
+// the session cannot be resolved (already closed, or no resolver wired), rather
+// than writing an empty key the UI would have to special-case.
+func TestActivityRecordsUnknownSessionHasNoClientName(t *testing.T) {
+	store, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	svc := NewActivityService(store, zap.NewNop())
+	svc.SetSessionClientResolver(func(string) (string, string) { return "", "" })
+
+	svc.handleEvent(Event{
+		Type:      EventTypeActivityInternalToolCall,
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"internal_tool_name": "retrieve_tools",
+			"session_id":         "mcp-session-gone",
+			"status":             "success",
+		},
+	})
+
+	records, _, err := store.ListActivities(storage.DefaultActivityFilter())
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	_, hasName := records[0].Metadata["client_name"]
+	assert.False(t, hasName, "an unresolvable session must not add an empty client_name")
+}
+
 // TestHandleToolCallCompleted_UserIdentityExtraction verifies that handleToolCallCompleted
 // extracts UserID and UserEmail from _auth_ prefixed arguments and sets them on the record.
 func TestHandleToolCallCompleted_UserIdentityExtraction(t *testing.T) {
@@ -563,6 +635,87 @@ func TestHandleToolCallCompleted_NoUserIdentity(t *testing.T) {
 	record := records[0]
 	assert.Empty(t, record.UserID, "UserID should be empty when no _auth_user_id is present")
 	assert.Empty(t, record.UserEmail, "UserEmail should be empty when no _auth_user_email is present")
+}
+
+// TestHandleToolCallCompleted_ProfileMetadata verifies Spec 057 FR-011: the
+// profile slug from a /mcp/p/<slug> tool call lands at the TOP-LEVEL
+// metadata["profile"], NOT smuggled under metadata.intent.profile. Covers both
+// success and error paths (Codex PR #622 finding #2).
+func TestHandleToolCallCompleted_ProfileMetadata(t *testing.T) {
+	for _, status := range []string{"success", "error"} {
+		t.Run(status, func(t *testing.T) {
+			store, cleanup := setupTestStorage(t)
+			defer cleanup()
+
+			svc := NewActivityService(store, zap.NewNop())
+
+			evt := Event{
+				Type:      EventTypeActivityToolCallCompleted,
+				Timestamp: time.Now().UTC(),
+				Payload: map[string]any{
+					"server_name":  "research-srv",
+					"tool_name":    "search_papers",
+					"status":       status,
+					"duration_ms":  int64(10),
+					"tool_variant": "read",
+					"profile":      "research",
+					// An intent map is also present; profile must NOT live inside it.
+					"intent": map[string]interface{}{
+						"operation_type": "read",
+					},
+				},
+			}
+
+			svc.handleEvent(evt)
+
+			records, _, err := store.ListActivities(storage.DefaultActivityFilter())
+			require.NoError(t, err)
+			require.Len(t, records, 1)
+
+			md := records[0].Metadata
+			require.NotNil(t, md)
+			assert.Equal(t, "research", md["profile"],
+				"FR-011: profile slug must be at top-level metadata[\"profile\"]")
+
+			// Must NOT be nested inside the intent submap.
+			if intent, ok := md["intent"].(map[string]interface{}); ok {
+				_, nested := intent["profile"]
+				assert.False(t, nested, "profile must not be nested under metadata.intent.profile")
+			}
+		})
+	}
+}
+
+// TestHandleToolCallCompleted_NoProfileMetadata verifies that a tool call from
+// /mcp (no profile) omits metadata["profile"] entirely (FR-011 backward compat).
+func TestHandleToolCallCompleted_NoProfileMetadata(t *testing.T) {
+	store, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	svc := NewActivityService(store, zap.NewNop())
+
+	evt := Event{
+		Type:      EventTypeActivityToolCallCompleted,
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"server_name":  "github",
+			"tool_name":    "list_repos",
+			"status":       "success",
+			"duration_ms":  int64(10),
+			"tool_variant": "read",
+		},
+	}
+
+	svc.handleEvent(evt)
+
+	records, _, err := store.ListActivities(storage.DefaultActivityFilter())
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	if md := records[0].Metadata; md != nil {
+		_, ok := md["profile"]
+		assert.False(t, ok, "records from /mcp must omit metadata[\"profile\"]")
+	}
 }
 
 // TestHandleToolCallCompleted_NilArguments verifies no panic when arguments is nil.
@@ -798,4 +951,82 @@ func TestHandleInternalToolCall_NoUserIdentity(t *testing.T) {
 
 	assert.Empty(t, records[0].UserID)
 	assert.Empty(t, records[0].UserEmail)
+}
+
+// TestHandleToolCallCompleted_ByteCapture verifies that RequestBytes and ResponseBytes
+// are populated from the event payload pre-truncation values. T003 Spec 069 A1.
+func TestHandleToolCallCompleted_ByteCapture(t *testing.T) {
+	store, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	logger := zap.NewNop()
+	svc := NewActivityService(store, logger)
+
+	evt := Event{
+		Type:      EventTypeActivityToolCallCompleted,
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"server_name":    "test-server",
+			"tool_name":      "test-tool",
+			"session_id":     "sess-bytes",
+			"request_id":     "req-bytes",
+			"source":         "mcp",
+			"status":         "success",
+			"duration_ms":    int64(50),
+			"response":       "truncated...",
+			"request_bytes":  1500,
+			"response_bytes": 98304,
+		},
+	}
+
+	svc.handleEvent(evt)
+
+	filter := storage.DefaultActivityFilter()
+	filter.ExcludeCallToolSuccess = false
+	records, _, err := store.ListActivities(filter)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	record := records[0]
+	assert.Equal(t, 1500, record.RequestBytes, "RequestBytes must reflect pre-truncation request size")
+	assert.Equal(t, 98304, record.ResponseBytes, "ResponseBytes must reflect pre-truncation response size")
+}
+
+// TestActivityServiceStartAfterStopIsNoOp (Spec 080 FR-010, review round 5):
+// production launches Start via `go r.activityService.Start(...)` in
+// lifecycle.go, so a fast shutdown can run Stop BEFORE the Start goroutine is
+// ever scheduled. Stop must leave a terminal stopped state that turns the
+// late Start into a no-op — no retention/usage/persist loops launched, no
+// storage access. Storage and runtime are nil on purpose: any registration
+// step (SubscribeEvents, initUsageFromStorage, the worker loops) would panic,
+// so a regression fails loudly.
+func TestActivityServiceStartAfterStopIsNoOp(t *testing.T) {
+	svc := NewActivityService(nil, zap.NewNop())
+
+	// Fast shutdown wins the race: Stop runs before Start ever does. It must
+	// return immediately (Start never ran, done never closes).
+	svc.Stop()
+
+	// The delayed Start must return immediately without registering anything.
+	// A non-no-op Start would either panic (nil rt/storage) or block forever
+	// in the event loop (ctx is never cancelled) and trip the timeout below.
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		svc.Start(context.Background(), nil)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start after Stop did not return; it must be a no-op")
+	}
+
+	svc.startMu.Lock()
+	started := svc.started
+	svc.startMu.Unlock()
+	assert.False(t, started, "Start after Stop must not mark the service started")
+
+	// Stop stays idempotent after the no-op Start.
+	svc.Stop()
+	svc.Stop()
 }

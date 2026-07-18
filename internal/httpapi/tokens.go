@@ -22,6 +22,7 @@ type TokenStore interface {
 	ListAgentTokens() ([]auth.AgentToken, error)
 	GetAgentTokenByName(name string) (*auth.AgentToken, error)
 	RevokeAgentToken(name string) error
+	DeleteAgentToken(name string) error
 	RegenerateAgentToken(name string, newRawToken string, hmacKey []byte) (*auth.AgentToken, error)
 	ValidateAgentToken(rawToken string, hmacKey []byte) (*auth.AgentToken, error)
 	UpdateAgentTokenLastUsed(name string) error
@@ -38,6 +39,7 @@ type createTokenRequest struct {
 	AllowedServers []string `json:"allowed_servers"`
 	Permissions    []string `json:"permissions"`
 	ExpiresIn      string   `json:"expires_in"`
+	ProfilePin     string   `json:"profile_pin,omitempty"`
 }
 
 // createTokenResponse is the JSON response for POST /api/v1/tokens.
@@ -48,6 +50,7 @@ type createTokenResponse struct {
 	Permissions    []string  `json:"permissions"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	CreatedAt      time.Time `json:"created_at"`
+	ProfilePin     string    `json:"profile_pin,omitempty"`
 }
 
 // tokenInfoResponse is the JSON response for GET endpoints (no secret).
@@ -60,6 +63,7 @@ type tokenInfoResponse struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
 	Revoked        bool       `json:"revoked"`
+	ProfilePin     string     `json:"profile_pin,omitempty"`
 }
 
 // regenerateTokenResponse is the JSON response for POST /api/v1/tokens/{name}/regenerate.
@@ -148,6 +152,16 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		req.AllowedServers = []string{"*"}
 	}
 
+	// Validate profile_pin (Profiles v2 T3): the slug must name a configured
+	// profile at creation time. Later config changes are warn-skipped at request
+	// time by the resolver, not hard-failed here.
+	if req.ProfilePin != "" {
+		if err := s.validateProfilePin(req.ProfilePin); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	// Generate token
 	rawToken, err := auth.GenerateToken()
 	if err != nil {
@@ -171,6 +185,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		Permissions:    req.Permissions,
 		ExpiresAt:      expiresAt,
 		CreatedAt:      now,
+		ProfilePin:     req.ProfilePin,
 	}
 
 	if err := s.tokenStore.CreateAgentToken(agentToken, rawToken, hmacKey); err != nil {
@@ -191,6 +206,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		Permissions:    req.Permissions,
 		ExpiresAt:      expiresAt,
 		CreatedAt:      now,
+		ProfilePin:     req.ProfilePin,
 	}
 
 	s.writeJSON(w, http.StatusCreated, contracts.NewSuccessResponse(resp))
@@ -277,6 +293,36 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleDeleteToken handles DELETE /api/v1/tokens/{name}/permanent
+// It permanently removes a token (unlike revoke, which is a soft delete),
+// freeing the name so it can be reused for a new token.
+func (s *Server) handleDeleteToken(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminAuth(w, r) {
+		return
+	}
+	if !s.requireTokenStore(w, r) {
+		return
+	}
+
+	name := chi.URLParam(r, "name")
+	if name == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Token name is required")
+		return
+	}
+
+	if err := s.tokenStore.DeleteAgentToken(name); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("Token %q not found", name))
+			return
+		}
+		s.logger.Errorf("Failed to delete agent token: %v", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to delete token")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleRegenerateToken handles POST /api/v1/tokens/{name}/regenerate
 func (s *Server) handleRegenerateToken(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdminAuth(w, r) {
@@ -348,6 +394,26 @@ func validateTokenName(name string) error {
 // validateTokenPermissions validates the permissions list using auth.ValidatePermissions.
 func validateTokenPermissions(perms []string) error {
 	return auth.ValidatePermissions(perms)
+}
+
+// validateProfilePin checks that the given profile slug names a profile in the
+// current configuration (Profiles v2 T3). It errors if profiles are unavailable
+// or the slug is unknown, so a token cannot be pinned to a non-existent profile.
+func (s *Server) validateProfilePin(slug string) error {
+	cfg, err := s.controller.GetConfig()
+	if err != nil || cfg == nil {
+		return fmt.Errorf("cannot validate profile_pin: configuration unavailable")
+	}
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Name == slug {
+			return nil
+		}
+	}
+	available := make([]string, 0, len(cfg.Profiles))
+	for i := range cfg.Profiles {
+		available = append(available, cfg.Profiles[i].Name)
+	}
+	return fmt.Errorf("unknown profile_pin %q (available: %s)", slug, strings.Join(available, ", "))
 }
 
 // parseExpiry parses an expiry duration string and returns the absolute expiry time.
@@ -434,5 +500,6 @@ func tokenToInfoResponse(t auth.AgentToken) tokenInfoResponse {
 		CreatedAt:      t.CreatedAt,
 		LastUsedAt:     t.LastUsedAt,
 		Revoked:        t.Revoked,
+		ProfilePin:     t.ProfilePin,
 	}
 }

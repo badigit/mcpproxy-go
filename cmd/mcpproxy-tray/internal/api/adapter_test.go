@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tray"
 )
 
 // =============================================================================
@@ -21,11 +23,13 @@ type MockClient struct {
 	enableErr            error
 	quarantineErr        error
 	oauthErr             error
-	enabledServers       map[string]bool   // tracks enable/disable calls
-	quarantinedServers   map[string]bool   // tracks quarantine calls
-	unquarantinedServers []string          // tracks unquarantine calls
-	oauthTriggered       []string          // tracks OAuth login calls
+	enabledServers       map[string]bool // tracks enable/disable calls
+	quarantinedServers   map[string]bool // tracks quarantine calls
+	unquarantinedServers []string        // tracks unquarantine calls
+	oauthTriggered       []string        // tracks OAuth login calls
 	statusCh             chan StatusUpdate
+	profiles             []tray.ProfileInfo // Profiles v2 T5
+	activeProfile        string             // Profiles v2 T5
 }
 
 func NewMockClient() *MockClient {
@@ -85,6 +89,46 @@ func (m *MockClient) TriggerOAuthLogin(serverName string) error {
 
 func (m *MockClient) StatusChannel() <-chan StatusUpdate {
 	return m.statusCh
+}
+
+func (m *MockClient) GetProfiles() ([]tray.ProfileInfo, error) {
+	return m.profiles, nil
+}
+
+func (m *MockClient) GetActiveProfile() (string, error) {
+	return m.activeProfile, nil
+}
+
+func (m *MockClient) SetActiveProfile(name string) error {
+	m.activeProfile = name
+	return nil
+}
+
+// TestServerAdapterProfileDelegation verifies the adapter forwards the profile
+// switcher calls (Profiles v2 T5) to the underlying client.
+func TestServerAdapterProfileDelegation(t *testing.T) {
+	mock := NewMockClient()
+	mock.profiles = []tray.ProfileInfo{
+		{Name: "research", ToolCount: 3},
+		{Name: "deploy", ToolCount: 2},
+	}
+	mock.activeProfile = "research"
+	adapter := NewServerAdapter(mock)
+
+	profiles, err := adapter.GetProfiles()
+	require.NoError(t, err)
+	require.Len(t, profiles, 2)
+	assert.Equal(t, "research", profiles[0].Name)
+	assert.Equal(t, 3, profiles[0].ToolCount)
+
+	active, err := adapter.GetActiveProfile()
+	require.NoError(t, err)
+	assert.Equal(t, "research", active)
+
+	require.NoError(t, adapter.SetActiveProfile("deploy"))
+	active, err = adapter.GetActiveProfile()
+	require.NoError(t, err)
+	assert.Equal(t, "deploy", active)
 }
 
 // =============================================================================
@@ -600,4 +644,31 @@ func TestHealthDataFlow_EndToEnd(t *testing.T) {
 	// Test GetStatus counts correctly using health
 	status := adapter.GetStatus().(map[string]interface{})
 	assert.Equal(t, 1, status["connected_servers"], "Status should use health.level for connected count")
+}
+
+// =============================================================================
+// ServerAdapter.GetConfigPath Tests
+// =============================================================================
+
+// The tray launches core with --config <MCPPROXY_TRAY_CONFIG_PATH> (see
+// buildCoreArgs in main.go). GetConfigPath must resolve to that SAME path so
+// tray-side config consumers (e.g. the Spec 079 update_check gate) read the
+// config core is actually using — not a hardcoded default.
+func TestServerAdapter_GetConfigPath_HonorsTrayConfigPathEnv(t *testing.T) {
+	const custom = "/tmp/custom-tray-config/mcp_config.json"
+	t.Setenv("MCPPROXY_TRAY_CONFIG_PATH", custom)
+
+	adapter := NewServerAdapter(NewMockClient())
+
+	assert.Equal(t, custom, adapter.GetConfigPath())
+}
+
+func TestServerAdapter_GetConfigPath_DefaultWhenEnvUnset(t *testing.T) {
+	t.Setenv("MCPPROXY_TRAY_CONFIG_PATH", "")
+
+	adapter := NewServerAdapter(NewMockClient())
+
+	got := adapter.GetConfigPath()
+	assert.Contains(t, got, "mcp_config.json")
+	assert.NotEqual(t, "", got)
 }

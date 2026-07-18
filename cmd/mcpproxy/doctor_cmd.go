@@ -13,8 +13,28 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 )
+
+// doctorUpdateActionLine renders the guided-update action for the /api/v1/info
+// update object (Spec 079 US2, FR-009): the channel's exact one-line command
+// when one exists, the channel-appropriate guidance otherwise, or "" when the
+// daemon reported no install channel (older daemons). The release URL is
+// already printed on the Download line, so guidance uses the generic
+// "releases page" wording.
+func doctorUpdateActionLine(updateInfo map[string]interface{}) string {
+	if cmd := getStringField(updateInfo, "update_command"); cmd != "" {
+		return "Run: " + cmd
+	}
+	channel := getStringField(updateInfo, "install_channel")
+	if channel == "" {
+		return ""
+	}
+	if guidance := updatecheck.GuidanceLine(channel, ""); guidance != "" {
+		return "Update: " + guidance
+	}
+	return ""
+}
 
 var (
 	doctorCmd = &cobra.Command{
@@ -39,6 +59,8 @@ Examples:
 	doctorOutput     string
 	doctorLogLevel   string
 	doctorConfigPath string
+	// Spec 044 — optional filter to scope diagnostics to a single server.
+	doctorServerFilter string
 )
 
 // GetDoctorCommand returns the doctor command for adding to the root command.
@@ -54,6 +76,7 @@ func init() {
 	doctorCmd.Flags().StringVarP(&doctorOutput, "output", "o", "pretty", "Output format (pretty, json)")
 	doctorCmd.Flags().StringVarP(&doctorLogLevel, "log-level", "l", "warn", "Log level")
 	doctorCmd.Flags().StringVarP(&doctorConfigPath, "config", "c", "", "Path to config file")
+	doctorCmd.Flags().StringVar(&doctorServerFilter, "server", "", "Limit health checks to a single upstream server (by name)")
 }
 
 func runDoctor(_ *cobra.Command, _ []string) error {
@@ -74,18 +97,14 @@ func runDoctor(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Check if daemon is running
-	if !shouldUseDoctorDaemon(globalConfig.DataDir) {
+	// Check if daemon is running (socket first, then TCP fallback)
+	client, ok := newDaemonClient(globalConfig, logger.Sugar())
+	if !ok {
 		return fmt.Errorf("doctor requires running daemon. Start with: mcpproxy serve")
 	}
 
 	logger.Info("Fetching diagnostics from daemon")
-	return runDoctorClientMode(ctx, globalConfig.DataDir, logger)
-}
-
-func shouldUseDoctorDaemon(dataDir string) bool {
-	socketPath := socket.DetectSocketPath(dataDir)
-	return socket.IsSocketAvailable(socketPath)
+	return runDoctorClientMode(ctx, client, logger)
 }
 
 // quarantineServerStats holds quarantine stats for a single server.
@@ -95,10 +114,7 @@ type quarantineServerStats struct {
 	ChangedCount int
 }
 
-func runDoctorClientMode(ctx context.Context, dataDir string, logger *zap.Logger) error {
-	socketPath := socket.DetectSocketPath(dataDir)
-	client := cliclient.NewClient(socketPath, logger.Sugar())
-
+func runDoctorClientMode(ctx context.Context, client *cliclient.Client, logger *zap.Logger) error {
 	// Call GET /api/v1/info with refresh=true to get fresh update info
 	info, err := client.GetInfoWithRefresh(ctx, true)
 	if err != nil {
@@ -115,7 +131,94 @@ func runDoctorClientMode(ctx context.Context, dataDir string, logger *zap.Logger
 	// Collect quarantine stats from servers
 	quarantineStats := collectQuarantineStats(ctx, client, logger)
 
-	return outputDiagnostics(diag, info, quarantineStats)
+	// Host-environment hint (issue #457). Cheap probe — runs locally because
+	// doctor is socket-bound, i.e. same host as the daemon. Skip on a single-
+	// server filter since the hint is host-global, not server-scoped.
+	var envHint string
+	if doctorServerFilter == "" {
+		servers, err := client.GetServers(ctx)
+		if err != nil {
+			logger.Debug("Failed to get servers for env hint", zap.Error(err))
+		} else {
+			inputs := snapDockerEnvInputs{
+				SnapDockerPresent:      detectSnapDockerPresent(ctx),
+				ServiceHomeOutsideHome: homeOutsideHome(detectServiceHome(ctx)),
+				HasDockerUpstream:      hasDockerUpstream(servers),
+			}
+			if inputs.ShouldWarn() {
+				envHint = snapDockerHint()
+			}
+		}
+	}
+
+	// Spec 044 — optionally narrow to a single server. Applied after
+	// collection so the backend diagnostic shape is unchanged.
+	if doctorServerFilter != "" {
+		diag = filterDiagnosticsByServer(diag, doctorServerFilter)
+		quarantineStats = filterQuarantineStatsByServer(quarantineStats, doctorServerFilter)
+	}
+
+	return outputDiagnostics(diag, info, quarantineStats, envHint)
+}
+
+// filterDiagnosticsByServer returns a shallow copy of the diagnostics
+// payload where every per-server array is filtered to entries whose
+// server_name equals `serverName`. Unknown fields are passed through
+// unchanged. Spec 044.
+func filterDiagnosticsByServer(diag map[string]interface{}, serverName string) map[string]interface{} {
+	out := make(map[string]interface{}, len(diag))
+	perServerArrayFields := map[string]bool{
+		"upstream_errors":  true,
+		"oauth_required":   true,
+		"oauth_issues":     true,
+		"runtime_warnings": true,
+		"missing_secrets":  true,
+	}
+	total := 0
+	for k, v := range diag {
+		if perServerArrayFields[k] {
+			if arr, ok := v.([]interface{}); ok {
+				filtered := make([]interface{}, 0, len(arr))
+				for _, item := range arr {
+					if m, ok := item.(map[string]interface{}); ok {
+						name := getStringField(m, "server_name")
+						// missing_secrets uses `used_by` (array of server names).
+						if k == "missing_secrets" {
+							if usedBy := getArrayField(m, "used_by"); len(usedBy) > 0 {
+								for _, u := range usedBy {
+									if s, ok := u.(string); ok && s == serverName {
+										filtered = append(filtered, item)
+										break
+									}
+								}
+								continue
+							}
+						}
+						if name == serverName {
+							filtered = append(filtered, item)
+						}
+					}
+				}
+				out[k] = filtered
+				total += len(filtered)
+				continue
+			}
+		}
+		out[k] = v
+	}
+	out["total_issues"] = total
+	return out
+}
+
+// filterQuarantineStatsByServer keeps only the stats for the requested server.
+func filterQuarantineStatsByServer(stats []quarantineServerStats, serverName string) []quarantineServerStats {
+	out := make([]quarantineServerStats, 0, 1)
+	for _, s := range stats {
+		if s.ServerName == serverName {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // collectQuarantineStats queries each server's tool approvals to find pending tools.
@@ -168,7 +271,7 @@ func collectQuarantineStats(ctx context.Context, client *cliclient.Client, logge
 	return stats
 }
 
-func outputDiagnostics(diag map[string]interface{}, info map[string]interface{}, quarantineStats []quarantineServerStats) error {
+func outputDiagnostics(diag map[string]interface{}, info map[string]interface{}, quarantineStats []quarantineServerStats, envHint string) error {
 	switch doctorOutput {
 	case "json":
 		// Combine diagnostics with info for JSON output
@@ -180,6 +283,9 @@ func outputDiagnostics(diag map[string]interface{}, info map[string]interface{},
 		}
 		if len(quarantineStats) > 0 {
 			combined["quarantine"] = quarantineStats
+		}
+		if envHint != "" {
+			combined["environment_warnings"] = []string{envHint}
 		}
 		output, err := json.MarshalIndent(combined, "", "  ")
 		if err != nil {
@@ -209,6 +315,10 @@ func outputDiagnostics(diag map[string]interface{}, info map[string]interface{},
 						if releaseURL != "" {
 							fmt.Printf("Download: %s\n", releaseURL)
 						}
+						// Spec 079 US2 (FR-009): channel-aware guided update.
+						if action := doctorUpdateActionLine(updateInfo); action != "" {
+							fmt.Println(action)
+						}
 					} else {
 						fmt.Printf("Version: %s (latest)\n", version)
 					}
@@ -228,6 +338,11 @@ func outputDiagnostics(diag map[string]interface{}, info map[string]interface{},
 
 			// Show deprecated config warnings even when no issues
 			displayDeprecatedConfigs(diag)
+
+			// Host-environment hint (snap-docker, issue #457). Surfaced even
+			// when no per-server diagnostics fired because the upstreams may
+			// still be in retry — the hint preempts the next failure.
+			displayEnvironmentHint(envHint)
 
 			// Display security features status even when no issues
 			fmt.Println("🔒 Security Features")
@@ -391,6 +506,9 @@ func outputDiagnostics(diag map[string]interface{}, info map[string]interface{},
 
 		// Deprecated Configuration warnings
 		displayDeprecatedConfigs(diag)
+
+		// Host-environment hint (snap-docker, issue #457).
+		displayEnvironmentHint(envHint)
 
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		fmt.Println()

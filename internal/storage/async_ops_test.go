@@ -51,6 +51,7 @@ func TestSaveServerSyncPreservesAllFields(t *testing.T) {
 		Updated:     time.Now(),
 		Isolation: &config.IsolationConfig{
 			Enabled:     config.BoolPtr(true),
+			Mode:        func() *config.IsolationMode { m := config.IsolationModeSandbox; return &m }(),
 			Image:       "python:3.11",
 			NetworkMode: "bridge",
 			ExtraArgs:   []string{"-v", "/host:/container"},
@@ -120,6 +121,10 @@ func TestSaveServerSyncPreservesAllFields(t *testing.T) {
 	if record.Isolation.IsEnabled() != serverConfig.Isolation.IsEnabled() {
 		t.Errorf("Isolation.Enabled mismatch: got %v, want %v", record.Isolation.IsEnabled(), serverConfig.Isolation.IsEnabled())
 	}
+	// MCP-34.2: per-server isolation.mode must survive the BBolt round-trip.
+	if !reflect.DeepEqual(record.Isolation.Mode, serverConfig.Isolation.Mode) {
+		t.Errorf("Isolation.Mode mismatch: got %v, want %v", record.Isolation.Mode, serverConfig.Isolation.Mode)
+	}
 	if record.Isolation.Image != serverConfig.Isolation.Image {
 		t.Errorf("Isolation.Image mismatch: got %s, want %s", record.Isolation.Image, serverConfig.Isolation.Image)
 	}
@@ -166,6 +171,88 @@ func TestSaveServerSyncPreservesAllFields(t *testing.T) {
 	}
 
 	t.Log("All ServerConfig fields are correctly preserved in saveServerSync")
+}
+
+// TestAutoApproveToolChangesRoundTrip verifies the per-server
+// auto_approve_tool_changes flag (MCP-2940) survives a Save → Get / List
+// cycle through BBolt. This is the persistence half of the feature: without
+// it, SaveConfiguration (which rebuilds the JSON config from these records)
+// would wipe a REST/UI-set toggle on the next mutation. Tri-state *bool — an
+// unset flag must stay nil, an explicit false must round-trip as false.
+func TestAutoApproveToolChangesRoundTrip(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "async_ops_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zaptest.NewLogger(t).Sugar()
+	manager, err := NewManager(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("Failed to create storage manager: %v", err)
+	}
+	defer manager.Close()
+
+	boolPtr := func(b bool) *bool { return &b }
+	cases := []struct {
+		name string
+		flag *bool
+	}{
+		{"auto-on", boolPtr(true)},
+		{"auto-off", boolPtr(false)},
+		{"unset", nil},
+	}
+
+	for _, tc := range cases {
+		sc := &config.ServerConfig{
+			Name:                   tc.name,
+			URL:                    "https://example.com/mcp",
+			Protocol:               "http",
+			Enabled:                true,
+			Created:                time.Now(),
+			AutoApproveToolChanges: tc.flag,
+		}
+		if err := manager.SaveUpstreamServer(sc); err != nil {
+			t.Fatalf("[%s] SaveUpstreamServer: %v", tc.name, err)
+		}
+	}
+
+	for _, tc := range cases {
+		got, err := manager.GetUpstreamServer(tc.name)
+		if err != nil {
+			t.Fatalf("[%s] GetUpstreamServer: %v", tc.name, err)
+		}
+		if !reflect.DeepEqual(got.AutoApproveToolChanges, tc.flag) {
+			t.Errorf("[%s] Get: AutoApproveToolChanges = %v, want %v",
+				tc.name, derefBool(got.AutoApproveToolChanges), derefBool(tc.flag))
+		}
+	}
+
+	listed, err := manager.ListUpstreamServers()
+	if err != nil {
+		t.Fatalf("ListUpstreamServers: %v", err)
+	}
+	byName := map[string]*config.ServerConfig{}
+	for _, s := range listed {
+		byName[s.Name] = s
+	}
+	for _, tc := range cases {
+		s, ok := byName[tc.name]
+		if !ok {
+			t.Fatalf("[%s] missing from ListUpstreamServers", tc.name)
+		}
+		if !reflect.DeepEqual(s.AutoApproveToolChanges, tc.flag) {
+			t.Errorf("[%s] List: AutoApproveToolChanges = %v, want %v",
+				tc.name, derefBool(s.AutoApproveToolChanges), derefBool(tc.flag))
+		}
+	}
+}
+
+func derefBool(b *bool) interface{} {
+	if b == nil {
+		return nil
+	}
+	return *b
 }
 
 // TestSaveServerSyncPreservesNilFields verifies that nil nested configs remain nil after save.
@@ -242,14 +329,34 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		"Created":        true,
 		"Updated":        true, // Updated is set by saveServerSync, not copied
 		"Isolation":      true,
-		"Shared":         true, // Teams-only: persisted in JSON config, not in BBolt
-		"SkipQuarantine":    true, // Spec 032: runtime-only field, not persisted to BBolt
-		"ReconnectOnUse":    true, // Spec 354: persisted to BBolt for on-demand reconnection
-		"AnnotationDefaults": true, // Fork: per-server annotation defaults, runtime-only config
-		"SearchAliases":     true, // Fork: config-only search metadata, sourced from JSON config
-		"DomainTags":        true, // Fork: config-only domain grouping, sourced from JSON config
-		"ToolAliases":       true, // Fork: config-only per-tool aliases, sourced from JSON config
-		"DisableEnrichment": true, // Fork: config-only enrichment opt-out, sourced from JSON config
+		"Shared":         true, // Server-edition-only: persisted in JSON config, not in BBolt
+		"SkipQuarantine": true, // Spec 032: runtime-only field, not persisted to BBolt
+		// MCP-2930/MCP-2940: successor to SkipQuarantine; persisted to BBolt
+		// because SaveConfiguration rebuilds the JSON config's server list from
+		// these records — without it the REST/UI toggle would be wiped on save.
+		"AutoApproveToolChanges": true,
+		"ReconnectOnUse":         true, // Spec 354: persisted to BBolt for on-demand reconnection
+		"LauncherWaitTimeout":    true, // Spec 046: persisted to BBolt so REST-API-added launcher servers survive restarts
+		"EnabledTools":           true, // feat/config-tool-allowlist: persisted to BBolt
+		"DisabledTools":          true, // feat/config-tool-allowlist: persisted to BBolt
+		// MCP-866: persisted to BBolt so a server's registry origin/provenance
+		// (and the custom-origin skip_quarantine guard) survive a restart.
+		"SourceRegistryID":         true,
+		"SourceRegistryProvenance": true,
+		// Spec 074: server-edition per-upstream broker config; lives in the JSON
+		// config (like Shared), not persisted to the BBolt UpstreamRecord.
+		"AuthBroker": true,
+		// Spec 074: per-server discovery/health-check overrides; round-tripped
+		// through UpstreamRecord so REST/UI-set overrides survive a restart.
+		"HealthCheckInterval":   true,
+		"ToolDiscoveryInterval": true,
+		// MCP-3322: per-server init_timeout override; round-tripped through
+		// UpstreamRecord so REST/UI/CLI-set deadlines survive a restart.
+		"InitTimeout": true,
+		// Spec 084: per-server toon_output override; round-tripped through
+		// UpstreamRecord so a REST/UI-set override survives a restart and a
+		// SaveConfiguration rebuild of the JSON server list.
+		"ToonOutput": true,
 	}
 
 	// Get all fields from ServerConfig
@@ -278,20 +385,15 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 			continue
 		}
 		if fieldName == "Shared" {
-			// Teams-only field, persisted in JSON config not BBolt
+			// Server-edition-only field, persisted in JSON config not BBolt
 			continue
 		}
 		if fieldName == "SkipQuarantine" {
 			// Spec 032: runtime-only field, not persisted to BBolt
 			continue
 		}
-		if fieldName == "AnnotationDefaults" {
-			// Fork: per-server annotation defaults, runtime-only config not persisted to BBolt
-			continue
-		}
-		switch fieldName {
-		case "SearchAliases", "DomainTags", "ToolAliases", "DisableEnrichment":
-			// Fork (spec 2026-04-17): config-only search metadata, not persisted to BBolt
+		if fieldName == "AuthBroker" {
+			// Spec 074: server-edition JSON-config field, not persisted to BBolt
 			continue
 		}
 		if !upstreamFields[fieldName] {
@@ -300,4 +402,57 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 	}
 
 	t.Logf("ServerConfig has %d fields, all mapped to UpstreamRecord", serverConfigType.NumField())
+}
+
+// TestManagerStopAsyncDrainsThenCloseIsIdempotent guards the split shutdown
+// sequence behind Spec 080 FR-010: StopAsync must stop the async manager AND
+// drain queued operations to the DB (so a caller can perform a final write —
+// the telemetry shutdown marker — strictly after all async DB work), and the
+// subsequent Close must not re-run the drain, double-cancel, or panic. A
+// StopAsync after Close must also be a harmless no-op.
+func TestManagerStopAsyncDrainsThenCloseIsIdempotent(t *testing.T) {
+	logger := zaptest.NewLogger(t).Sugar()
+	manager, err := NewManager(t.TempDir(), logger)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// Seed a record, then queue an async write against it.
+	if err := manager.SaveUpstreamServer(&config.ServerConfig{
+		Name:     "drain-test",
+		Protocol: "stdio",
+		Command:  "true",
+		Enabled:  false,
+	}); err != nil {
+		t.Fatalf("SaveUpstreamServer: %v", err)
+	}
+	manager.asyncMgr.EnableServerAsync("drain-test", true)
+
+	// StopAsync must flush the queued write before returning.
+	manager.StopAsync()
+	got, err := manager.GetUpstreamServer("drain-test")
+	if err != nil {
+		t.Fatalf("GetUpstreamServer after StopAsync: %v", err)
+	}
+	if !got.Enabled {
+		t.Fatal("queued async write not drained by StopAsync")
+	}
+
+	// The DB is still open between StopAsync and Close — this is the window
+	// where the shutdown marker is resolved.
+	if manager.GetDB() == nil {
+		t.Fatal("DB must remain open after StopAsync")
+	}
+
+	// Double StopAsync, then Close (whose internal async stop must no-op).
+	manager.StopAsync()
+	if err := manager.Close(); err != nil {
+		t.Fatalf("Close after StopAsync: %v", err)
+	}
+
+	// StopAsync and Close after Close must not panic.
+	manager.StopAsync()
+	if err := manager.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
 }

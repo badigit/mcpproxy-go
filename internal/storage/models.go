@@ -2,9 +2,19 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"time"
 )
+
+// ErrToolApprovalNotFound is returned by GetToolApproval when no record
+// exists for the requested server+tool key. Callers that want to distinguish
+// "first time we've seen this tool" from a real read error (corrupt JSON,
+// closed DB, mmap remap during compaction) MUST use errors.Is, not a generic
+// `err != nil` check — a transient decode error must not be misread as
+// "missing", which would otherwise silently overwrite a pending/changed
+// record with a synthesized approved one.
+var ErrToolApprovalNotFound = errors.New("tool approval not found")
 
 // Bucket names for bbolt database
 const (
@@ -17,17 +27,84 @@ const (
 	MetaBucket            = "meta"
 	CacheBucket           = "cache"
 	CacheStatsBucket      = "cache_stats"
-	SessionsBucket        = "sessions"
+	// SessionsBucket holds MCP transport/work session records.
+	//
+	// It is NOT "sessions". The server edition stores USER LOGIN sessions in a
+	// bucket of that name, on the same BBolt database, and the two were silently
+	// destroying each other:
+	//
+	//   - enforceSessionRetention (here) keeps the 100 newest keys and deletes the
+	//     rest by raw key order, with no type check — evicting user auth sessions
+	//     and logging people out at random.
+	//   - the server edition's CleanupExpiredSessions unmarshals every value as an
+	//     auth session; an MCP record has no expires_at, so its zero time reads as
+	//     long expired and the record is deleted.
+	//
+	// Namespacing the bucket is what makes each side's sweep safe.
+	SessionsBucket = "mcp_sessions"
 
-	// Tool enrichment cache (Spec 2026-04-17)
-	ToolEnrichmentBucket = "tool_enrichment"
+	// LegacySessionsBucket is the pre-namespacing bucket. In the personal edition
+	// it holds only MCP records; in the server edition it holds a mix of those and
+	// user login sessions. migrateLegacySessions moves the MCP records out and
+	// leaves the auth sessions where they are, so nobody is logged out.
+	LegacySessionsBucket = "sessions"
 
 	// Security scanner buckets (Spec 039)
 	ScannersBucket           = "security_scanners"
 	ScanJobsBucket           = "security_scan_jobs"
+	ScanJobIndexBucket       = "security_scan_job_index" // lightweight ScanJobMeta index (MCP-2205)
 	ScanReportsBucket        = "security_reports"
 	IntegrityBaselinesBucket = "integrity_baselines"
+
+	// Onboarding wizard bucket (Spec 046)
+	OnboardingBucket = "onboarding"
 )
+
+// Onboarding state keys (Spec 046)
+const (
+	OnboardingStateKey = "wizard_state"
+)
+
+// Onboarding step-status values (Spec 046; enum widened by Spec 080 FR-001).
+const (
+	// StepStatusCompleted means the user completed the step inside the wizard.
+	StepStatusCompleted = "completed"
+	// StepStatusCompletedExternal means the wizard's connect step was never
+	// advanced, but at dismissal time the install showed positive evidence of
+	// a connection made outside the wizard (a supported client currently
+	// connected, or an MCP client has ever handshaked). Connect step only
+	// (Spec 080 FR-002).
+	StepStatusCompletedExternal = "completed_external"
+	// StepStatusSkipped means the wizard was dismissed with the step
+	// untouched and no external-connection evidence was established.
+	StepStatusSkipped = "skipped"
+)
+
+// OnboardingState records whether the user has engaged with the first-run
+// wizard, and which steps they completed or skipped. Persisted under
+// OnboardingBucket / OnboardingStateKey. Absence of the record means
+// "wizard has never been shown to this installation".
+type OnboardingState struct {
+	// Engaged is true once the wizard was shown and the user completed or
+	// skipped it. Once true, the wizard does not auto-show again, even if
+	// state regresses (e.g. user disconnects all clients).
+	Engaged bool `json:"engaged"`
+
+	// FirstShownAt is the timestamp of first wizard render.
+	FirstShownAt *time.Time `json:"first_shown_at,omitempty"`
+
+	// EngagedAt is the timestamp of completion or explicit skip.
+	EngagedAt *time.Time `json:"engaged_at,omitempty"`
+
+	// ConnectStepStatus is one of: "", "completed", "completed_external",
+	// "skipped" (Spec 080 FR-001). "completed_external" records a dismissal
+	// where the connect step was untouched but the install was already
+	// connected outside the wizard (CLI, ConnectModal, manual config).
+	ConnectStepStatus string `json:"connect_step_status,omitempty"`
+
+	// ServerStepStatus is one of: "", "completed", "skipped".
+	ServerStepStatus string `json:"server_step_status,omitempty"`
+}
 
 // Meta keys
 const (
@@ -36,7 +113,11 @@ const (
 )
 
 // Current schema version
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
+
+// OutputSchemaHashSchemaVersion is the schema version that starts including
+// MCP outputSchema in the tool approval hash baseline.
+const OutputSchemaHashSchemaVersion = 3
 
 // UpstreamRecord represents an upstream server record in storage
 type UpstreamRecord struct {
@@ -56,6 +137,33 @@ type UpstreamRecord struct {
 	Updated        time.Time               `json:"updated"`
 	Isolation      *config.IsolationConfig `json:"isolation,omitempty"`        // Per-server isolation settings
 	ReconnectOnUse bool                    `json:"reconnect_on_use,omitempty"` // Attempt reconnection on tool call
+	// AutoApproveToolChanges (MCP-2930/MCP-2940) is the per-server intent to
+	// auto-approve new/changed tools past the trust baseline. Tri-state *bool.
+	// Persisted to BBolt because SaveConfiguration rebuilds the JSON config's
+	// server list from these records — a field absent here is wiped on the
+	// next mutation, so REST/UI toggling (MCP-2932) and runtime enforcement
+	// (MCP-2931) would not survive a save/restart without it.
+	AutoApproveToolChanges *bool           `json:"auto_approve_tool_changes,omitempty"`
+	LauncherWaitTimeout    config.Duration `json:"launcher_wait_timeout,omitempty"` // Spec 046: max wait for locally-launched HTTP/SSE upstream URL to become reachable
+	EnabledTools           []string        `json:"enabled_tools,omitempty"`         // Allowlist: only these tools are exposed
+	DisabledTools          []string        `json:"disabled_tools,omitempty"`        // Denylist: these tools are hidden
+	// MCP-866: persist a server's registry origin + provenance so the
+	// approval/quarantine view and the custom-origin skip_quarantine guard
+	// survive a restart.
+	SourceRegistryID         string `json:"source_registry_id,omitempty"`
+	SourceRegistryProvenance string `json:"source_registry_provenance,omitempty"`
+	// Spec 074: per-server discovery/health-check interval overrides, persisted
+	// so REST-API/UI-set overrides survive a restart. *Duration tri-state:
+	// nil = inherit, pointer-to-0s = disabled, positive = interval.
+	HealthCheckInterval   *config.Duration `json:"health_check_interval,omitempty"`
+	ToolDiscoveryInterval *config.Duration `json:"tool_discovery_interval,omitempty"`
+	// MCP-3322: per-server MCP `initialize` handshake deadline override,
+	// persisted so a REST/UI/CLI-set init_timeout survives a restart.
+	InitTimeout *config.Duration `json:"init_timeout,omitempty"`
+	// Spec 084: per-server toon_output override ("" = inherit global),
+	// persisted so the override survives a restart and a SaveConfiguration
+	// rebuild of the JSON server list.
+	ToonOutput string `json:"toon_output,omitempty"`
 }
 
 // ToolStatRecord represents tool usage statistics
@@ -83,17 +191,21 @@ const (
 // When a tool is first discovered, it starts as "pending". Once approved, it becomes "approved".
 // If the tool's description or schema changes after approval, it becomes "changed".
 type ToolApprovalRecord struct {
-	ServerName          string    `json:"server_name"`
-	ToolName            string    `json:"tool_name"`
-	ApprovedHash        string    `json:"approved_hash"`
-	CurrentHash         string    `json:"current_hash"`
-	Status              string    `json:"status"` // "approved", "pending", "changed"
-	ApprovedAt          time.Time `json:"approved_at"`
-	ApprovedBy          string    `json:"approved_by"`
-	PreviousDescription string    `json:"previous_description,omitempty"`
-	CurrentDescription  string    `json:"current_description,omitempty"`
-	PreviousSchema      string    `json:"previous_schema,omitempty"`
-	CurrentSchema       string    `json:"current_schema,omitempty"`
+	ServerName           string    `json:"server_name"`
+	ToolName             string    `json:"tool_name"`
+	ApprovedHash         string    `json:"approved_hash"`
+	CurrentHash          string    `json:"current_hash"`
+	HashSchemaVersion    uint64    `json:"hash_schema_version,omitempty"`
+	Status               string    `json:"status"` // "approved", "pending", "changed"
+	ApprovedAt           time.Time `json:"approved_at"`
+	ApprovedBy           string    `json:"approved_by"`
+	PreviousDescription  string    `json:"previous_description,omitempty"`
+	CurrentDescription   string    `json:"current_description,omitempty"`
+	PreviousSchema       string    `json:"previous_schema,omitempty"`
+	CurrentSchema        string    `json:"current_schema,omitempty"`
+	PreviousOutputSchema string    `json:"previous_output_schema,omitempty"`
+	CurrentOutputSchema  string    `json:"current_output_schema,omitempty"`
+	Disabled             bool      `json:"disabled,omitempty"`
 }
 
 // ToolApprovalKey returns the storage key for a tool approval record.
@@ -223,41 +335,4 @@ func (d *DockerRecoveryState) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary implements encoding.BinaryUnmarshaler
 func (d *DockerRecoveryState) UnmarshalBinary(data []byte) error {
 	return json.Unmarshal(data, d)
-}
-
-// EnrichedToolMeta is the cached result of LLM-based tool enrichment.
-// Each record captures search keywords, example user queries, and a
-// single domain tag for one upstream tool. Entries live in
-// ToolEnrichmentBucket keyed by EnrichmentCacheKey(server, tool, description, promptVersion).
-//
-// The cache is invalidated automatically when the underlying tool's
-// description changes (different hash) or when the enrichment prompt
-// template is bumped (different PromptVersion).
-type EnrichedToolMeta struct {
-	ServerName      string    `json:"server_name"`
-	ToolName        string    `json:"tool_name"`
-	DescriptionHash string    `json:"description_hash"` // sha256 hex of source description; used for invalidation
-	Keywords        []string  `json:"keywords,omitempty"`
-	ExampleQueries  []string  `json:"example_queries,omitempty"`
-	Domain          string    `json:"domain,omitempty"`
-	PromptVersion   int       `json:"prompt_version"`
-	Model           string    `json:"model,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-}
-
-// EnrichmentKey returns the BBolt key for a tool enrichment record.
-// The key is "<server>:<tool>"; invalidation is done by matching
-// DescriptionHash and PromptVersion inside the value.
-func EnrichmentKey(serverName, toolName string) string {
-	return serverName + ":" + toolName
-}
-
-// MarshalBinary implements encoding.BinaryMarshaler
-func (e *EnrichedToolMeta) MarshalBinary() ([]byte, error) {
-	return json.Marshal(e)
-}
-
-// UnmarshalBinary implements encoding.BinaryUnmarshaler
-func (e *EnrichedToolMeta) UnmarshalBinary(data []byte) error {
-	return json.Unmarshal(data, e)
 }

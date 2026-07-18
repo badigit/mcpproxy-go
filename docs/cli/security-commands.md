@@ -293,9 +293,14 @@ Scan completed for "everything".
 
 Security Report: everything
 Scan ID:     scan-everything-1775804891180898000
-Risk Score:  0/100
+Risk Score:  0/100 (degraded — 1 of 7 scanners did not run)
 Scanned:     2026-04-10 10:08:19
 Scanners:    6 run, 1 failed (ramparts) of 7
+
+Scanner timing:
+  mcp-scan             completed    1.2s
+  trivy-mcp            completed    12.3s
+  ramparts             failed       -
 
 WARNING: Scan coverage incomplete: 1 of 7 scanners did not run
 
@@ -374,11 +379,12 @@ mcpproxy security scan my-new-server --scanners nova-proximity,trivy-mcp
 
 Before running any scanner, mcpproxy determines *what to scan*. The resolver order is:
 
-1. **Docker-isolated servers** → extract `/app` (or the server's `WorkingDir`) from the running container.
-2. **Package-runner commands** (`npx`, `uvx`, `pipx`, `bunx`) → resolve from the local package cache (`~/.npm/_npx/…`, `~/.cache/uv/…`, etc.). This path is tried **first** for package runners.
-3. **Working directory** from the server config.
-4. **Arg-scan fallback** — iterate positional command args, accept the first one that exists as a directory AND contains a source marker (`package.json`, `pyproject.toml`, `setup.py`, `Cargo.toml`, `go.mod`, etc.).
-5. **Tool definitions only** — export the server's tool schemas to a temp dir and scan those (used for HTTP/SSE servers and as a last-resort fallback).
+1. **Docker-image servers** (`command: docker`, `args: [run, …, mcp/fetch]` — also `podman` / `docker container run`) → `source_method=container_image`. The scan target is the image reference itself. Image-capable scanners (Trivy) run in image mode (`trivy image mcp/fetch`) instead of scanning an empty source tree. Trivy resolves the image via the local daemon/containerd/podman, falling back to pulling it from the remote registry, so no Docker socket mount is needed.
+2. **Docker-isolated servers** → extract `/app` (or the server's `WorkingDir`) from the running container.
+3. **Package-runner commands** (`npx`, `uvx`, `pipx`, `bunx`) → resolve from the local package cache (`~/.npm/_npx/…`, `~/.cache/uv/…`, etc.). This path is tried **first** for package runners.
+4. **Working directory** from the server config.
+5. **Arg-scan fallback** — iterate positional command args, accept the first one that exists as a directory AND contains a source marker (`package.json`, `pyproject.toml`, `setup.py`, `Cargo.toml`, `go.mod`, etc.).
+6. **Tool definitions only** — export the server's tool schemas to a temp dir and scan those (used for HTTP/SSE servers and as a last-resort fallback).
 
 The `source_method` and `source_path` are recorded on the scan job and shown in both the text and JSON report. This is how you verify a scanner is examining the right directory.
 
@@ -420,16 +426,18 @@ Scan Status: everything
   Started:  2026-04-10 08:41:17
   Finished: 2026-04-10 08:42:09
 
-  SCANNER              STATUS       FINDINGS ERROR
-  -----------------------------------------------------------------
-  cisco-mcp-scanner    completed    0
-  mcp-ai-scanner       completed    0
-  mcp-scan             failed       0        scanner mcp-scan produ...
-  nova-proximity       completed    0
-  ramparts             failed       0        scanner ramparts produ...
-  semgrep-mcp          completed    0
-  trivy-mcp            completed    0
+  SCANNER              STATUS       DURATION   FINDINGS ERROR
+  ---------------------------------------------------------------------------
+  cisco-mcp-scanner    completed    1.2s       0
+  mcp-ai-scanner       completed    3.4s       0
+  mcp-scan             failed       850ms      0        scanner mcp-scan produ...
+  nova-proximity       completed    2.1s       0
+  ramparts             failed       120ms      0        scanner ramparts produ...
+  semgrep-mcp          completed    5.7s       0
+  trivy-mcp            completed    12.3s      0
 ```
+
+The `DURATION` column is each scanner's wall-clock execution time, computed from its `started_at`/`completed_at` timestamps. It renders `-` when timing is unavailable (e.g. a scanner that never started).
 
 :::tip Use status for diagnostics
 If `security report` shows "0 findings" but you think a scanner should have flagged something, open `status` — failed scanners appear here with their truncated stderr. The full stderr is available via `security status <server> -o json`.
@@ -464,9 +472,14 @@ Use `-o json`, `-o yaml`, or `-o sarif` for machine-readable output.
 ```
 Security Report: everything
 Scan ID:     scan-everything-1775804891180898000
-Risk Score:  0/100
+Risk Score:  0/100 (degraded — 1 of 7 scanners did not run)
 Scanned:     2026-04-10 10:08:19
 Scanners:    6 run, 1 failed (ramparts) of 7
+
+Scanner timing:
+  mcp-scan             completed    1.2s
+  trivy-mcp            completed    12.3s
+  ramparts             failed       -
 
 WARNING: Scan coverage incomplete: 1 of 7 scanners did not run
 
@@ -485,8 +498,15 @@ The `Scanners: X run, Y failed (names) of Z` line surfaces per-scanner failures 
 
 - `risk_score` — composite 0-100 score
 - `summary` — severity counts (`critical`, `high`, `medium`, `low`, `info`, `dangerous`, `warnings`, `info_level`, `total`)
-- `findings` — normalized findings across all scanners
+- `findings` — normalized findings across all scanners. Findings from the
+  deterministic tool-scanner (Spec 076) additionally carry `confidence` (0.0–1.0
+  combined confidence) and `signals` (the independent check IDs that fired, e.g.
+  `unicode.hidden`, `directive.imperative`). When several independent checks
+  agree on one tool, that agreement **adds** to the composite `risk_score`
+  rather than being collapsed — the table report renders these as `Confidence:`
+  and `Signals:` lines under the finding.
 - `reports` — per-scanner raw results (also includes SARIF when `?include_sarif=true` is passed to the REST endpoint)
+- `scanner_statuses` — per-scanner execution records, each with `scanner_id`, `status`, `started_at`, `completed_at`, `duration_ms` (wall-clock execution time in milliseconds), `findings_count`, and `error`
 - `scan_context` — source method, source path, scanned file list
 - `scanners_run`, `scanners_failed`, `scanners_total`
 - `pass1_complete`, `pass2_complete`, `pass2_running`

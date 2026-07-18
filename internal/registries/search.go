@@ -3,29 +3,49 @@ package registries
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/experiments"
 )
 
+// Sentinel errors for single-server lookup. Surfaces map these to stable error
+// codes (registry_not_found / server_not_found) for cross-surface consistency
+// (CN-004).
+var (
+	ErrRegistryNotFound = errors.New("registry not found")
+	ErrServerNotFound   = errors.New("server not found in registry")
+)
+
 // Constants for repeated strings
 const (
-	protocolMCPRun   = "custom/mcprun"
-	protocolMCPStore = "custom/mcpstore"
-	protocolDocker   = "custom/docker"
-	protocolFleur    = "custom/fleur"
-	protocolMCPV0    = "mcp/v0"
-	protocolRemote   = "custom/remote"
-	dockerProtocol   = "docker"
-	noDescAvailable  = "No description available"
+	protocolDocker  = "custom/docker"
+	dockerProtocol  = "docker"
+	noDescAvailable = "No description available"
 )
 
 // GitHub URL pattern for matching https://github.com/<author|org>/<repo>
 var githubURLPattern = regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)(?:/.*)?$`)
+
+// buildVersion holds the build-time version used in the outbound User-Agent.
+// Set via SetVersion at process startup. Defaults to "dev" so tests run
+// without setup. Some registries (e.g. Pulse, issue #566) reject requests
+// with an empty or bare User-Agent and require a versioned one.
+var buildVersion = "dev"
+
+// SetVersion sets the version reported in the registry User-Agent header.
+func SetVersion(v string) {
+	if v != "" {
+		buildVersion = v
+	}
+}
+
+// registryUserAgent returns the versioned User-Agent for registry HTTP requests.
+func registryUserAgent() string {
+	return "mcpproxy/" + buildVersion
+}
 
 // SearchServers searches the given registry for servers matching optional tag and query
 // with optional repository guessing and result limiting
@@ -36,26 +56,38 @@ func SearchServers(ctx context.Context, registryID, tag, query string, limit int
 		return nil, fmt.Errorf("registry '%s' not found", registryID)
 	}
 
+	// FR-008: skip a key-requiring registry when no key is configured, rather
+	// than performing a doomed fetch. Surfaces map ErrRegistryKeyMissing to an
+	// "unavailable" marker so the overall search still succeeds.
+	if err := checkRegistryKey(reg); err != nil {
+		return nil, err
+	}
+
 	if reg.ServersURL == "" {
 		return nil, fmt.Errorf("registry '%s' has no servers endpoint", reg.Name)
 	}
 
-	// Fetch servers from registry WITHOUT repository guessing (for performance)
-	servers, err := fetchServers(ctx, reg, nil) // Pass nil guesser to skip expensive operations
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch servers from %s: %w", reg.Name, err)
-	}
-
-	// Filter results BEFORE expensive repository guessing
-	filtered := filterServers(servers, tag, query)
-
-	// Apply limit BEFORE expensive repository guessing (default 10, max 50)
+	// Clamp the limit up front (default 10, max 50) so it can also bound how many
+	// pages a paginating registry is asked for. Applying it only after the whole
+	// listing had been fetched meant a limit=3 search still crawled every page —
+	// six-plus minutes against a registry answering in ~20s per page.
 	if limit <= 0 {
 		limit = 10 // Default limit
 	}
 	if limit > 50 {
 		limit = 50 // Max limit
 	}
+
+	// Fetch servers from registry WITHOUT repository guessing (for performance).
+	// Forward the query so search-capable protocols can filter server-side, and
+	// the limit so they can stop paginating once they have enough.
+	servers, err := fetchServers(ctx, reg, nil, query, limit) // Pass nil guesser to skip expensive operations
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch servers from %s: %w", reg.Name, err)
+	}
+
+	// Filter results BEFORE expensive repository guessing
+	filtered := filterServers(servers, tag, query)
 
 	if len(filtered) > limit {
 		filtered = filtered[:limit]
@@ -74,30 +106,98 @@ func SearchServers(ctx context.Context, registryID, tag, query string, limit int
 	return filtered, nil
 }
 
-// fetchServers fetches and parses servers from a registry based on its protocol
-func fetchServers(ctx context.Context, reg *RegistryEntry, guesser *experiments.Guesser) ([]ServerEntry, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+// FindServerByID resolves a single server within a registry by its exact ID.
+// It performs a live registry fetch and is the shared resolution path used by
+// every add-from-registry surface (CN-001/CN-004). Returns ErrRegistryNotFound
+// when registryID does not resolve and ErrServerNotFound when no server matches.
+func FindServerByID(ctx context.Context, registryID, serverID string, guesser *experiments.Guesser) (*ServerEntry, error) {
+	reg := FindRegistry(registryID)
+	if reg == nil {
+		return nil, ErrRegistryNotFound
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", reg.ServersURL, http.NoBody)
+	// Honor key-requiring registries (FR-008) on the add path too.
+	if err := checkRegistryKey(reg); err != nil {
+		return nil, err
+	}
+
+	// Match against the FULL registry listing, never the UI/search limit: a
+	// server beyond the first page of results must still be addable. Routing the
+	// add path through SearchServers truncated the listing to 50 before
+	// matching, so any entry past the first page was searchable but not addable
+	// (Codex RV #1).
+	match, err := findServerByIDFetch(ctx, reg, serverID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, err
 	}
 
-	resp, err := client.Do(req)
+	// Enrich only the single matched entry (cheap) rather than the whole listing.
+	if guesser != nil {
+		if enriched := applyBatchRepositoryGuessing(ctx, []ServerEntry{*match}, guesser); len(enriched) > 0 {
+			match = &enriched[0]
+		}
+	}
+	match.Registry = reg.Name
+	return match, nil
+}
+
+// findServerByIDFetch resolves serverID against a registry's full listing. It
+// first forwards serverID as a server-side `search` hint (cheap for the
+// paginating official protocol) and falls back to a full unfiltered fetch when
+// the hinted search does not surface the exact entry — so the match is found
+// regardless of its position in the listing.
+func findServerByIDFetch(ctx context.Context, reg *RegistryEntry, serverID string) (*ServerEntry, error) {
+	if servers, err := fetchServers(ctx, reg, nil, serverID, 0); err == nil {
+		if match, err := findServerByIDIn(servers, serverID); err == nil {
+			return match, nil
+		}
+	}
+	servers, err := fetchServers(ctx, reg, nil, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	return findServerByIDIn(servers, serverID)
+}
+
+// findServerByIDIn returns the first server whose ID exactly matches serverID.
+// Pure (no network) so the not-found path is unit-testable.
+func findServerByIDIn(servers []ServerEntry, serverID string) (*ServerEntry, error) {
+	for i := range servers {
+		if servers[i].ID == serverID {
+			match := servers[i] // copy to avoid aliasing the slice backing array
+			return &match, nil
+		}
+	}
+	return nil, ErrServerNotFound
+}
+
+// fetchServers fetches and parses servers from a registry based on its protocol.
+// The optional query is forwarded to protocols that support server-side search
+// (currently the official v0.1 protocol); other protocols filter client-side.
+// maxResults (0 = no cap) lets a paginating protocol stop early once it has
+// enough to satisfy the caller — see fetchOfficialServers.
+func fetchServers(ctx context.Context, reg *RegistryEntry, guesser *experiments.Guesser, query string, maxResults int) ([]ServerEntry, error) {
+	// The official protocol paginates (cursor follow-loop) and is handled by a
+	// dedicated fetcher; the built-in reference source is served in-binary with
+	// no network request at all.
+	switch reg.Protocol {
+	case protocolOfficial:
+		return fetchOfficialServers(ctx, reg, guesser, query, maxResults)
+	case protocolReference:
+		return referenceServers(), nil
+	}
+
+	// registryGet sets the standard headers (Accept/User-Agent/auth), checks the
+	// status, and auto-retries transient failures (timeouts, 5xx/429) with
+	// exponential backoff so a transient hiccup no longer fails the search.
+	body, err := registryGet(ctx, reg, reg.ServersURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch servers: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("registry query returned %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	// Parse response JSON
 	var rawData interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&rawData); err != nil {
+	if err := json.Unmarshal(body, &rawData); err != nil {
 		return nil, fmt.Errorf("invalid JSON from registry: %w", err)
 	}
 
@@ -112,37 +212,27 @@ func parseServers(ctx context.Context, rawData interface{}, reg *RegistryEntry, 
 	var servers []ServerEntry
 
 	switch reg.Protocol {
-	case "modelcontextprotocol/registry":
-		servers = parseOpenAPIRegistry(rawData)
-	case protocolMCPRun:
-		servers = parseMCPRun(rawData)
+	case protocolOfficial:
+		// Single-page parse; the paginating fetcher (fetchOfficialServers) is the
+		// normal entry point and already follows the cursor.
+		servers, _ = parseOfficialPage(rawData)
 	case "custom/pulse":
 		servers = parsePulseWithoutGuesser(rawData) // Parse without guesser first
-	case protocolMCPStore:
-		servers = parseMCPStore(rawData)
 	case protocolDocker:
 		servers = parseDocker(rawData)
-	case protocolFleur:
-		servers = parseFleur(rawData)
 	case "custom/apitracker":
 		servers = parseAPITracker(rawData)
 	case "custom/apify":
 		servers = parseApify(rawData)
-	case protocolMCPV0:
-		servers = parseAzureMCPDemoWithoutGuesser(rawData) // Parse without guesser first
-	case protocolRemote:
-		servers = parseRemoteMCPServers(rawData)
 	default:
 		// Default handling: try to unmarshal directly into []ServerEntry
 		servers = parseDefault(rawData)
 	}
 
-	// For servers missing URLs, try to construct them if possible
-	for i := range servers {
-		if servers[i].URL == "" {
-			servers[i].URL = constructServerURL(&servers[i], reg)
-		}
-	}
+	// NOTE: URL synthesis (constructServerURL) was deliberately removed. Local
+	// servers MUST leave URL empty so the add path builds a stdio transport
+	// (issues #483/#567); the official parser already sets URL only for true
+	// remote endpoints.
 
 	// Apply batch repository guessing if guesser is provided
 	if guesser != nil {
@@ -250,62 +340,6 @@ func parseOpenAPIRegistry(rawData interface{}) []ServerEntry {
 	return servers
 }
 
-// parseMCPRun handles MCP Run's specific API format
-func parseMCPRun(rawData interface{}) []ServerEntry {
-	servers := []ServerEntry{}
-
-	if arr, ok := rawData.([]interface{}); ok {
-		for _, item := range arr {
-			itemMap, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if slug, ok := itemMap["slug"].(string); ok && slug != "" {
-				server := ServerEntry{
-					ID:   slug,
-					Name: slug,
-				}
-
-				// Extract description from meta if available
-				if meta, ok := itemMap["meta"].(map[string]interface{}); ok {
-					if desc, ok := meta["description"].(string); ok {
-						server.Description = desc
-					}
-				}
-
-				// For servers without descriptions, use default
-				if server.Description == "" {
-					server.Description = noDescAvailable
-				}
-
-				servers = append(servers, server)
-			}
-		}
-	}
-
-	return servers
-}
-
-// parseMCPStore handles MCP Store's specific API format
-func parseMCPStore(rawData interface{}) []ServerEntry {
-	servers := []ServerEntry{}
-
-	if m, ok := rawData.(map[string]interface{}); ok {
-		if serversData := m["servers"]; serversData != nil {
-			if marshaledData, err := json.Marshal(serversData); err == nil {
-				_ = json.Unmarshal(marshaledData, &servers)
-			}
-		} else if packagesData := m["packages"]; packagesData != nil {
-			// MCP Store might use "packages" instead of "servers"
-			if marshaledData, err := json.Marshal(packagesData); err == nil {
-				_ = json.Unmarshal(marshaledData, &servers)
-			}
-		}
-	}
-
-	return servers
-}
-
 // parseDocker handles Docker registry format
 func parseDocker(rawData interface{}) []ServerEntry {
 	servers := []ServerEntry{}
@@ -326,9 +360,17 @@ func parseDocker(rawData interface{}) []ServerEntry {
 			continue
 		}
 		if name, ok := itemMap["name"].(string); ok && name != "" {
+			// Docker Hub's mcp/ namespace returns image repo names (e.g. "sqlite",
+			// "git", "fetch"). The full reference is mcp/<name>. These images are
+			// stdio MCP servers, so the canonical launch is `docker run -i --rm`.
+			// We MUST set InstallCmd (not URL) — the URL field is reserved for HTTP/SSE
+			// remote endpoints. See issue #483: synthesising "docker://mcp/<name>" as a
+			// URL caused the frontend to register it as an http transport, leading to
+			// `Post "docker://mcp/sqlite": unsupported protocol scheme "docker"`.
 			server := ServerEntry{
-				ID:   name,
-				Name: name,
+				ID:         name,
+				Name:       name,
+				InstallCmd: fmt.Sprintf("docker run -i --rm mcp/%s", name),
 			}
 
 			// Try to get description from images array
@@ -358,65 +400,6 @@ func parseDocker(rawData interface{}) []ServerEntry {
 
 			servers = append(servers, server)
 		}
-	}
-
-	return servers
-}
-
-// parseFleur handles Fleur registry format
-func parseFleur(rawData interface{}) []ServerEntry {
-	servers := []ServerEntry{}
-
-	arr, ok := rawData.([]interface{})
-	if !ok {
-		return servers
-	}
-
-	for _, item := range arr {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		// Check if this is an MCP-enabled app
-		config, hasConfig := itemMap["config"].(map[string]interface{})
-		if !hasConfig {
-			continue
-		}
-
-		mcpKey, hasMcpKey := config["mcpKey"].(string)
-		if !hasMcpKey || mcpKey == "" {
-			continue // skip non-MCP entries
-		}
-
-		server := ServerEntry{
-			ID:   mcpKey,
-			Name: mcpKey,
-		}
-
-		// Extract description
-		if desc, ok := itemMap["description"].(string); ok {
-			server.Description = desc
-		} else if name, ok := itemMap["name"].(string); ok {
-			server.Description = name
-		} else {
-			server.Description = noDescAvailable
-		}
-
-		// Build installation command from config
-		if runtime, ok := config["runtime"].(string); ok {
-			if argsInterface, ok := config["args"].([]interface{}); ok {
-				args := make([]string, 0, len(argsInterface))
-				for _, arg := range argsInterface {
-					if argStr, ok := arg.(string); ok {
-						args = append(args, argStr)
-					}
-				}
-				server.InstallCmd = buildFleurInstallCmd(runtime, args)
-			}
-		}
-
-		servers = append(servers, server)
 	}
 
 	return servers
@@ -543,42 +526,6 @@ func createServerEntry(data map[string]interface{}) ServerEntry {
 	return server
 }
 
-// constructServerURL tries to construct a server URL if missing
-func constructServerURL(server *ServerEntry, reg *RegistryEntry) string {
-	if server.URL != "" {
-		return server.URL
-	}
-
-	// For some registries, we might be able to construct URLs from patterns
-	switch reg.Protocol {
-	case protocolMCPRun:
-		if server.ID != "" {
-			// Replace slashes with dashes to create valid subdomain URLs
-			// e.g., "G4Vi/weather-service" becomes "https://G4Vi-weather-service.mcp.run/mcp/"
-			urlSafeID := strings.ReplaceAll(server.ID, "/", "-")
-			return fmt.Sprintf("https://%s.mcp.run/mcp/", urlSafeID)
-		}
-	case protocolMCPStore:
-		if server.ID != "" {
-			return fmt.Sprintf("https://api.mcpstore.co/servers/%s/mcp", server.ID)
-		}
-	case protocolDocker:
-		if server.ID != "" {
-			return fmt.Sprintf("docker://mcp/%s", server.ID)
-		}
-	case protocolFleur:
-		if server.ID != "" {
-			return fmt.Sprintf("https://api.fleurmcp.com/apps/%s/mcp", server.ID)
-		}
-	case dockerProtocol:
-		if server.ID != "" {
-			return fmt.Sprintf("docker://%s", server.ID)
-		}
-	}
-
-	return ""
-}
-
 // filterServers filters servers by tag and query
 func filterServers(servers []ServerEntry, tag, query string) []ServerEntry {
 	if tag == "" && query == "" {
@@ -604,76 +551,6 @@ func filterServers(servers []ServerEntry, tag, query string) []ServerEntry {
 	}
 
 	return filtered
-}
-
-// buildFleurInstallCmd constructs installation command from runtime and args (helper for tests)
-func buildFleurInstallCmd(runtime string, args []string) string {
-	switch runtime {
-	case "npx", "uvx", dockerProtocol:
-		return runtime + " " + strings.Join(args, " ")
-	case "stdio":
-		return strings.Join(args, " ")
-	default:
-		combined := append([]string{runtime}, args...)
-		return strings.Join(combined, " ")
-	}
-}
-
-// parseRemoteMCPServers handles Remote MCP Servers registry format (custom/remote protocol)
-func parseRemoteMCPServers(rawData interface{}) []ServerEntry {
-	servers := []ServerEntry{}
-
-	data, ok := rawData.(map[string]interface{})
-	if !ok {
-		return servers
-	}
-
-	serversData, ok := data["servers"]
-	if !ok {
-		return servers
-	}
-
-	serversArray, ok := serversData.([]interface{})
-	if !ok {
-		return servers
-	}
-
-	for _, item := range serversArray {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		// Extract basic fields from the simple format
-		id, _ := itemMap["id"].(string)
-		name, _ := itemMap["name"].(string)
-		url, _ := itemMap["url"].(string)
-		auth, _ := itemMap["auth"].(string)
-
-		if id == "" || name == "" || url == "" {
-			continue
-		}
-
-		server := ServerEntry{
-			ID:   id,
-			Name: name,
-			URL:  url,
-		}
-
-		// Create description based on auth type and server name
-		switch auth {
-		case "oauth":
-			server.Description = fmt.Sprintf("%s (OAuth authentication required)", name)
-		case "open":
-			server.Description = fmt.Sprintf("%s (Open access)", name)
-		default:
-			server.Description = fmt.Sprintf("%s (Authentication: %s)", name, auth)
-		}
-
-		servers = append(servers, server)
-	}
-
-	return servers
 }
 
 // parsePulseWithoutGuesser handles Pulse registry format without repository guessing
@@ -736,73 +613,6 @@ func parsePulseWithoutGuesser(rawData interface{}) []ServerEntry {
 		// Store source_code_url for later batch processing
 		if sourceCodeURL, ok := itemMap["source_code_url"].(string); ok && sourceCodeURL != "" {
 			server.SourceCodeURL = sourceCodeURL
-		}
-
-		servers = append(servers, server)
-	}
-
-	return servers
-}
-
-// parseAzureMCPDemoWithoutGuesser handles Azure MCP Demo registry format without repository guessing
-func parseAzureMCPDemoWithoutGuesser(rawData interface{}) []ServerEntry {
-	servers := []ServerEntry{}
-
-	data, ok := rawData.(map[string]interface{})
-	if !ok {
-		return servers
-	}
-
-	serversData, ok := data["servers"]
-	if !ok {
-		return servers
-	}
-
-	serversArray, ok := serversData.([]interface{})
-	if !ok {
-		return servers
-	}
-
-	for _, item := range serversArray {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		// Extract basic fields
-		id, _ := itemMap["id"].(string)
-		name, _ := itemMap["name"].(string)
-		description, _ := itemMap["description"].(string)
-
-		if id == "" || name == "" {
-			continue
-		}
-
-		server := ServerEntry{
-			ID:          id,
-			Name:        name,
-			Description: description,
-		}
-
-		// Extract repository information for constructing URLs
-		if repo, ok := itemMap["repository"].(map[string]interface{}); ok {
-			if repoURL, ok := repo["url"].(string); ok && repoURL != "" {
-				// Store repository URL for later batch processing
-				server.SourceCodeURL = repoURL
-			}
-		}
-
-		// Extract version information for additional context
-		if versionDetail, ok := itemMap["version_detail"].(map[string]interface{}); ok {
-			if version, ok := versionDetail["version"].(string); ok && version != "" {
-				// Add version info to description if available
-				if server.Description != "" {
-					server.Description += " (v" + version + ")"
-				}
-			}
-			if releaseDate, ok := versionDetail["release_date"].(string); ok && releaseDate != "" {
-				server.UpdatedAt = releaseDate
-			}
 		}
 
 		servers = append(servers, server)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 )
 
 // ToolInfo represents a cached tool definition.
@@ -14,6 +15,9 @@ type ToolInfo struct {
 	Description string
 	InputSchema map[string]interface{}
 	Annotations *config.ToolAnnotations
+	// OutputSchemaJSON is the tool's declared output schema (raw JSON), empty
+	// when the tool declares none. Used for output-schema validation (Spec 056).
+	OutputSchemaJSON string
 }
 
 // ServerStatus represents the runtime status of an upstream server.
@@ -32,6 +36,10 @@ type ServerStatus struct {
 	ToolCount      int
 	Tools          []ToolInfo // Phase 7.1: Cached tool list for lock-free reads
 	Metadata       map[string]interface{}
+	// Diagnostic is the most recent classified failure for this server, or nil
+	// when the server is healthy (or the last failure has not yet been classified).
+	// Spec 044.
+	Diagnostic *diagnostics.DiagnosticError
 }
 
 // ServerStatusSnapshot is an immutable snapshot of all server statuses.
@@ -111,6 +119,10 @@ func (v *View) UpdateServer(name string, fn func(*ServerStatus)) {
 				newStatus.Metadata[mk] = mv
 			}
 		}
+		if vs.Diagnostic != nil {
+			d := *vs.Diagnostic
+			newStatus.Diagnostic = &d
+		}
 		newServers[k] = &newStatus
 	}
 
@@ -177,6 +189,10 @@ func (v *View) RemoveServer(name string) {
 			for mk, mv := range vs.Metadata {
 				newStatus.Metadata[mk] = mv
 			}
+		}
+		if vs.Diagnostic != nil {
+			d := *vs.Diagnostic
+			newStatus.Diagnostic = &d
 		}
 		newServers[k] = &newStatus
 	}

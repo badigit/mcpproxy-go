@@ -11,9 +11,31 @@ components:
         activity_max_response_size:
           description: 'Response truncation limit in bytes (default: 65536)'
           type: integer
+        activity_max_size_mb:
+          description: 'Max total activity-log size in MB before pruning oldest (default:
+            256, 0=disabled)'
+          type: integer
         activity_retention_days:
           description: Activity logging settings (RFC-003)
           type: integer
+        allow_private_registry_fetch:
+          description: |-
+            AllowPrivateRegistryFetch opts out of the registry SSRF guard (MCP-1076,
+            CWE-918). By default (false) registry fetches refuse any host that is — or
+            resolves to — a non-routable address (loopback, RFC1918/CGNAT private,
+            link-local incl. the 169.254.169.254 cloud-metadata endpoint), so a
+            malicious or typo'd registry source cannot turn the daemon into a
+            request-forgery vector against internal services.
+
+            This opt-out is BLANKET (all-or-nothing): setting it true disables the
+            guard for EVERY non-routable range at once — loopback, RFC1918/CGNAT
+            private, link-local AND the 169.254.169.254 cloud-metadata endpoint. There
+            is no way to allow only loopback; enabling it for a localhost dev registry
+            also re-opens the cloud-metadata SSRF vector. Set true ONLY when you
+            intentionally run a trusted registry mirror on an internal/private address,
+            ideally on a host with no cloud-metadata exposure. The change takes effect
+            only on daemon (re)start or config reload.
+          type: boolean
         allow_server_add:
           type: boolean
         allow_server_remove:
@@ -62,6 +84,33 @@ components:
           $ref: '#/components/schemas/secureenv.EnvConfig'
         features:
           $ref: '#/components/schemas/config.FeatureFlags'
+        forward_proxy_env:
+          description: |-
+            ForwardProxyEnv opts in to forwarding the ambient HTTP(S)/ALL/NO/FTP proxy
+            environment variables to spawned stdio upstream servers (MCP-2769). OFF by
+            default: proxy URLs commonly embed credentials (http://user:pass@proxy), so
+            forwarding them to every upstream is a credential-leak risk. When enabled,
+            values are forwarded with their userinfo (credentials) redacted.
+          type: boolean
+        health_check_interval:
+          description: |-
+            Discovery & health-check cadence (spec 074, #608). Both are *Duration
+            tri-state pointers: nil = inherit the built-in default; a pointer to 0s =
+            the loop is disabled; a positive value = that interval. Defaults live only
+            in the resolvers (ResolveHealthCheckInterval / ResolveToolDiscoveryInterval)
+            so an unset key behaves exactly as before this feature (SC-005). Validated
+            in Validate(): health-check ∈ {0} ∪ [5s,1h]; tool-discovery ∈ {0} ∪ [30s,24h].
+          type: string
+        init_timeout:
+          description: |-
+            InitTimeout is the global default deadline for an upstream's MCP
+            `initialize` handshake (MCP-3322 / GH #760). *Duration tri-state: nil =
+            inherit the built-in 30s default; a positive value = that deadline. A
+            per-server InitTimeout overrides this. Resolved by ResolveInitTimeout;
+            validated to {0} ∪ [1s, 30m] in Validate(). Servers doing legitimate
+            first-run warmup (cache/index build) before answering `initialize` can
+            raise this so they are not killed mid-startup.
+          type: string
         instructions:
           description: |-
             Instructions text returned in the MCP initialize response to guide AI agents.
@@ -86,6 +135,21 @@ components:
         oauth_expiry_warning_hours:
           description: Health status settings
           type: number
+        observability:
+          $ref: '#/components/schemas/config.ObservabilityConfig'
+        output_sanitisation:
+          $ref: '#/components/schemas/config.OutputSanitisationConfig'
+        output_validation:
+          $ref: '#/components/schemas/config.OutputValidationConfig'
+        profiles:
+          description: |-
+            Profiles are optional named, server-scoped views exposed at /mcp/p/<name>
+            (Spec 057). Absent/empty is fully supported — /mcp is unchanged and configs
+            without this key serialize byte-identically (SC-004).
+          items:
+            $ref: '#/components/schemas/config.ProfileConfig'
+          type: array
+          uniqueItems: false
         quarantine_enabled:
           description: |-
             QuarantineEnabled controls whether quarantine is active. It gates two
@@ -108,8 +172,35 @@ components:
             $ref: '#/components/schemas/config.RegistryEntry'
           type: array
           uniqueItems: false
+        registries_locked:
+          description: |-
+            RegistriesLocked is an enterprise stub knob (MCP-866): when true, runtime
+            additions of custom registries (e.g. `registry add-source`, the REST/MCP
+            add-source surface) are rejected so an administrator can pin the discovery
+            sources. Built-in defaults are unaffected. Documented but otherwise inert
+            beyond the add-source rejection.
+          type: boolean
         require_mcp_auth:
           description: 'Require authentication on /mcp endpoint (default: false)'
+          type: boolean
+        reveal_secret_headers:
+          description: |-
+            RevealSecretHeaders, when true, disables the redaction of sensitive
+            header values (Authorization, X-API-Key, Cookie, …) in responses
+            from the `upstream_servers` MCP tool, the `/api/v1/servers` REST
+            API, and the SSE event stream.
+
+            Default false — sensitive header values are surfaced as
+            `***REDACTED***` so an MCP agent cannot read Bearer tokens / API
+            keys out of another upstream's config (PR #425).
+
+            The Web UI / macOS tray edit forms work without seeing the real
+            values: PATCH /api/v1/servers/{id} deep-merges (omitted keys are
+            preserved, see `headers_remove` / `env_remove` for explicit
+            deletes), so clients compute a diff and only send the keys that
+            actually changed. Redacted-but-unchanged values never round-trip
+            — the backend keeps the real string. Set this to true if a
+            downstream tool genuinely needs raw values in the response.
           type: boolean
         routing_mode:
           description: |-
@@ -126,10 +217,50 @@ components:
           $ref: '#/components/schemas/config.TLSConfig'
         tokenizer:
           $ref: '#/components/schemas/config.TokenizerConfig'
+        tool_discovery_interval:
+          type: string
         tool_response_limit:
           type: integer
+        tool_response_mode:
+          description: |-
+            Tool response mode (Spec 085): how retrieve_tools serializes results.
+            Valid values: "" (= full), "full" (default: today's schema-bearing
+            entries), "compact" (signature + first-sentence entries). Orthogonal to
+            routing_mode — routing_mode selects the tool SURFACE, this selects the
+            SERIALIZATION within the retrieve_tools surface. Serialization-only: it
+            never affects the query, ranking, or result set. Hot-reloadable.
+          type: string
+        tool_response_session_risk_warning:
+          description: |-
+            ToolResponseSessionRiskWarning controls whether the prose `warning` field
+            is included in the `session_risk` object returned by `retrieve_tools`.
+            The structured fields (level, lethal_trifecta, has_open_world_tools, etc.)
+            are always included. Default: false (quiet for LLM clients) — see issue #406.
+            Most tools lack annotations, so the MCP-spec defaults treat them as fully
+            permissive across all three risk axes, which makes the prose warning fire
+            on almost every call and wastes tokens.
+          type: boolean
         tools_limit:
           type: integer
+        toon_min_savings_pct:
+          description: |-
+            ToonMinSavingsPct is the minimum byte-savings percentage (validated
+            1-90; 0/unset → 15) the complete TOON emission (marker + hint + body)
+            must achieve over the exact passthrough emission for adaptive mode to
+            encode a block. Byte savings approximate token savings for the tabular
+            payload class; the spec-083 profiler reports true token deltas.
+            Global-only (no per-server override, FR-001).
+          type: integer
+        toon_output:
+          description: |-
+            ToonOutput selects the TOON encoding mode for call_tool_* result text
+            blocks (spec 084): "off" (default — responses byte-identical to
+            pre-feature behavior), "adaptive" (encode only tabular-uniform payloads
+            that beat compact JSON by ToonMinSavingsPct), or "always"
+            (benchmark/debug only — encodes every JSON-parseable block and can
+            INCREASE token cost). Per-server override: ServerConfig.ToonOutput.
+            Resolved by ResolveToonOutput; hot-reloadable.
+          type: string
         top_k:
           description: 'Deprecated: TopK is superseded by ToolsLimit and has no runtime
             effect. Kept for backward compatibility.'
@@ -137,6 +268,8 @@ components:
         tray_endpoint:
           description: Tray endpoint override (unix:// or npipe://)
           type: string
+        update_check:
+          $ref: '#/components/schemas/config.UpdateCheckConfig'
       type: object
     config.CustomPattern:
       properties:
@@ -159,6 +292,42 @@ components:
           description: 'Risk level: critical, high, medium, low'
           type: string
       type: object
+    config.DeepScanConfig:
+      description: |-
+        DeepScan is the opt-in "deep scan" layer (Spec 077 US3). It subsumes the
+        deprecated top-level scanner_fetch_package_source / scanner_disable_no_new_privileges
+        keys (migrated on load) and gates the heavy Docker-based scanners + source
+        extraction. Disabled by default (FR-006): only the deterministic in-process
+        baseline scanner runs. A deep-scan failure NEVER changes the baseline verdict
+        (FR-007/FR-008).
+      properties:
+        disable_no_new_privileges:
+          description: |-
+            DisableNoNewPrivileges, when true, omits the `--security-opt
+            no-new-privileges` flag from scanner container runs (snap-docker/AppArmor
+            escape hatch). Absorbs the deprecated top-level
+            scanner_disable_no_new_privileges. Default false.
+          type: boolean
+        enabled:
+          description: Enabled is the master opt-in for the heavy layer (FR-006).
+            Default false.
+          type: boolean
+        fetch_package_source:
+          description: |-
+            FetchPackageSource controls whether the scanner fetches the PUBLISHED
+            source of package-runner servers (npx/uvx) — without executing it — when
+            no local source is available. Absorbs the deprecated top-level
+            scanner_fetch_package_source. Default (nil) is ENABLED within deep scan.
+          type: boolean
+        scanners:
+          description: |-
+            Scanners optionally restricts which deep scanners may run under the
+            umbrella (by scanner id). Empty ⇒ all enabled deep scanners are eligible.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+      type: object
     config.DockerIsolationConfig:
       description: Docker isolation settings
       properties:
@@ -174,7 +343,8 @@ components:
           description: 'Mount shared cache volumes for faster restarts (default: true)'
           type: boolean
         enabled:
-          description: Global enable/disable for Docker isolation
+          description: Global enable/disable for Docker isolation (legacy; superseded
+            by Mode)
           type: boolean
         extra_args:
           description: Additional docker run arguments
@@ -194,6 +364,15 @@ components:
         memory_limit:
           description: Memory limit for containers
           type: string
+        mode:
+          description: 'Isolation mode: "docker" | "sandbox" | "none" (MCP-34.2).
+            Unset per-server inherits the global mode; unset globally falls back to
+            the legacy "enabled" flag (true ⇒ docker, false ⇒ none)'
+          type: string
+          x-enum-varnames:
+          - IsolationModeDocker
+          - IsolationModeSandbox
+          - IsolationModeNone
         network_mode:
           description: 'Docker network mode (default: bridge)'
           type: string
@@ -288,7 +467,8 @@ components:
       description: Per-server isolation settings
       properties:
         enabled:
-          description: Enable Docker isolation for this server (nil = inherit global)
+          description: Enable Docker isolation for this server (nil = inherit global;
+            legacy, superseded by Mode)
           type: boolean
         extra_args:
           description: Additional docker run arguments for this server
@@ -308,6 +488,8 @@ components:
         log_max_size:
           description: Maximum size of log files override
           type: string
+        mode:
+          $ref: '#/components/schemas/config.IsolationMode'
         network_mode:
           description: Custom network mode for this server
           type: string
@@ -315,6 +497,15 @@ components:
           description: Custom working directory in container
           type: string
       type: object
+    config.IsolationMode:
+      description: 'Isolation mode: "docker" | "sandbox" | "none" (MCP-34.2). Unset
+        per-server inherits the global mode; unset globally falls back to the legacy
+        "enabled" flag (true ⇒ docker, false ⇒ none)'
+      type: string
+      x-enum-varnames:
+      - IsolationModeDocker
+      - IsolationModeSandbox
+      - IsolationModeNone
     config.LogConfig:
       description: Logging configuration
       properties:
@@ -343,6 +534,16 @@ components:
           description: MB
           type: integer
       type: object
+    config.MetricsExporterConfig:
+      description: |-
+        Metrics gates the Prometheus /metrics scrape endpoint (MCP-32). Disabled
+        by default — operators opt in for k8s/enterprise deployments.
+      properties:
+        enabled:
+          description: Enabled exposes /metrics on the existing HTTP listener when
+            true.
+          type: boolean
+      type: object
     config.OAuthConfig:
       description: OAuth configuration (keep even when empty to signal OAuth requirement)
       properties:
@@ -365,6 +566,75 @@ components:
           type: array
           uniqueItems: false
       type: object
+    config.ObservabilityConfig:
+      description: 'Observability settings (Spec 069): usage aggregate cache/persistence
+        cadence.'
+      properties:
+        metrics:
+          $ref: '#/components/schemas/config.MetricsExporterConfig'
+        tracing:
+          $ref: '#/components/schemas/config.TracingExporterConfig'
+        usage_cache_ttl:
+          description: |-
+            UsageCacheTTL bounds the freshness of the usage endpoint's read cache for
+            wide windows (FR-005). Default 5s.
+          type: string
+        usage_persist_interval:
+          description: |-
+            UsagePersistInterval is how often the actor-owned usage aggregate snapshot
+            is flushed to storage. Default 30s.
+          type: string
+      type: object
+    config.OutputSanitisationConfig:
+      description: Output sanitisation settings (Spec 054 Track B)
+      properties:
+        max_redactions:
+          description: cap on redactions per response; default 100
+          type: integer
+        response_action:
+          description: '"spotlight" | "redact" | "block"; default "spotlight"'
+          type: string
+        spotlight_untrusted:
+          description: wrap untrusted output in spotlight markers; default true
+          type: boolean
+        strip_classes:
+          description: 'classes to strip: ansi/c0c1/bidi/zero_width'
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        strip_control_chars:
+          description: strip control-character classes; default false
+          type: boolean
+      type: object
+    config.OutputValidationConfig:
+      description: Output-schema validation settings (Spec 056)
+      properties:
+        max_bytes:
+          description: structured payload byte cap; default 5<<20
+          type: integer
+        max_depth:
+          description: nesting depth cap; default 64
+          type: integer
+        missing_structured_content:
+          description: '"allow" | "block"; default "allow"'
+          type: string
+        mode:
+          description: '"off" | "warn" | "strict"; default "warn"'
+          type: string
+      type: object
+    config.ProfileConfig:
+      properties:
+        name:
+          description: URL slug, validated
+          type: string
+        servers:
+          description: references to mcpServers[].name
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+      type: object
     config.RegistryEntry:
       properties:
         count:
@@ -378,6 +648,20 @@ components:
           type: string
         protocol:
           type: string
+        provenance:
+          description: |-
+            Provenance is the trust tag for this registry (MCP-866):
+            RegistryProvenanceOfficial for built-in defaults, RegistryProvenanceCustom
+            for user-added registries. It is authoritatively (re)computed by the
+            registries merge from whether the ID is a shipped default — a user cannot
+            claim "official" by writing it into their config.
+          type: string
+        requires_key:
+          description: |-
+            RequiresKey marks a registry that needs an API key to be queried. When
+            true and no key is configured, the registry is skipped/marked unavailable
+            rather than failing the whole search (FR-008).
+          type: boolean
         servers_url:
           type: string
         tags:
@@ -391,8 +675,8 @@ components:
     config.SecurityConfig:
       description: Security scanner settings (Spec 039)
       properties:
-        auto_scan_quarantined:
-          type: boolean
+        deep_scan:
+          $ref: '#/components/schemas/config.DeepScanConfig'
         integrity_check_interval:
           type: string
         integrity_check_on_restart:
@@ -405,6 +689,11 @@ components:
           type: string
         scanner_disable_no_new_privileges:
           description: |-
+            Deprecated (Spec 077 US3): migrated on load into DeepScan.DisableNoNewPrivileges
+            (see migrateDeepScanConfig). Retained only so existing configs that still carry
+            the top-level key parse; consumers MUST read the effective value via
+            SecurityConfig.IsDisableNoNewPrivileges. Cleared after migration.
+
             ScannerDisableNoNewPrivileges, when true, omits the
             `--security-opt no-new-privileges` flag from scanner container runs.
 
@@ -420,6 +709,34 @@ components:
             default, and read-only source mounts, so the marginal isolation loss
             is small. The preferred fix remains replacing snap docker with a
             distro-packaged docker.
+          type: boolean
+        scanner_fetch_package_source:
+          description: |-
+            Deprecated (Spec 077 US3): migrated on load into DeepScan.FetchPackageSource
+            (see migrateDeepScanConfig). Retained only so existing configs that still carry
+            the top-level key parse; consumers MUST read the effective value via
+            SecurityConfig.EffectiveFetchPackageSource. Cleared after migration.
+
+            ScannerFetchPackageSource controls whether the scanner fetches the
+            PUBLISHED source of package-runner servers (npx/uvx) — without executing
+            it — when no local source is available (no Docker container, no local
+            package cache, no working_dir). This is the primary quarantine/scan
+            target: a quarantined-on-add server is never run locally, so without this
+            the scan degrades to tool-definitions-only (no real source-level
+            analysis). See MCP-2206.
+
+            Fetching uses `npm pack --ignore-scripts` (npm) and `uv pip download` /
+            `pip download` with `--only-binary=:all:` (Python), which only download +
+            unpack archives and NEVER run install, build, or setup.py — a scanner must
+            not execute the untrusted code it is scanning. The Python
+            `--only-binary=:all:` flag is required because downloading an sdist would
+            invoke its build backend (setup.py); packages with no wheel fall back to
+            tool-definitions-only instead. Extraction is hardened against path
+            traversal and decompression bombs.
+
+            Default (nil) is ENABLED. Set to false on air-gapped deployments to
+            forbid the scanner's network egress; such servers then fall back to the
+            tool-definitions-only scan with no regression.
           type: boolean
         scanner_registry_url:
           type: string
@@ -463,35 +780,44 @@ components:
       type: object
     config.ServerConfig:
       properties:
-        annotation_defaults:
-          $ref: '#/components/schemas/config.ToolAnnotations'
         args:
           items:
             type: string
           type: array
           uniqueItems: false
+        auto_approve_tool_changes:
+          description: |-
+            AutoApproveToolChanges is the per-server intent to auto-approve tool
+            changes/additions (disabling per-server rug-pull protection). Supersedes
+            skip_quarantine. MCP-2930 only ACCEPTS, persists, and migrates this flag — it
+            is NOT yet consulted at runtime; auto-approval is still governed by
+            SkipQuarantine until the trust-baseline behavior change (MCP-2931) migrates the
+            runtime consumers onto it.
+            Tri-state pointer (mirrors QuarantineEnabled): nil = unset (inherit/migrate
+            from legacy skip_quarantine), explicit true/false = honored as-is so an
+            explicit auto_approve_tool_changes:false overrides a legacy skip_quarantine:true.
+            Read via IsAutoApproveToolChanges().
+          type: boolean
         command:
           type: string
         created:
           type: string
-        disable_enrichment:
-          description: |-
-            DisableEnrichment skips the LLM enrichment step for this server even
-            when enrichment is globally enabled. Useful for servers whose tool
-            descriptions are already high quality or for air-gapped environments.
-          type: boolean
-        domain_tags:
-          description: |-
-            DomainTags classifies this server into high-level domains used for
-            catalog grouping in retrieve_tools responses (e.g. ["crm", "sales"]).
-            First entry is the server's default tool domain when no per-tool
-            override is known.
+        disabled_tools:
+          description: 'Denylist: these tools are hidden; mutually exclusive with
+            enabled_tools'
           items:
             type: string
           type: array
           uniqueItems: false
         enabled:
           type: boolean
+        enabled_tools:
+          description: 'Allowlist: only these tools are exposed; mutually exclusive
+            with disabled_tools'
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         env:
           additionalProperties:
             type: string
@@ -501,8 +827,35 @@ components:
             type: string
           description: For HTTP servers
           type: object
+        health_check_interval:
+          description: |-
+            Per-server discovery & health-check overrides (spec 074). Same *Duration
+            tri-state as the global keys: nil = inherit the global value (or default),
+            pointer to 0s = disabled for this server, positive = that interval.
+            HealthCheckInterval is fully wired into the per-server health loop;
+            ToolDiscoveryInterval is accepted/validated and round-trips for
+            forward-compat, but the periodic index sweep is governed by the global
+            cadence in this iteration (see spec 074 plan §C).
+          type: string
+        init_timeout:
+          description: |-
+            InitTimeout overrides the global init_timeout for this server's MCP
+            `initialize` handshake deadline (MCP-3322 / GH #760). *Duration tri-state:
+            nil = inherit the global value (or 30s default), positive = that deadline.
+            Resolved by Config.ResolveInitTimeout; validated to {0} ∪ [1s, 30m]. Raise
+            this for upstreams that do legitimate first-run warmup (e.g. caching many
+            channels/users) before responding to `initialize`.
+          type: string
         isolation:
           $ref: '#/components/schemas/config.IsolationConfig'
+        launcher_wait_timeout:
+          description: |-
+            LauncherWaitTimeout caps how long mcpproxy will wait for a locally-launched
+            HTTP/SSE upstream's URL to become reachable after Spawn(). Only consulted
+            when the server is configured with both Command and an HTTP/SSE URL — i.e.,
+            mcpproxy starts the process AND connects via network. Stdio servers ignore
+            this field. Zero or unset → 30s default.
+          type: string
         name:
           type: string
         oauth:
@@ -517,31 +870,38 @@ components:
           description: Attempt reconnection when a tool call targets a disconnected
             server
           type: boolean
-        search_aliases:
-          description: |-
-            SearchAliases adds keywords that boost every tool on this server when
-            matched by a retrieve_tools query. Use for cross-language synonyms,
-            short forms, or common misspellings (e.g. ["битрикс", "b24", "crm"]).
-          items:
-            type: string
-          type: array
-          uniqueItems: false
         shared:
           description: 'Server edition: shared with all users'
           type: boolean
         skip_quarantine:
-          description: Skip tool-level quarantine for this server
-          type: boolean
-        tool_aliases:
-          additionalProperties:
-            items:
-              type: string
-            type: array
           description: |-
-            ToolAliases maps a tool's base name (without the server prefix) to
-            extra keywords that boost only that tool. Takes precedence over
-            SearchAliases and LLM-derived keywords at the same rank.
-          type: object
+            SkipQuarantine is DEPRECATED (MCP-2930): use AutoApproveToolChanges instead.
+            Kept for back-compat parsing; on config load a legacy skip_quarantine:true is
+            migrated to auto_approve_tool_changes:true only when the new field is unset
+            (see normalizeServerQuarantineFlags).
+          type: boolean
+        source_registry_id:
+          description: |-
+            SourceRegistryID records which registry this server was added from (empty
+            for manually-configured servers). MCP-866: surfaced in the approval /
+            quarantine view so a reviewer can see a server's origin.
+          type: string
+        source_registry_provenance:
+          description: |-
+            SourceRegistryProvenance records the source registry's provenance at add
+            time (RegistryProvenanceOfficial / RegistryProvenanceCustom). It is purely
+            informational (MCP-1072) — surfaced so a reviewer can see a server's origin
+            — and no longer gates quarantine or skip_quarantine.
+          type: string
+        tool_discovery_interval:
+          type: string
+        toon_output:
+          description: |-
+            ToonOutput overrides the global toon_output mode for this server's
+            tools (spec 084, FR-001). Plain string, not a pointer: ""/absent =
+            inherit the global value; "off"|"adaptive"|"always" = override ("off"
+            is the explicit force-off). Resolved by Config.ResolveToonOutput.
+          type: string
         updated:
           type: string
         url:
@@ -604,22 +964,51 @@ components:
           description: Default encoding (e.g., "cl100k_base")
           type: string
       type: object
-    config.ToolAnnotations:
+    config.TracingExporterConfig:
       description: |-
-        AnnotationDefaults provides fallback tool annotations for upstream servers
-        that don't supply their own. Individual hint fields are applied only when
-        the upstream tool has nil for that specific hint (per-field merge).
+        Tracing gates the OpenTelemetry OTLP trace exporter (MCP-32). Disabled by
+        default.
       properties:
-        destructiveHint:
+        enabled:
+          description: Enabled turns on OTLP trace export for tool calls and upstream
+            hops.
           type: boolean
-        idempotentHint:
-          type: boolean
-        openWorldHint:
-          type: boolean
-        readOnlyHint:
-          type: boolean
-        title:
+        endpoint:
+          description: |-
+            Endpoint is the collector address as host:port (no scheme), e.g.
+            "localhost:4318" for http or "localhost:4317" for grpc.
           type: string
+        protocol:
+          description: 'Protocol selects the OTLP transport: "http" or "grpc".'
+          type: string
+        sample_rate:
+          description: SampleRate is the head-based trace sampling ratio in [0,1].
+            Default 0.1.
+          type: number
+      type: object
+    config.UpdateCheckConfig:
+      description: |-
+        Update-check settings (Spec 079 FR-012): config-file control of the
+        background upgrade-awareness checker (internal/updatecheck). nil =
+        enabled on the stable channel (existing default behavior). The existing
+        environment switches keep working and WIN over these keys (FR-014):
+        MCPPROXY_DISABLE_AUTO_UPDATE=true force-disables even when
+        enabled=true, and MCPPROXY_ALLOW_PRERELEASE_UPDATES=true force-selects
+        the rc channel even when channel=stable.
+      properties:
+        channel:
+          description: |-
+            Channel selects which releases are offered as updates: "stable"
+            (default; prereleases never offered) or "rc" (prereleases included).
+            Empty resolves to stable. Validated in ValidateDetailed.
+          type: string
+        enabled:
+          description: |-
+            Enabled gates all update checking. Tri-state: nil/absent = enabled
+            (default true, matching pre-079 behavior). When false, no network
+            check is performed and no upgrade nudge appears on any surface
+            (FR-015) — /api/v1/info omits the update object entirely.
+          type: boolean
       type: object
     configimport.FailedServer:
       properties:
@@ -723,7 +1112,7 @@ components:
           description: Name of upstream MCP server
           type: string
         session_id:
-          description: MCP session ID for correlation
+          description: MCP transport session ID (regenerated on every reconnect)
           type: string
         source:
           $ref: '#/components/schemas/contracts.ActivitySource'
@@ -738,6 +1127,9 @@ components:
           type: string
         type:
           $ref: '#/components/schemas/contracts.ActivityType'
+        work_session_id:
+          description: 'Spec 082: one client, one project, across reconnects'
+          type: string
       type: object
     contracts.ActivitySource:
       description: 'How activity was triggered: "mcp", "cli", "api"'
@@ -811,6 +1203,35 @@ components:
       - ActivityTypePolicyDecision
       - ActivityTypeQuarantineChange
       - ActivityTypeServerChange
+    contracts.AddFromRegistryRequest:
+      properties:
+        enabled:
+          description: defaults to true when nil
+          type: boolean
+        env:
+          additionalProperties:
+            type: string
+          description: overrides + required-input values
+          type: object
+        name:
+          description: optional name override
+          type: string
+      type: object
+    contracts.AddRegistrySourceRequest:
+      properties:
+        id:
+          description: derived from the host when empty
+          type: string
+        name:
+          description: defaults to the id
+          type: string
+        protocol:
+          description: defaults to modelcontextprotocol/registry
+          type: string
+        url:
+          description: required https registry URL
+          type: string
+      type: object
     contracts.ConfigApplyResult:
       properties:
         applied_immediately:
@@ -843,6 +1264,40 @@ components:
         success:
           type: boolean
       type: object
+    contracts.DeepScanDescriptor:
+      description: |-
+        DeepScan reports the opt-in "deep scan" layer status (Spec 077 US3),
+        SEPARATELY from the baseline verdict above. Always emitted on a computed
+        summary — when deep scan is off (the default) it reports enabled=false
+        plus any enabled-but-skipped Docker scanners. It never influences Status.
+      properties:
+        available:
+          type: boolean
+        enabled:
+          type: boolean
+        ran:
+          type: boolean
+        scanners_failed:
+          items:
+            $ref: '#/components/schemas/contracts.DeepScanScannerFailure'
+          type: array
+          uniqueItems: false
+        skipped_scanners:
+          description: |-
+            SkippedScanners lists Docker scanners the user enabled that are skipped
+            because security.deep_scan.enabled is false (informational).
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+      type: object
+    contracts.DeepScanScannerFailure:
+      properties:
+        id:
+          type: string
+        reason:
+          type: string
+      type: object
     contracts.DeprecatedConfigWarning:
       properties:
         field:
@@ -850,6 +1305,46 @@ components:
         message:
           type: string
         replacement:
+          type: string
+      type: object
+    contracts.Diagnostic:
+      description: |-
+        Spec 044 — structured diagnostic error and stable error code. Both
+        are populated when the server is in a failed state and the error
+        has been classified by internal/diagnostics. Healthy servers omit
+        these fields.
+      properties:
+        cause:
+          type: string
+        code:
+          type: string
+        detected_at:
+          type: string
+        docs_url:
+          type: string
+        fix_steps:
+          items:
+            $ref: '#/components/schemas/contracts.DiagnosticFixStep'
+          type: array
+          uniqueItems: false
+        severity:
+          type: string
+        user_message:
+          type: string
+      type: object
+    contracts.DiagnosticFixStep:
+      properties:
+        command:
+          type: string
+        destructive:
+          type: boolean
+        fixer_key:
+          type: string
+        label:
+          type: string
+        type:
+          type: string
+        url:
           type: string
       type: object
     contracts.Diagnostics:
@@ -901,6 +1396,18 @@ components:
         error:
           type: string
         version:
+          type: string
+      type: object
+    contracts.EditRegistrySourceRequest:
+      properties:
+        name:
+          description: new display name
+          type: string
+        servers_url:
+          description: explicit servers-collection URL
+          type: string
+        url:
+          description: new base/servers https URL
           type: string
       type: object
     contracts.ErrorResponse:
@@ -1029,6 +1536,34 @@ components:
         total:
           type: integer
       type: object
+    contracts.GlobalToolsResponse:
+      properties:
+        failed_servers:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        partial:
+          type: boolean
+        stats:
+          $ref: '#/components/schemas/contracts.GlobalToolsStats'
+        tools:
+          items:
+            $ref: '#/components/schemas/contracts.Tool'
+          type: array
+          uniqueItems: false
+      type: object
+    contracts.GlobalToolsStats:
+      properties:
+        disabled:
+          type: integer
+        enabled:
+          type: integer
+        pending_approval:
+          type: integer
+        total:
+          type: integer
+      type: object
     contracts.HealthStatus:
       description: Unified health status calculated by the backend
       properties:
@@ -1084,11 +1619,38 @@ components:
           type: string
         enabled:
           type: boolean
+        extra_args:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         image:
           type: string
         memory_limit:
           type: string
+        network_mode:
+          type: string
         timeout:
+          type: string
+        working_dir:
+          type: string
+      type: object
+    contracts.IsolationDefaults:
+      description: |-
+        IsolationDefaults exposes the resolved baseline values that
+        would apply when no per-server override is set. Populated on
+        list/get responses; never consumed on PATCH requests.
+      properties:
+        extra_args:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        image:
+          type: string
+        network_mode:
+          type: string
+        runtime_type:
           type: string
         working_dir:
           type: string
@@ -1136,6 +1698,14 @@ components:
           type: integer
         total_tokens:
           type: integer
+        work_session_id:
+          type: string
+        workspace_name:
+          description: |-
+            Workspace / work session (Spec 082). WorkspaceName is the project's
+            basename — the full local path is never exposed. WorkSessionID groups the
+            reconnects that make up one stretch of user work.
+          type: string
       type: object
     contracts.MetadataStatus:
       properties:
@@ -1296,12 +1866,23 @@ components:
     contracts.QuarantineStats:
       description: Tool quarantine metrics for this server
       properties:
+        blocked_count:
+          description: Number of disabled (blocked) tools
+          type: integer
         changed_count:
           description: Number of tools whose description/schema changed since approval
           type: integer
         pending_count:
           description: Number of newly discovered tools awaiting approval
           type: integer
+      type: object
+    contracts.RefreshRegistryResponse:
+      properties:
+        cleared:
+          description: number of cached entries dropped
+          type: integer
+        registry_id:
+          type: string
       type: object
     contracts.Registry:
       properties:
@@ -1316,6 +1897,11 @@ components:
           type: string
         protocol:
           type: string
+        provenance:
+          description: |-
+            Provenance is the trust tag (MCP-866): "official/trusted" for built-in
+            defaults, "custom/unverified" for user-added registries.
+          type: string
         servers_url:
           type: string
         tags:
@@ -1323,7 +1909,25 @@ components:
             type: string
           type: array
           uniqueItems: false
+        trusted:
+          description: |-
+            Trusted indicates whether this is an official, shipped-by-default
+            registry. Trust is derived from membership in the default set, never
+            from self-assertion in config.
+          type: boolean
         url:
+          type: string
+      type: object
+    contracts.RegistryCacheInfo:
+      properties:
+        age_seconds:
+          type: number
+        stale:
+          type: boolean
+      type: object
+    contracts.RegistryUnavailable:
+      properties:
+        reason:
           type: string
       type: object
     contracts.ReplayToolCallRequest:
@@ -1386,6 +1990,8 @@ components:
       type: object
     contracts.SearchRegistryServersResponse:
       properties:
+        cache:
+          $ref: '#/components/schemas/contracts.RegistryCacheInfo'
         query:
           type: string
         registry_id:
@@ -1399,6 +2005,8 @@ components:
           type: string
         total:
           type: integer
+        unavailable:
+          $ref: '#/components/schemas/contracts.RegistryUnavailable'
       type: object
     contracts.SearchResult:
       properties:
@@ -1428,12 +2036,25 @@ components:
     contracts.SecurityScanSummary:
       description: Latest security scan results summary
       properties:
+        deep_scan:
+          $ref: '#/components/schemas/contracts.DeepScanDescriptor'
         finding_counts:
           $ref: '#/components/schemas/contracts.FindingCounts'
         last_scan_at:
           type: string
         risk_score:
           description: 0-100
+          type: integer
+        scanners_failed:
+          type: integer
+        scanners_run:
+          description: |-
+            Scanner coverage for the primary (baseline) scan pass — informational only.
+            Spec 077 US3 (FR-008/FR-014): Status is derived SOLELY from the
+            deterministic baseline findings; a failed Docker deep scanner no longer
+            downgrades a clean verdict. That failure is surfaced via DeepScan instead.
+          type: integer
+        scanners_total:
           type: integer
         status:
           description: '"clean", "warnings", "dangerous", "failed", "not_scanned",
@@ -1450,6 +2071,15 @@ components:
         authenticated:
           description: OAuth authentication status
           type: boolean
+        auto_approve_tool_changes:
+          description: |-
+            AutoApproveToolChanges mirrors config.ServerConfig.AutoApproveToolChanges
+            (MCP-2930): the per-server intent to auto-approve new/changed tools past
+            the trust baseline. Tri-state *bool — nil means "never set" (omitted from
+            the payload), so the Web UI toggle (MCP-2932) can distinguish unset from
+            an explicit false. Read-only on the GET path; PATCH/POST accept it via
+            AddServerRequest.
+          type: boolean
         command:
           type: string
         connected:
@@ -1460,12 +2090,16 @@ components:
           type: boolean
         created:
           type: string
+        diagnostic:
+          $ref: '#/components/schemas/contracts.Diagnostic'
         enabled:
           type: boolean
         env:
           additionalProperties:
             type: string
           type: object
+        error_code:
+          type: string
         headers:
           additionalProperties:
             type: string
@@ -1474,8 +2108,18 @@ components:
           $ref: '#/components/schemas/contracts.HealthStatus'
         id:
           type: string
+        init_timeout:
+          description: |-
+            InitTimeout mirrors config.ServerConfig.InitTimeout (MCP-3322 / GH #760):
+            the per-server MCP `initialize` handshake deadline override. Serialized as
+            a duration string (e.g. "120s"); nil/omitted means "inherit the global
+            default". Surfaced on the GET path so clients can read back a configured
+            override; PATCH/POST accept it via AddServerRequest.
+          type: string
         isolation:
           $ref: '#/components/schemas/contracts.IsolationConfig'
+        isolation_defaults:
+          $ref: '#/components/schemas/contracts.IsolationDefaults'
         last_error:
           type: string
         last_reconnect_at:
@@ -1507,6 +2151,18 @@ components:
           $ref: '#/components/schemas/contracts.SecurityScanSummary'
         should_retry:
           type: boolean
+        source_registry_id:
+          description: |-
+            MCP-901 — registry provenance of an upstream that was added from a
+            registry. SourceRegistryID names the source registry (empty for
+            manually-configured servers); SourceRegistryProvenance is the trust tag
+            recorded at add time ("official/trusted" or "custom/unverified"). Both
+            are projected from config.ServerConfig so the approval/quarantine view
+            can render an "added from <registry> · unverified" origin badge. Optional
+            and omitted when empty — clients that pre-date this treat them as absent.
+          type: string
+        source_registry_provenance:
+          type: string
         status:
           type: string
         token_expires_at:
@@ -1614,8 +2270,19 @@ components:
           $ref: '#/components/schemas/contracts.ToolAnnotation'
         approval_status:
           type: string
+        config_denied:
+          description: |-
+            ConfigDenied is true when the tool is denied by the server's static
+            enabled_tools / disabled_tools config. The user cannot override this toggle.
+          type: boolean
         description:
           type: string
+        disabled:
+          description: |-
+            Disabled mirrors ToolApprovalRecord.Disabled so per-tool enable state is
+            available without a second round-trip to the approvals endpoint. Absent
+            in the JSON when false (default) to keep responses compact.
+          type: boolean
         last_used:
           type: string
         name:
@@ -1709,6 +2376,10 @@ components:
         checked_at:
           description: When the update check was performed
           type: string
+        install_channel:
+          description: Detected install channel (homebrew, dmg, deb, rpm, docker,
+            go-install, windows-installer, tarball, unknown) — Spec 079 FR-008
+          type: string
         is_prerelease:
           description: Whether the latest version is a prerelease
           type: boolean
@@ -1717,6 +2388,10 @@ components:
           type: string
         release_url:
           description: URL to the release page
+          type: string
+        update_command:
+          description: One-line update command for the channel; only set when an update
+            is available and the channel has one — Spec 079 FR-009
           type: string
       type: object
     contracts.UpstreamError:
@@ -1727,6 +2402,91 @@ components:
           type: string
         timestamp:
           type: string
+      type: object
+    contracts.UsageAggregateResponse:
+      properties:
+        freshness_ms:
+          description: age of the underlying snapshot in ms
+          type: integer
+        generated_at:
+          type: string
+        other:
+          $ref: '#/components/schemas/contracts.UsageOtherBucket'
+        timeline:
+          items:
+            $ref: '#/components/schemas/contracts.UsageTimeBucket'
+          type: array
+          uniqueItems: false
+        token_source:
+          description: '"bytes" (size-based proxy, FR-006)'
+          type: string
+        tokens_saved:
+          description: echoed from ServerTokenMetrics (FR-007)
+          type: integer
+        tokens_saved_percentage:
+          type: number
+        tools:
+          items:
+            $ref: '#/components/schemas/contracts.UsageToolStat'
+          type: array
+          uniqueItems: false
+        window:
+          type: string
+      type: object
+    contracts.UsageOtherBucket:
+      description: present only when the list was truncated to top-N
+      properties:
+        calls:
+          type: integer
+        tools_folded:
+          type: integer
+        total_resp_bytes:
+          type: integer
+      type: object
+    contracts.UsageTimeBucket:
+      properties:
+        calls:
+          type: integer
+        errors:
+          type: integer
+        start:
+          type: string
+        total_resp_bytes:
+          type: integer
+      type: object
+    contracts.UsageToolStat:
+      properties:
+        avg_req_bytes:
+          description: null when no sized request calls
+          type: integer
+        avg_resp_bytes:
+          description: null when sized_calls == 0 (only legacy 0-byte calls)
+          type: integer
+        blocked:
+          type: integer
+        calls:
+          type: integer
+        error_rate:
+          type: number
+        errors:
+          type: integer
+        last_used:
+          type: string
+        p50_ms:
+          type: integer
+        p95_ms:
+          type: integer
+        server:
+          type: string
+        sized_calls:
+          description: calls with known response size (basis for avg_resp_bytes)
+          type: integer
+        tool:
+          type: string
+        total_req_bytes:
+          type: integer
+        total_resp_bytes:
+          type: integer
       type: object
     contracts.ValidateConfigResponse:
       properties:
@@ -1757,6 +2517,15 @@ components:
             type: string
           type: array
           uniqueItems: false
+        auto_approve_tool_changes:
+          description: |-
+            AutoApproveToolChanges is the per-server intent to auto-approve
+            new/changed tools past the trust baseline (MCP-2930). Tri-state *bool:
+            a nil pointer means "leave unchanged" on PATCH; a present value
+            (including false) is applied. Mirrors config.ServerConfig's *bool
+            semantics — do NOT collapse to a plain bool, or an omitted field would
+            silently reset a previously-set value.
+          type: boolean
         command:
           type: string
         enabled:
@@ -1769,6 +2538,15 @@ components:
           additionalProperties:
             type: string
           type: object
+        init_timeout:
+          description: |-
+            InitTimeout is the per-server MCP `initialize` handshake deadline override
+            (MCP-3322 / GH #760), serialized as a duration string (e.g. "120s"). A nil
+            pointer means "leave unchanged" on PATCH; a present value is applied.
+            Mirrors config.ServerConfig.InitTimeout's *Duration tri-state.
+          type: string
+        isolation:
+          $ref: '#/components/schemas/httpapi.IsolationRequest'
         name:
           type: string
         protocol:
@@ -1832,6 +2610,18 @@ components:
         path:
           description: File path to import from
           type: string
+        rename:
+          additionalProperties:
+            type: string
+          description: |-
+            Rename maps a server name → new name. Applied after parsing so the
+            caller can disambiguate cross-source name collisions (Spec 046 v2 —
+            e.g. "mcpproxy" → "mcpproxy_claude_code"). Keys are matched against
+            either the raw source name (OriginalName) or the sanitized name shown
+            in the preview (Server.Name); these differ for names that need
+            sanitizing (e.g. "Figma Desktop" → "Figma_Desktop"). Keys not present
+            in the imported set are ignored.
+          type: object
         server_names:
           description: 'Optional: import only these servers'
           items:
@@ -1913,6 +2703,77 @@ components:
           type: array
           uniqueItems: false
       type: object
+    httpapi.IsolationRequest:
+      description: |-
+        Isolation carries per-server Docker isolation overrides (image,
+        network_mode, extra_args, working_dir, enabled). A nil pointer
+        means "do not touch isolation config"; an empty-but-present
+        object on PATCH intentionally clears the overrides.
+      properties:
+        enabled:
+          type: boolean
+        extra_args:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        image:
+          type: string
+        network_mode:
+          type: string
+        working_dir:
+          type: string
+      type: object
+    httpapi.OnboardingMarkRequest:
+      properties:
+        connect_step_status:
+          description: |-
+            ConnectStepStatus is one of: "", "completed", "skipped". Empty
+            preserves the existing value. The stored enum is wider (Spec 080
+            FR-001): a "skipped" request for a previously untouched connect step
+            is upgraded server-side to "completed_external" when the install
+            shows positive evidence of an external connection (Spec 080 FR-002).
+            "completed_external" is NOT accepted from clients — it must never be
+            persisted without that server-verified evidence (edge case: "never
+            guess completed_external without positive evidence").
+          type: string
+        engaged:
+          description: |-
+            Engaged marks the wizard as engaged (completed or explicitly skipped).
+            Once true, the wizard does not auto-show again.
+          type: boolean
+        mark_shown:
+          description: MarkShown records the wizard's first display time if not already
+            set.
+          type: boolean
+        server_step_status:
+          description: |-
+            ServerStepStatus is one of: "", "completed", "skipped". Empty
+            preserves the existing value.
+          type: string
+      type: object
+    httpapi.SetActiveProfileRequest:
+      properties:
+        active_profile:
+          type: string
+        profile:
+          type: string
+      type: object
+    httpapi.UndoConnectRequest:
+      properties:
+        backup_name:
+          description: |-
+            BackupName is the bare filename (filepath.Base) of the backup returned as
+            backup_path by the preceding connect — a name, never a path. Undo resolves
+            the full path server-side by joining it with the client's own config
+            directory, so a client-supplied value can never contribute a directory
+            component (traversal is impossible by construction). Empty means the
+            connect created the file (no prior file existed), so undo removes it.
+          type: string
+        server_name:
+          description: Defaults to "mcpproxy"
+          type: string
+      type: object
     management.BulkOperationResult:
       properties:
         errors:
@@ -1982,6 +2843,15 @@ components:
           type: object
         enhance_path:
           description: Enable PATH enhancement for Launchd scenarios
+          type: boolean
+        forward_proxy_env:
+          description: |-
+            ForwardProxyEnv opts in to forwarding the ambient HTTP(S)/ALL/NO/FTP proxy
+            environment variables to spawned upstream servers (MCP-2769). It is OFF by
+            default and deliberately kept out of the AllowedSystemVars default list:
+            proxy URLs frequently carry credentials (http://user:pass@proxy), so
+            forwarding them to every stdio upstream is a credential-leak risk. When
+            enabled, values are forwarded with their userinfo (credentials) redacted.
           type: boolean
         inherit_system_safe:
           type: boolean
@@ -2078,9 +2948,14 @@ paths:
         name: tool
         schema:
           type: string
-      - description: Filter by MCP session ID
+      - description: Filter by MCP transport session ID
         in: query
         name: session_id
+        schema:
+          type: string
+      - description: Filter by work session (one client, one project, across reconnects)
+        in: query
+        name: work_session_id
         schema:
           type: string
       - description: Filter by status
@@ -2294,9 +3169,14 @@ paths:
         name: tool
         schema:
           type: string
-      - description: Filter by MCP session ID
+      - description: Filter by MCP transport session ID
         in: query
         name: session_id
+        schema:
+          type: string
+      - description: Filter by work session (one client, one project, across reconnects)
+        in: query
+        name: work_session_id
         schema:
           type: string
       - description: Filter by status
@@ -2421,6 +3301,99 @@ paths:
       summary: Get activity summary statistics
       tags:
       - Activity
+  /api/v1/activity/usage:
+    get:
+      description: Returns the actor-owned usage aggregate (per-tool rollup + timeline
+        + tokens-saved headline) for the Web UI usage graphs (Spec 069). Served from
+        an in-memory snapshot — never a per-request full-log scan. Per-tool metrics
+        are lifetime-cumulative; `window` scopes the timeline and filters the tool
+        list to tools active within the span.
+      parameters:
+      - description: Time window for timeline + tool-list membership
+        in: query
+        name: window
+        schema:
+          enum:
+          - 24h
+          - 7d
+          - all
+          type: string
+      - description: Filter to one server
+        in: query
+        name: server
+        schema:
+          type: string
+      - description: Filter to one tool
+        in: query
+        name: tool
+        schema:
+          type: string
+      - description: Filter to tools with activity of this status
+        in: query
+        name: status
+        schema:
+          enum:
+          - success
+          - error
+          - blocked
+          type: string
+      - description: Top-N tools by sort key; remainder folded into 'other' (default
+          20)
+        in: query
+        name: top
+        schema:
+          type: integer
+      - description: Ranking key for the per-tool list
+        in: query
+        name: sort
+        schema:
+          enum:
+          - calls
+          - resp_bytes
+          - error_rate
+          - p95
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/data'
+                properties:
+                  data:
+                    type: object
+                  error:
+                    type: string
+                  request_id:
+                    type: string
+                  success:
+                    type: boolean
+                type: object
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: Unauthorized
+      security:
+      - ApiKeyHeader: []
+      - ApiKeyQuery: []
+      summary: Get usage statistics aggregate
+      tags:
+      - Activity
   /api/v1/annotations/coverage:
     get:
       description: Reports how many upstream tools have MCP annotations vs don't,
@@ -2467,6 +3440,52 @@ paths:
       summary: Get current configuration
       tags:
       - config
+    patch:
+      description: Deep-merges only the fields present in the request body onto the
+        live in-memory configuration and routes the result through the existing apply
+        pipeline (validation, change detection, disk persistence, hot-reload). Fields
+        the client omits — including masked secrets such as `api_key` and secret request
+        headers — are preserved verbatim. Nested objects are merged recursively; arrays
+        and scalars replace wholesale.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+        description: Partial configuration with only the fields to change
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ConfigApplyResult'
+          description: Configuration patch applied (inspect validation_errors for
+            rejected values)
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Invalid JSON payload or empty patch
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unauthorized - missing or invalid API key
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Failed to read or apply configuration
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Partially update configuration
+      tags:
+      - config
   /api/v1/config/apply:
     post:
       description: Applies a new MCPProxy configuration. Validates and persists the
@@ -2509,6 +3528,53 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: Apply configuration
+      tags:
+      - config
+  /api/v1/config/docker-isolation:
+    patch:
+      description: Convenience endpoint to flip `docker_isolation.enabled` without
+        resending the full config. Persists to disk via the existing config writer
+        — the file watcher then hot-reloads the change. Returns the new state and
+        whether a restart is required for existing connections to pick it up.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                enabled:
+                  type: boolean
+              type: object
+        description: New isolation state
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ConfigApplyResult'
+          description: Isolation toggle applied
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Invalid JSON payload
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unauthorized - missing or invalid API key
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Failed to apply configuration
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Toggle global Docker isolation
       tags:
       - config
   /api/v1/config/validate:
@@ -2579,7 +3645,8 @@ paths:
         Remove the MCPProxy entry from the specified client's configuration file.
         Creates a backup of the existing config before modifying.
       parameters:
-      - description: Client ID (claude-code, cursor, windsurf, vscode, codex, gemini)
+      - description: Client ID (claude-code, claude-desktop, cursor, windsurf, vscode,
+          codex, gemini, opencode)
         in: path
         name: client
         required: true
@@ -2604,6 +3671,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/contracts.ErrorResponse'
           description: Bad request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Permission denied (macOS App-Data block)
         "404":
           content:
             application/json:
@@ -2622,12 +3695,53 @@ paths:
       summary: Disconnect MCPProxy from a client
       tags:
       - connect
+    get:
+      description: |-
+        Resolves one client's status by reading its config file on demand.
+        This is the only Connect endpoint that opens a client config file, so
+        on macOS it is the sole place an App-Data privacy prompt may legitimately
+        appear (scoped to this user action). Resolves access_state to
+        accessible|absent|denied|malformed and populates remediation when denied.
+      parameters:
+      - description: Client ID (claude-code, claude-desktop, cursor, windsurf, vscode,
+          codex, gemini, opencode)
+        in: path
+        name: client
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: ClientStatus
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unknown client
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Service unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Get a single client's connection status (on-demand)
+      tags:
+      - connect
     post:
       description: |-
         Register MCPProxy as an MCP server in the specified client's configuration file.
         Creates a backup of the existing config before modifying.
       parameters:
-      - description: Client ID (claude-code, cursor, windsurf, vscode, codex, gemini)
+      - description: Client ID (claude-code, claude-desktop, cursor, windsurf, vscode,
+          codex, gemini, opencode)
         in: path
         name: client
         required: true
@@ -2652,6 +3766,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/contracts.ErrorResponse'
           description: Bad request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Permission denied (macOS App-Data block)
         "404":
           content:
             application/json:
@@ -2674,6 +3794,133 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: Connect MCPProxy to a client
+      tags:
+      - connect
+  /api/v1/connect/{client}/preview:
+    get:
+      description: |-
+        Returns the exact entry a subsequent connect would add to the client's
+        config — target path, server key, entry name, and entry contents — WITHOUT
+        modifying the file or creating a backup (Spec 078 US1). The embedded API key
+        is masked in the payload; contains_api_key flags that a credential is written.
+        entry_exists distinguishes a create from an overwrite of a same-named entry.
+        Reads the config on demand to classify create-vs-overwrite, so on macOS this
+        may raise an App-Data privacy prompt; a denial returns 403 + remediation.
+      parameters:
+      - description: Client ID (claude-code, claude-desktop, cursor, windsurf, vscode,
+          codex, gemini, opencode)
+        in: path
+        name: client
+        required: true
+        schema:
+          type: string
+      - description: Entry name to preview (defaults to mcpproxy); mirror the value
+          passed to POST connect
+        in: query
+        name: server_name
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: ConnectPreview
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Permission denied (macOS App-Data block)
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unknown client
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Service unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Preview the change a connect would make (no write)
+      tags:
+      - connect
+  /api/v1/connect/{client}/undo:
+    post:
+      description: |-
+        Reverts the connect that produced the named backup (Spec 078 US3):
+        restores the client config byte-for-byte from that backup, or — when
+        backup_name is empty because the connect created the file — deletes the
+        created file. backup_name is the bare filename of the backup the connect
+        returned (never a path); undo resolves the full path server-side inside
+        the client's own config directory, so a client value cannot escape it.
+        Refuses with 409 when the config changed since the connect (undo never
+        clobbers later edits; use DELETE /connect/{client} for a surgical entry
+        removal instead). Takes its own safety backup first; its path is returned
+        as backup_path in the result.
+      parameters:
+      - description: Client ID (claude-code, claude-desktop, cursor, windsurf, vscode,
+          codex, gemini, opencode)
+        in: path
+        name: client
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/httpapi.UndoConnectRequest'
+        description: Undo parameters (server_name, backup_name = the bare filename
+          of the backup the preceding connect returned)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: ConnectResult (action restored|deleted)
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad request (e.g. backup_name is a path, or not a backup of
+            this client's config)
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Permission denied (macOS App-Data block)
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unknown client or backup no longer exists
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Config changed since connect; undo refused
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Service unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Undo a connect, restoring the pre-connect config
       tags:
       - connect
   /api/v1/diagnostics:
@@ -2875,6 +4122,146 @@ paths:
       summary: Get server information
       tags:
       - status
+  /api/v1/onboarding/mark:
+    post:
+      description: |-
+        Updates wizard engagement and per-step status. Once engaged is
+        true, the wizard does not auto-show again, even if state regresses.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/httpapi.OnboardingMarkRequest'
+        description: Mark request
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: Updated OnboardingStateResponse
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad request
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Service unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Mark onboarding wizard state (Spec 046)
+      tags:
+      - onboarding
+  /api/v1/onboarding/state:
+    get:
+      description: |-
+        Returns the wizard engagement record alongside live predicates
+        (whether any client is connected, whether any server is configured),
+        plus a derived ShouldShowWizard flag the frontend can rely on.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.APIResponse'
+          description: OnboardingStateResponse
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Service unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Get onboarding wizard state and predicates (Spec 046)
+      tags:
+      - onboarding
+  /api/v1/profiles:
+    get:
+      description: List all configured profiles with their effective servers and indexed
+        tool count (Profiles v2). A profile scopes tool discovery and calls to a named
+        subset of upstream servers.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Profile list
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Configuration unavailable
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: List configured profiles
+      tags:
+      - profiles
+  /api/v1/profiles/active:
+    get:
+      description: 'Get the server-level default active profile used by UI surfaces
+        (Web UI / tray). Empty string means "all servers". Note: within a live MCP
+        session, the set_profile tool selection takes precedence over this default.'
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Active profile
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Get the default active profile
+      tags:
+      - profiles
+    put:
+      description: Set the server-level default active profile for UI surfaces. The
+        slug must match a configured profile; pass an empty string to clear. This
+        does not affect live MCP sessions, which use the set_profile tool.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/httpapi.SetActiveProfileRequest'
+        description: Profile slug to activate (empty clears)
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Active profile updated
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Invalid request body
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Unknown profile
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Set the default active profile
+      tags:
+      - profiles
   /api/v1/registries:
     get:
       description: Retrieves list of all MCP server registries that can be browsed
@@ -2903,6 +4290,188 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: List available MCP server registries
+      tags:
+      - registries
+    post:
+      description: Adds a generic modelcontextprotocol/registry v0.1 https endpoint
+        as a custom registry (MCP-866). The source is always tagged custom/unverified,
+        so every server discovered through it lands quarantined and can never skip
+        quarantine.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/contracts.AddRegistrySourceRequest'
+        description: Registry source (https url + optional protocol/id/name)
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Registry source added
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: invalid_registry_url
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registries_locked
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_shadows_builtin | duplicate_registry
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Add a user-supplied registry source
+      tags:
+      - registries
+  /api/v1/registries/{id}:
+    delete:
+      description: Removes a custom/unverified registry previously added via add-source
+        (MCP-1057). Built-in registries are refused with registry_shadows_builtin;
+        an unknown id yields registry_not_found. The change is persisted copy-on-write.
+      parameters:
+      - description: Registry ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Registry source removed
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Registry ID is required
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registries_locked
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_not_found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_shadows_builtin
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Remove a user-added custom registry source
+      tags:
+      - registries
+    put:
+      description: 'Updates a custom registry previously added via add-source (MCP-1072):
+        name, url, servers-url. Empty fields are left unchanged. Built-in registries
+        are refused with registry_shadows_builtin; an unknown id yields registry_not_found;
+        a non-https url yields invalid_registry_url. The change is persisted copy-on-write.'
+      parameters:
+      - description: Registry ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/contracts.EditRegistrySourceRequest'
+        description: Fields to update (name/url/servers_url; empty = unchanged)
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Registry source updated
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Registry ID is required | invalid_registry_url
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registries_locked
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_not_found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_shadows_builtin
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Edit a user-added custom registry source
+      tags:
+      - registries
+  /api/v1/registries/{id}/refresh:
+    post:
+      description: Invalidates the cached server lists for a registry so the next
+        search re-fetches fresh data from the source (spec 070 FR-007). Returns how
+        many cache entries were dropped.
+      parameters:
+      - description: Registry ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.RefreshRegistryResponse'
+          description: Registry cache refreshed
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Registry ID is required
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Failed to refresh registry cache
+      summary: Refresh a registry's cached server list
       tags:
       - registries
   /api/v1/registries/{id}/servers:
@@ -2961,6 +4530,62 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: Search MCP servers in a registry
+      tags:
+      - registries
+  /api/v1/registries/{id}/servers/{serverId}/add:
+    post:
+      description: Resolves a registry server reference server-side, re-derives a
+        validated config, and persists it quarantined (spec 070 keystone). The client
+        never sends a config blob — command/args/url and the quarantine flag are derived
+        from the registry entry, not the request.
+      parameters:
+      - description: Registry ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: Server ID within the registry
+        in: path
+        name: serverId
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/contracts.AddFromRegistryRequest'
+        description: Optional overrides (name, env, enabled)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Server added (quarantined)
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: no_install_info | missing_required_input | duplicate_name
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: registry_not_found | server_not_found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Internal server error
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Add an upstream server from a registry reference
       tags:
       - registries
   /api/v1/routing:
@@ -3233,6 +4858,57 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: Partially update an upstream server
+      tags:
+      - servers
+  /api/v1/servers/{id}/config-to-secret:
+    post:
+      description: Atomically reads the real value from the server config, stores
+        it in the OS keyring, and rewrites the config field to `${keyring:<name>}`.
+        Unblocks the UI's Convert-to-secret affordance for values the API redacts
+        on the read path.
+      parameters:
+      - description: Server ID or name
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                additionalProperties: {}
+                type: object
+          description: Secret stored, config updated with reference
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad scope/key/secret_name, or value is already a reference
+            / empty
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Server or key not found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Secret resolver or config update failed
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Convert a header / env value to a keyring secret
       tags:
       - servers
   /api/v1/servers/{id}/disable:
@@ -3673,6 +5349,129 @@ paths:
       - ApiKeyAuth: []
       - ApiKeyQuery: []
       summary: Get tools for a server
+      tags:
+      - servers
+  /api/v1/servers/{id}/tools/block:
+    post:
+      description: Atomically approves AND disables the given tools (or all pending/changed
+        tools when block_all=true) for a server. The approve and disable land in a
+        single write per tool, so a tool is never left in the approved+enabled state.
+        The "blocked" field counts tools actually blocked.
+      parameters:
+      - description: Server ID or name
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Block result
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Internal server error
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Block (approve+disable) tools for a server
+      tags:
+      - servers
+  /api/v1/servers/{id}/tools/disable_all:
+    post:
+      description: Bulk-toggles every known tool of a server. The "changed" field
+      parameters:
+      - description: Server ID or name
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Operation result
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Internal server error
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Enable or disable all tools for a server
+      tags:
+      - servers
+  /api/v1/servers/{id}/tools/enable_all:
+    post:
+      description: Bulk-toggles every known tool of a server. The "changed" field
+      parameters:
+      - description: Server ID or name
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.SuccessResponse'
+          description: Operation result
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Bad request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Internal server error
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: Enable or disable all tools for a server
       tags:
       - servers
   /api/v1/servers/{id}/unquarantine:
@@ -4312,6 +6111,31 @@ paths:
       summary: Replay a tool call
       tags:
       - tool-calls
+  /api/v1/tools:
+    get:
+      description: 'Consolidated, read-only listing of all tools from every configured
+        server (including disabled servers and disabled/config-denied tools), enriched
+        with approval state and 30-day usage. Backs the global Tools page and the
+        CLI global `tools list` (spec 050, issue #437).'
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.GlobalToolsResponse'
+          description: All tools across all servers
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/contracts.ErrorResponse'
+          description: Could not enumerate servers
+      security:
+      - ApiKeyAuth: []
+      - ApiKeyQuery: []
+      summary: List every tool across all servers
+      tags:
+      - tools
   /api/v1/tools/call:
     post:
       description: Execute a tool on an upstream MCP server (wrapper around MCP tool

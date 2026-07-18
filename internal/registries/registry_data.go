@@ -6,38 +6,84 @@ import (
 
 var registryList []RegistryEntry
 
-// SetRegistriesFromConfig sets the registries list from configuration
+// SetRegistriesFromConfig builds the effective registry list by MERGING the
+// built-in defaults with the user's configured registries, keyed by ID
+// (FR-006). Built-in defaults come first (in their canonical order); a config
+// entry with a new ID is appended, and a config entry whose ID collides with a
+// default overrides it in place. This means adding one custom registry no
+// longer drops the shipped defaults, and no rebuild is required.
 func SetRegistriesFromConfig(cfg *config.Config) {
-	if cfg != nil && cfg.Registries != nil {
-		// Convert config.RegistryEntry to registries.RegistryEntry
-		registryList = make([]RegistryEntry, len(cfg.Registries))
+	index := make(map[string]int) // ID -> position in merged
+	merged := make([]RegistryEntry, 0, len(config.DefaultRegistries()))
+
+	// Trust is derived from membership in the shipped default set (MCP-866), not
+	// from any provenance a user wrote into their config — so a custom registry
+	// can never claim "official/trusted", and an override of a default ID keeps
+	// its trusted status (e.g. attaching an API key to a built-in registry).
+	defaults := config.DefaultRegistries()
+	defaultIDs := make(map[string]bool, len(defaults))
+	for i := range defaults {
+		defaultIDs[defaults[i].ID] = true
+	}
+
+	upsert := func(r RegistryEntry) {
+		if defaultIDs[r.ID] {
+			r.Provenance = config.RegistryProvenanceOfficial
+		} else {
+			r.Provenance = config.RegistryProvenanceCustom
+		}
+		if pos, ok := index[r.ID]; ok {
+			merged[pos] = r
+			return
+		}
+		index[r.ID] = len(merged)
+		merged = append(merged, r)
+	}
+
+	for i := range defaults {
+		upsert(fromConfigEntry(&defaults[i]))
+	}
+	if cfg != nil {
 		for i := range cfg.Registries {
-			r := &cfg.Registries[i]
-			registryList[i] = RegistryEntry{
-				ID:          r.ID,
-				Name:        r.Name,
-				Description: r.Description,
-				URL:         r.URL,
-				ServersURL:  r.ServersURL,
-				Tags:        r.Tags,
-				Protocol:    r.Protocol,
-				Count:       r.Count,
+			// MCP-1049: never resurface a deprecated former-default registry that
+			// is still persisted in an existing config. The load-time prune
+			// (config.PruneDeprecatedRegistries) cleans the persisted slice, and
+			// this skip guarantees convergence even for a stale in-memory config
+			// (hot-reload, direct construction). A genuine custom registry is never
+			// in the deprecated set, so it is always merged.
+			if config.IsDeprecatedDefaultRegistry(cfg.Registries[i].ID) {
+				continue
 			}
+			upsert(fromConfigEntry(&cfg.Registries[i]))
 		}
-	} else {
-		// Use default registries
-		registryList = []RegistryEntry{
-			{
-				ID:          "smithery",
-				Name:        "Smithery MCP Registry",
-				Description: "The official community registry for Model Context Protocol (MCP) servers.",
-				URL:         "https://smithery.ai/protocols",
-				ServersURL:  "https://smithery.ai/api/smithery-protocol-registry",
-				Tags:        []string{"official", "community"},
-				Protocol:    "modelcontextprotocol/registry",
-				Count:       -1, // Will be populated at runtime
-			},
-		}
+	}
+
+	registryList = merged
+
+	// Propagate the SSRF allow-policy (MCP-1076): off by default, opt-in via the
+	// user's allow_private_registry_fetch flag. Done here so every config load /
+	// hot-reload keeps the dial-time guard in sync with current config.
+	SetAllowPrivateRegistryFetch(cfg != nil && cfg.AllowPrivateRegistryFetch)
+}
+
+// IsTrusted reports whether this is an official, shipped-by-default registry.
+// Trust is never granted by omission — an absent provenance tag is untrusted.
+func (r *RegistryEntry) IsTrusted() bool {
+	return r != nil && r.Provenance == config.RegistryProvenanceOfficial
+}
+
+// fromConfigEntry converts a config.RegistryEntry to a registries.RegistryEntry.
+func fromConfigEntry(r *config.RegistryEntry) RegistryEntry {
+	return RegistryEntry{
+		ID:          r.ID,
+		Name:        r.Name,
+		Description: r.Description,
+		URL:         r.URL,
+		ServersURL:  r.ServersURL,
+		Tags:        r.Tags,
+		Protocol:    r.Protocol,
+		Count:       r.Count,
+		RequiresKey: r.RequiresKey,
 	}
 }
 

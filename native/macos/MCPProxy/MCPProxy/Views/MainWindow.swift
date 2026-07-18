@@ -6,9 +6,9 @@ import SwiftUI
 enum SidebarItem: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case servers = "Servers"
+    case registries = "Registries"
     case activity = "Activity Log"
     case secrets = "Secrets"
-    case config = "Configuration"
 
     var id: String { rawValue }
 
@@ -16,9 +16,9 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         switch self {
         case .dashboard: return "rectangle.3.group"
         case .servers: return "server.rack"
+        case .registries: return "books.vertical"
         case .activity: return "clock.arrow.circlepath"
         case .secrets: return "key.fill"
-        case .config: return "gearshape"
         }
     }
 
@@ -37,7 +37,14 @@ struct MainWindow: View {
                         .accessibilityIdentifier("sidebar-\(item.rawValue)")
                 }
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220)
+            // Cap the sidebar width so SwiftUI cannot expand it past a
+            // sensible upper bound. Without `max:`, the sidebar can grow
+            // unbounded after certain layout transitions (e.g. exiting a
+            // detail view back to the list), leaving the detail pane
+            // squeezed into a sliver on the right. 280pt keeps long
+            // labels like "Activity Log" fully readable while leaving
+            // the main content area generous space.
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
             .listStyle(.sidebar)
             .accessibilityIdentifier("sidebar-list")
         } detail: {
@@ -54,12 +61,12 @@ struct MainWindow: View {
                         DashboardView(appState: appState)
                     case .servers:
                         ServersView(appState: appState)
+                    case .registries:
+                        RegistriesView(appState: appState)
                     case .activity:
                         ActivityView(appState: appState)
                     case .secrets:
                         SecretsView(appState: appState)
-                    case .config:
-                        ConfigView(appState: appState)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -68,12 +75,31 @@ struct MainWindow: View {
             .accessibilityIdentifier("detail-view")
         }
         .frame(minWidth: 800, minHeight: 500)
+        .background(sidebarShortcuts)
         .onReceive(NotificationCenter.default.publisher(for: .switchToActivity)) { _ in
             selectedItem = .activity
         }
         .onReceive(NotificationCenter.default.publisher(for: .switchToServers)) { _ in
             selectedItem = .servers
         }
+    }
+
+    /// Hidden ⌘1…⌘5 shortcuts to jump straight to each sidebar section. Keeps
+    /// keyboard navigation fast for users and lets UI-test automation reach a
+    /// section (the sidebar List rows aren't directly clickable via the
+    /// accessibility menu API).
+    @ViewBuilder
+    private var sidebarShortcuts: some View {
+        VStack {
+            ForEach(Array(SidebarItem.allCases.enumerated()), id: \.element) { index, item in
+                Button("") { selectedItem = item }
+                    .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                    .accessibilityIdentifier("sidebar-shortcut-\(item.rawValue)")
+            }
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Core Status Banner

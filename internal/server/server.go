@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
 	"path/filepath"
+	gruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +24,13 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/connect"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/httpapi"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/management"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security/scanner"
@@ -35,6 +39,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tlslocal"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 	"github.com/smart-mcp-proxy/mcpproxy-go/web"
 )
@@ -77,11 +82,45 @@ type Server struct {
 	// Spec 024: Shutdown info for lifecycle events
 	shutdownReason string
 	shutdownSignal string
+
+	// MCP-32: observability manager (Prometheus /metrics + OTLP tracing).
+	// Nil when disabled; config-gated and off by default.
+	observability *observability.Manager
 }
 
 // NewServer creates a new server instance
 func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 	return NewServerWithConfigPath(cfg, "", logger)
+}
+
+// buildObservabilityConfig maps the file-level observability config (MCP-32)
+// onto the observability package config. Exporters are OFF unless explicitly
+// enabled. Health checks remain on (cheap, internal). Defensive against a nil
+// observability block.
+func buildObservabilityConfig(cfg *config.Config) observability.Config {
+	out := observability.DefaultConfig("mcpproxy", httpapi.GetBuildVersion())
+	// DefaultConfig enables metrics; flip to opt-in per the MCP-32 directive.
+	out.Metrics.Enabled = false
+	out.Tracing.Enabled = false
+	// The observability package's health manager is out of scope for MCP-32 and
+	// its readiness is vacuous (no registered checkers). Keep the existing
+	// controller-backed /healthz and /readyz authoritative in all cases.
+	out.Health.Enabled = false
+
+	obs := cfg.Observability
+	if obs == nil {
+		return out
+	}
+	if obs.Metrics != nil {
+		out.Metrics.Enabled = obs.Metrics.Enabled
+	}
+	if obs.Tracing != nil {
+		out.Tracing.Enabled = obs.Tracing.Enabled
+		out.Tracing.Protocol = obs.Tracing.Protocol
+		out.Tracing.OTLPEndpoint = obs.Tracing.Endpoint
+		out.Tracing.SampleRate = obs.Tracing.SampleRate
+	}
+	return out
 }
 
 // NewServerWithConfigPath creates a new server instance with explicit config path tracking
@@ -98,15 +137,18 @@ func NewServerWithConfigPath(cfg *config.Config, configPath string, logger *zap.
 	// Initialize telemetry service with build version and edition (Spec 036)
 	rt.SetTelemetry(httpapi.GetBuildVersion(), httpapi.GetEdition())
 
-	// Initialize observability manager for metrics (FR-011: OAuth refresh metrics)
-	obsConfig := observability.DefaultConfig("mcpproxy", httpapi.GetBuildVersion())
+	// Initialize observability manager (MCP-32): Prometheus /metrics + OTLP
+	// tracing, config-gated and OFF by default. OAuth refresh metrics (Spec 023,
+	// FR-011) are wired here too when metrics are enabled.
+	obsConfig := buildObservabilityConfig(cfg)
 	obsManager, err := observability.NewManager(logger.Sugar(), &obsConfig)
 	if err != nil {
-		logger.Warn("Failed to create observability manager, metrics will be disabled", zap.Error(err))
+		logger.Warn("Failed to create observability manager, metrics/tracing will be disabled", zap.Error(err))
+		obsManager = nil
 	} else if obsManager.Metrics() != nil {
 		// Wire up metrics recorder to RefreshManager for OAuth refresh metrics
 		rt.SetRefreshMetricsRecorder(obsManager.Metrics())
-		logger.Info("OAuth refresh metrics enabled")
+		logger.Info("Prometheus metrics enabled", zap.String("endpoint", "/metrics"))
 	}
 
 	// Initialize management service and set it on runtime
@@ -122,10 +164,11 @@ func NewServerWithConfigPath(cfg *config.Config, configPath string, logger *zap.
 	rt.SetManagementService(mgmtService)
 
 	server := &Server{
-		logger:   logger,
-		runtime:  rt,
-		statusCh: make(chan interface{}, 10),
-		eventsCh: rt.SubscribeEvents(),
+		logger:        logger,
+		runtime:       rt,
+		statusCh:      make(chan interface{}, 10),
+		eventsCh:      rt.SubscribeEvents(),
+		observability: obsManager,
 	}
 
 	mcpProxy := NewMCPProxyServer(
@@ -138,7 +181,11 @@ func NewServerWithConfigPath(cfg *config.Config, configPath string, logger *zap.
 		server,
 		cfg.DebugSearch,
 		cfg,
+		rt.SignatureCache(), // Spec 085 FR-008: the ONE Runtime-owned signature cache
 	)
+	// MCP-32: give the MCP proxy access to observability for tool-call metrics
+	// and OTLP spans.
+	mcpProxy.SetObservability(obsManager)
 
 	server.mcpProxy = mcpProxy
 
@@ -230,6 +277,7 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 				TokenPrefix:    agentToken.TokenPrefix,
 				AllowedServers: agentToken.AllowedServers,
 				Permissions:    agentToken.Permissions,
+				ProfilePin:     agentToken.ProfilePin,
 			}
 			ctx := auth.WithAuthContext(r.Context(), authCtx)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -304,6 +352,13 @@ func (s *Server) GetDockerRecoveryStatus() *storage.DockerRecoveryState {
 	return s.runtime.GetDockerRecoveryStatus()
 }
 
+// IsDockerAvailable reports whether the host has a reachable Docker daemon via
+// a real probe. The /api/v1/docker/status endpoint uses this for genuine
+// availability rather than the synthetic recovery-state value (MCP-2478).
+func (s *Server) IsDockerAvailable() bool {
+	return s.runtime.IsDockerAvailable()
+}
+
 // StatusChannel returns a channel that receives status updates
 func (s *Server) StatusChannel() <-chan interface{} {
 	return s.statusCh
@@ -366,22 +421,50 @@ func (s *Server) forwardRuntimeStatus() {
 	}
 }
 
-// listenForRoutingModeRefresh subscribes to server events and refreshes routing mode
-// tool sets when upstream servers change (Spec 031).
+// listenForRoutingModeRefresh subscribes to server events and refreshes routing
+// mode tool sets when upstream servers change (Spec 031), and re-applies the
+// security scanner's opt-in deep-scan gate on config hot-reload (Spec 077 US3).
 func (s *Server) listenForRoutingModeRefresh() {
 	eventCh := s.runtime.SubscribeEvents()
 	defer s.runtime.UnsubscribeEvents(eventCh)
 
 	for evt := range eventCh {
-		if evt.Type == runtime.EventTypeServersChanged {
+		switch evt.Type {
+		case runtime.EventTypeServersChanged:
 			s.logger.Debug("servers changed, refreshing routing mode tools",
 				zap.String("event_type", string(evt.Type)))
 			if s.mcpProxy != nil {
 				s.mcpProxy.RefreshDirectModeTools()
 				s.mcpProxy.RefreshCodeExecModeTools()
 			}
+		case runtime.EventTypeConfigReloaded:
+			// Spec 077 US3: config hot-reload (file edit or /api/v1/config/apply)
+			// must re-gate the scanner so a security.deep_scan.* toggle takes
+			// effect without a restart. Fires on both reload paths, which both
+			// emit config.reloaded.
+			s.reapplyScannerSecurityConfig()
 		}
 	}
+}
+
+// reapplyScannerSecurityConfig re-applies the opt-in deep-scan gate (and the
+// engine-wide default isolation mode) to the running scanner service from the
+// live config, so a config hot-reload takes effect without a restart (Spec 077
+// US3). Mirrors the startup wiring; idempotent and nil-safe.
+func (s *Server) reapplyScannerSecurityConfig() {
+	if s.securityScanner == nil {
+		return
+	}
+	cfg := s.runtime.Config()
+	if cfg == nil {
+		return
+	}
+	s.securityScanner.ApplySecurityConfig(cfg.Security)
+	if cfg.DockerIsolation != nil {
+		s.securityScanner.SetIsolationMode(string(cfg.DockerIsolation.ResolvedMode()))
+	}
+	s.logger.Debug("Re-applied security scanner config on hot-reload",
+		zap.Bool("deep_scan_enabled", s.securityScanner.DeepScanEnabled()))
 }
 
 // Start starts the MCP proxy server
@@ -522,6 +605,16 @@ func (s *Server) Shutdown() error {
 		s.runtime.UnsubscribeEvents(s.eventsCh)
 	}
 
+	// MCP-32: flush and shut down the OTLP tracer provider so buffered spans
+	// are exported before exit.
+	if s.observability != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.observability.Close(ctx); err != nil {
+			s.logger.Warn("Failed to close observability manager", zap.Error(err))
+		}
+		cancel()
+	}
+
 	s.logger.Info("Shutting down MCP proxy server...")
 
 	// Gracefully shutdown HTTP server first to stop accepting new connections
@@ -641,6 +734,7 @@ func (s *Server) GetUpstreamStats() map[string]interface{} {
 
 			connectedCount := 0
 			connectingCount := 0
+			quarantinedCount := 0
 			totalTools := 0
 
 			serverStats := make(map[string]interface{}, len(snapshot.Servers))
@@ -727,17 +821,21 @@ func (s *Server) GetUpstreamStats() map[string]interface{} {
 				if connecting {
 					connectingCount++
 				}
+				if status.Quarantined {
+					quarantinedCount++
+				}
 				totalTools += status.ToolCount
 
 				serverStats[name] = entry
 			}
 
 			return map[string]interface{}{
-				"connected_servers":  connectedCount,
-				"connecting_servers": connectingCount,
-				"total_servers":      len(snapshot.Servers),
-				"servers":            serverStats,
-				"total_tools":        totalTools,
+				"connected_servers":   connectedCount,
+				"connecting_servers":  connectingCount,
+				"quarantined_servers": quarantinedCount,
+				"total_servers":       len(snapshot.Servers),
+				"servers":             serverStats,
+				"total_tools":         totalTools,
 			}
 		}
 	}
@@ -879,6 +977,31 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 			if scanSummary != nil {
 				serverMap["security_scan"] = scanSummary
 			}
+		}
+
+		// Spec 044: include structured diagnostic error + stable error code.
+		if serverStatus.Diagnostic != nil {
+			d := serverStatus.Diagnostic
+			diagMap := map[string]interface{}{
+				"code":        string(d.Code),
+				"severity":    string(d.Severity),
+				"cause":       d.Cause,
+				"detected_at": d.DetectedAt,
+			}
+			if entry, ok := diagnostics.Get(d.Code); ok {
+				// MCP-2909: prefer the runtime-aware remediation when present so
+				// the user sees the detected runtime + recommended image instead
+				// of the generic catalog message.
+				if d.Remediation != "" {
+					diagMap["user_message"] = d.Remediation
+				} else {
+					diagMap["user_message"] = entry.UserMessage
+				}
+				diagMap["fix_steps"] = entry.FixSteps
+				diagMap["docs_url"] = entry.DocsURL
+			}
+			serverMap["diagnostic"] = diagMap
+			serverMap["error_code"] = string(d.Code)
 		}
 
 		result = append(result, serverMap)
@@ -1055,11 +1178,17 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 		return fmt.Errorf("failed to save server to storage: %w", err)
 	}
 
-	// Update runtime config
+	// Update runtime config.
+	// runtime.Config() returns the live immutable snapshot, which background
+	// goroutines (e.g. LoadConfiguredServers, DiscoverAndIndexTools) may be
+	// ranging over concurrently. Mutating its Servers slice in place is a data
+	// race, so copy-on-write: clone the config and its server list, append to
+	// the clone, then publish atomically via UpdateConfig.
 	currentConfig := s.runtime.Config()
 	if currentConfig != nil {
-		currentConfig.Servers = append(currentConfig.Servers, serverConfig)
-		s.runtime.UpdateConfig(currentConfig, "")
+		updatedConfig := *currentConfig
+		updatedConfig.Servers = append(append([]*config.ServerConfig(nil), currentConfig.Servers...), serverConfig)
+		s.runtime.UpdateConfig(&updatedConfig, "")
 	}
 
 	// Save configuration to file
@@ -1129,6 +1258,50 @@ func (s *Server) UpdateServer(ctx context.Context, serverName string, updates *c
 	existing.Enabled = updates.Enabled
 	existing.Quarantined = updates.Quarantined
 	existing.ReconnectOnUse = updates.ReconnectOnUse
+
+	// AutoApproveToolChanges is a tri-state *bool (MCP-2940): nil means
+	// "leave unchanged" so callers that don't touch it (e.g. config-to-secret)
+	// don't reset it. A non-nil pointer (including a pointer to false) is
+	// applied. The PATCH handler preserves the existing pointer when the
+	// request omits the field, so this nil-guard is the second half of the
+	// nil-preserve contract.
+	if updates.AutoApproveToolChanges != nil {
+		existing.AutoApproveToolChanges = updates.AutoApproveToolChanges
+	}
+
+	// InitTimeout (MCP-3322) is a tri-state *Duration: nil means "leave
+	// unchanged"; a non-nil pointer is applied. The PATCH handler preserves the
+	// existing pointer when the request omits the field, so this nil-guard is
+	// the second half of the nil-preserve contract.
+	if updates.InitTimeout != nil {
+		existing.InitTimeout = updates.InitTimeout
+	}
+
+	// Isolation is PATCH-semantic: nil means "leave unchanged"; a
+	// present struct means "replace". Within the struct, the caller
+	// only populates fields they want to set (handled upstream by
+	// IsolationRequest.toConfig), so we merge into the existing
+	// override set rather than wholesale replacing.
+	if updates.Isolation != nil {
+		if existing.Isolation == nil {
+			existing.Isolation = &config.IsolationConfig{}
+		}
+		if updates.Isolation.Enabled != nil {
+			existing.Isolation.Enabled = updates.Isolation.Enabled
+		}
+		if updates.Isolation.Image != "" {
+			existing.Isolation.Image = updates.Isolation.Image
+		}
+		if updates.Isolation.NetworkMode != "" {
+			existing.Isolation.NetworkMode = updates.Isolation.NetworkMode
+		}
+		if updates.Isolation.ExtraArgs != nil {
+			existing.Isolation.ExtraArgs = updates.Isolation.ExtraArgs
+		}
+		if updates.Isolation.WorkingDir != "" {
+			existing.Isolation.WorkingDir = updates.Isolation.WorkingDir
+		}
+	}
 
 	// Save to storage
 	if err := storageManager.SaveUpstreamServer(existing); err != nil {
@@ -1296,6 +1469,11 @@ func (s *Server) StartServer(ctx context.Context) error {
 
 	s.serverCtx, s.serverCancel = context.WithCancel(ctx)
 
+	// MCP-32: project runtime events onto Prometheus metrics while running.
+	if s.observability != nil && s.observability.Metrics() != nil {
+		go s.runMetricsBridge(s.serverCtx, s.observability.Metrics())
+	}
+
 	go func() {
 		var serverError error
 
@@ -1400,8 +1578,11 @@ func (s *Server) StopServer() error {
 		_ = s.logger.Sync()
 	}
 
-	// NEW: Verify all containers stopped with retry loop (instead of arbitrary 3s sleep)
-	if s.runtime.UpstreamManager().HasDockerContainers() {
+	// NEW: Verify all containers stopped with retry loop (instead of arbitrary 3s sleep).
+	// Gated on Docker isolation actually being in use — otherwise the `docker ps`
+	// probe + verifyContainersCleanedUp loop are pure waste (and add ~17s per
+	// Stop in test processes). No isolation ⇒ no managed containers ⇒ nothing to verify.
+	if s.runtime.UpstreamManager().UsesDockerIsolation() && s.runtime.UpstreamManager().HasDockerContainers() {
 		s.logger.Warn("STOPSERVER - Docker containers still running, verifying cleanup...")
 		_ = s.logger.Sync()
 		s.verifyContainersCleanedUp(cleanupCtx)
@@ -1506,8 +1687,111 @@ func withHSTS(next http.Handler) http.Handler {
 	})
 }
 
+// profileMiddleware is an http.Handler middleware registered at /mcp/p/.
+// It resolves the profile slug from the URL path, looks up the profile in the
+// current config snapshot (lock-free, hot-reload safe), builds a ProfileScope,
+// injects it into the request context, then delegates to the retrieve_tools-mode
+// MCP handler (next). Auth has already run at this point via mcpAuthMiddleware.
+//
+// 404 responses:
+//   - No profiles configured at all → {"error":"no profiles configured"}
+//   - Slug not found               → {"error":"unknown profile '<slug>'","available":[...]}
+func (s *Server) profileMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.runtime.Config()
+
+		// FR-008: no profiles configured.
+		if cfg == nil || len(cfg.Profiles) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "no profiles configured",
+			})
+			return
+		}
+
+		// Strip the /mcp/p/ prefix to obtain the slug.
+		slug := strings.TrimPrefix(r.URL.Path, "/mcp/p/")
+		slug = strings.TrimPrefix(slug, "/mcp/p") // handle /mcp/p with no trailing slash
+		slug = strings.Trim(slug, "/")
+
+		// Profiles v2 T3: a profile-pinned agent token may only operate within its
+		// pinned profile. A request to any other /mcp/p/<slug> is forbidden (403),
+		// regardless of whether that slug is a real profile. Auth has already run
+		// (mcpAuthMiddleware wraps this handler), so the pin is on the context.
+		if pin := profilePinFromContext(r.Context()); pin != "" && pin != slug {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": fmt.Sprintf("agent token is pinned to profile '%s' and cannot access profile '%s'", pin, slug),
+			})
+			return
+		}
+
+		// Look up profile by slug (lock-free snapshot).
+		var found *config.ProfileConfig
+		for i := range cfg.Profiles {
+			if cfg.Profiles[i].Name == slug {
+				found = &cfg.Profiles[i]
+				break
+			}
+		}
+
+		// FR-009: slug not found.
+		if found == nil {
+			available := make([]string, 0, len(cfg.Profiles))
+			for _, p := range cfg.Profiles {
+				available = append(available, p.Name)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":     fmt.Sprintf("unknown profile '%s'", slug),
+				"available": available,
+			})
+			return
+		}
+
+		// Build scope from the effective server set (unknown-server warn-skip applied).
+		effectiveServers := found.EffectiveServers(cfg)
+		scope := profile.NewProfileScope(found.Name, effectiveServers)
+		ctx := profile.WithProfileScope(r.Context(), scope)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // startCustomHTTPServer creates a custom HTTP server that handles MCP endpoints
 // It supports both TCP (for browsers) and Unix socket/named pipe (for tray) listeners
+// registerHTTPHandlers forwards the REST API, SSE events, health endpoints,
+// and the observability /metrics endpoint from the outer http.ServeMux to the
+// httpapi chi router (httpAPIServer).
+//
+// MCP-3135: /metrics is registered on the chi router (httpapi.setupRoutes), but
+// the outer mux must explicitly forward it — otherwise GET /metrics returns 404
+// even when metrics are enabled. The forward is gated on metrics actually being
+// enabled so a disabled deployment keeps /metrics unrouted (404).
+func (s *Server) registerHTTPHandlers(mux *http.ServeMux, httpAPIServer http.Handler) {
+	mux.Handle("/api/", httpAPIServer)
+	mux.Handle("/events", httpAPIServer)
+
+	// Mount health endpoints directly on main mux at root level
+	healthEndpoints := []string{"/healthz", "/readyz", "/livez", "/ready", "/health"}
+	for _, endpoint := range healthEndpoints {
+		mux.Handle(endpoint, httpAPIServer)
+	}
+
+	s.logger.Info("Registered REST API endpoints", zap.Strings("api_endpoints", []string{"/api/v1/*", "/events"}))
+	s.logger.Info("Registered health endpoints", zap.Strings("health_endpoints", healthEndpoints))
+
+	// MCP-32/MCP-3135: forward /metrics to the chi router only when the
+	// Prometheus exporter is enabled. Without this the handler registered in
+	// httpapi.setupRoutes is unreachable through the outer mux.
+	if s.observability != nil && s.observability.Metrics() != nil {
+		mux.Handle("/metrics", httpAPIServer)
+		s.logger.Info("Registered metrics endpoint", zap.String("endpoint", "/metrics"))
+	}
+}
+
 func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *server.StreamableHTTPServer) error {
 	cfg := s.runtime.Config()
 	if cfg == nil {
@@ -1541,9 +1825,14 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	if cfg.EnableSocket {
 		trayListener, err = listenerManager.CreateTrayListener()
 		if err != nil {
-			s.logger.Warn("Failed to create tray listener, tray will use TCP fallback",
-				zap.Error(err))
-			// Continue without tray listener - tray will fall back to TCP
+			socketPath := cfg.TrayEndpoint
+			if socketPath == "" {
+				socketPath = filepath.Join(cfg.DataDir, "mcpproxy.sock")
+			}
+			s.logger.Warn("Failed to create tray/CLI socket listener; tray and CLI will fall back to TCP (API key required)",
+				zap.Error(err),
+				zap.String("socket_path", socketPath))
+			// Continue without tray listener - tray and CLI fall back to TCP
 		}
 	} else {
 		s.logger.Info("Socket communication disabled by configuration, clients will use TCP")
@@ -1633,17 +1922,26 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	mux.Handle("/mcp/call", callToolHandler)
 	mux.Handle("/mcp/call/", callToolHandler)
 
+	// /mcp/p/<slug> → profile-scoped retrieve_tools mode (Spec 057)
+	// Profile resolution is done by profileMiddleware which runs AFTER mcpAuthMiddleware
+	// so that agent-token scope can compose downstream with the profile scope.
+	profileStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools))
+	profileHandler := s.mcpAuthMiddleware(s.profileMiddleware(loggingHandler(profileStreamable)))
+	mux.Handle("/mcp/p/", profileHandler)
+	mux.Handle("/mcp/p", profileHandler)
+
 	s.logger.Info("Registered routing mode MCP endpoints",
 		zap.String("default_mode", cfg.RoutingMode),
-		zap.Strings("endpoints", []string{"/mcp/all", "/mcp/code", "/mcp/call"}))
+		zap.Strings("endpoints", []string{"/mcp/all", "/mcp/code", "/mcp/call", "/mcp/p/<slug>"}))
 
 	// Legacy endpoints for backward compatibility
 	mux.Handle("/v1/tool_code", mcpHandler)
 	mux.Handle("/v1/tool-code", mcpHandler) // Alias for python client
 
-	// API v1 endpoints with chi router for REST API and SSE
-	// TODO: Add observability manager integration
-	httpAPIServer := httpapi.NewServer(s, s.logger.Sugar(), nil)
+	// API v1 endpoints with chi router for REST API and SSE.
+	// MCP-32: pass the observability manager so /metrics is served (and HTTP
+	// request metrics/tracing middleware applied) when enabled.
+	httpAPIServer := httpapi.NewServer(s, s.logger.Sugar(), s.observability)
 	// Wire agent token management (Spec 028)
 	if sm := s.runtime.StorageManager(); sm != nil {
 		cfg := s.runtime.Config()
@@ -1668,8 +1966,42 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	})
 	// Wire client connect service
 	if cfg := s.runtime.Config(); cfg != nil {
-		connectSvc := connect.NewService(cfg.Listen, cfg.APIKey)
+		connectSvc := connect.NewService(cfg.Listen, cfg.APIKey).
+			WithRequireMCPAuth(cfg.RequireMCPAuth).
+			// Read listen/api_key/require_mcp_auth LIVE so a runtime toggle (the
+			// /mcp middleware already honors require_mcp_auth per-request) is
+			// reflected in what connect writes, instead of the startup snapshot
+			// that would re-leak the API key after auth is turned off (Spec 078).
+			WithConfigProvider(func() (string, string, bool) {
+				c := s.runtime.Config()
+				if c == nil {
+					return "", "", false
+				}
+				return c.Listen, c.APIKey, c.RequireMCPAuth
+			})
 		httpAPIServer.SetConnectService(connectSvc)
+
+		// Spec 046: wire the onboarding-funnel provider on the telemetry
+		// service so each heartbeat carries connected-client count + IDs
+		// (from connect.Service) and wizard engagement + per-step status
+		// (from BBolt OnboardingState). nil-safe at every layer.
+		if ts := s.runtime.TelemetryService(); ts != nil {
+			ts.SetOnboardingProvider(func() *telemetry.OnboardingSnapshot {
+				snap := &telemetry.OnboardingSnapshot{
+					ConnectedClientCount: connectSvc.GetConnectedCount(),
+					ConnectedClientIDs:   connectSvc.GetConnectedIDs(),
+				}
+				if state, err := s.runtime.GetOnboardingState(); err == nil && state != nil {
+					snap.WizardEngaged = state.Engaged
+					snap.WizardConnectStep = state.ConnectStepStatus
+					snap.WizardServerStep = state.ServerStepStatus
+					// Spec 080 (FR-005): shown once the wizard has rendered,
+					// independent of engagement.
+					snap.WizardShown = state.FirstShownAt != nil
+				}
+				return snap
+			})
+		}
 	}
 	// Wire security scanner service (Spec 039)
 	if sm := s.runtime.StorageManager(); sm != nil {
@@ -1681,38 +2013,131 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 		secRegistry := scanner.NewRegistry(dataDir, s.logger)
 		secDocker := scanner.NewDockerRunner(s.logger)
 		secService := scanner.NewService(sm, secRegistry, secDocker, dataDir, s.logger)
-		if cfg != nil && cfg.Security != nil && cfg.Security.ScannerDisableNoNewPrivileges {
-			secService.SetScannerDisableNoNewPrivileges(true)
+		// Spec 077 US3: gate the opt-in deep-scan layer (Docker scanners + source
+		// extraction). Off by default — only the deterministic in-process baseline
+		// runs. The deprecated top-level scanner_* keys are migrated into
+		// security.deep_scan on load, so the effective accessors read the unified
+		// surface here (T031). This exact call is re-run on every config.reloaded
+		// (reapplyScannerSecurityConfig) so a deep-scan toggle hot-reloads without
+		// a restart — startup and reload configure the scanner identically.
+		// ApplySecurityConfig is nil-safe (audit FIX 1): a nil Config or a nil
+		// Config.Security (DefaultConfig never initializes the security block)
+		// still forces the deep-scan layer OFF — no Docker scanners, no
+		// published-package-source fetch — so the disabled-path gates apply
+		// unconditionally rather than only when a security block exists.
+		var secCfg *config.SecurityConfig
+		if cfg != nil {
+			secCfg = cfg.Security
 		}
+		secService.ApplySecurityConfig(secCfg)
+		// MCP-34.4 / D3 option (b): tell the scanner which isolation mode is
+		// active. Under "sandbox"/"none" the host runs no Docker for scanner
+		// plugins, so they degrade cleanly (skip + "degraded" scan summary)
+		// instead of failing with a misleading "pull the image" message.
+		//
+		// Two layers: SetIsolationMode is the engine-wide default; the resolver
+		// is per-server so a server pinned to isolation.mode:docker still runs
+		// Docker scanners under a global sandbox default (and vice versa),
+		// matching the per-server isolation resolver and the docs.
+		if cfg != nil && cfg.DockerIsolation != nil {
+			secService.SetIsolationMode(string(cfg.DockerIsolation.ResolvedMode()))
+		}
+		secService.SetIsolationModeResolver(func(serverName string) string {
+			liveCfg := s.runtime.Config()
+			if liveCfg == nil || liveCfg.DockerIsolation == nil {
+				return ""
+			}
+			var sc *config.ServerConfig
+			for _, candidate := range liveCfg.Servers {
+				if candidate != nil && candidate.Name == serverName {
+					sc = candidate
+					break
+				}
+			}
+			if sc == nil {
+				return "" // unknown server → fall back to the engine-wide default
+			}
+			im := core.NewIsolationManager(liveCfg.DockerIsolation)
+			return string(im.ResolveMode(sc))
+		})
 		secService.SetEmitter(s.runtime)
-		secService.SetServerInfoProvider(&configServerInfoProvider{cfg: cfg, server: s})
+		secService.SetServerInfoProvider(&configServerInfoProvider{
+			cfg:        cfg,
+			liveConfig: s.runtime.Config, // resolve against the live snapshot (MCP-2123)
+			server:     s,
+		})
 		secService.SetServerUnquarantiner(&serverUnquarantinerAdapter{server: s})
 		secService.SetSecretStore(&keyringSecretStore{resolver: secret.NewResolver()})
 		secService.CleanupStaleJobs()
 		httpAPIServer.SetSecurityController(secService)
+		// Plumb scan summaries through management.ListServers so the SSE
+		// servers.changed embed and REST GET /api/v1/servers share a single
+		// enrichment site. Without this, mergeServers on the Web UI strips
+		// security_scan from every server on every SSE delivery — same bug
+		// class as the pre-existing quarantine-stats staleness PR #463
+		// already fixes for Quarantine.
+		if mgmtSvc, ok := s.runtime.GetManagementService().(management.Service); ok && mgmtSvc != nil {
+			mgmtSvc.SetScanSummaryEnricher(&scanSummaryEnricherAdapter{scanner: secService})
+		}
 		s.securityScanner = secService
 	}
-	// Wire teams multi-user OAuth (no-op in personal edition)
-	wireTeamsOAuth(s, httpAPIServer)
-	mux.Handle("/api/", httpAPIServer)
-	mux.Handle("/events", httpAPIServer)
+	// Wire server edition multi-user OAuth (no-op in personal edition)
+	wireServerEditionOAuth(s, httpAPIServer)
 
-	// Mount health endpoints directly on main mux at root level
-	healthEndpoints := []string{"/healthz", "/readyz", "/livez", "/ready", "/health"}
-	for _, endpoint := range healthEndpoints {
-		mux.Handle(endpoint, httpAPIServer)
-	}
+	// Forward REST API, events, health, and (MCP-32) /metrics onto the outer
+	// mux. Extracted so the routing is unit-testable (MCP-3135 regression).
+	s.registerHTTPHandlers(mux, httpAPIServer)
 
-	s.logger.Info("Registered REST API endpoints", zap.Strings("api_endpoints", []string{"/api/v1/*", "/events"}))
-	s.logger.Info("Registered health endpoints", zap.Strings("health_endpoints", healthEndpoints))
+	// Debug / profiling endpoints (API-key gated). Block & mutex profiles
+	// default to off; we enable them when the route is hit so the running
+	// daemon stays zero-overhead until someone actively profiles.
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", httppprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	pprofGated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.runtime.Config()
+		if cfg == nil || cfg.APIKey == "" {
+			http.Error(w, "api key not configured", http.StatusUnauthorized)
+			return
+		}
+		token := r.Header.Get("X-API-Key")
+		if token == "" {
+			token = r.URL.Query().Get("apikey")
+		}
+		if token == "" {
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				token = strings.TrimPrefix(h, "Bearer ")
+			}
+		}
+		if token != cfg.APIKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		gruntime.SetBlockProfileRate(100_000_000) // 1 sample / 100 ms blocked
+		gruntime.SetMutexProfileFraction(100)     // sample 1% of contention
+		pprofMux.ServeHTTP(w, r)
+	})
+	mux.Handle("/debug/pprof/", pprofGated)
+	s.logger.Info("Registered pprof endpoints", zap.String("path", "/debug/pprof/"))
 
 	// Swagger UI (OpenAPI documentation) - mounted directly on main mux for /swagger/* access
 	swaggerHandler := httpapi.SetupSwaggerHandler(s.logger.Sugar())
 	mux.Handle("/swagger/", swaggerHandler)
 	s.logger.Info("Registered Swagger UI endpoint", zap.String("swagger_endpoint", "/swagger/*"))
 
-	// Web UI endpoints (serves embedded Vue.js frontend) with selective API key protection
-	webUIHandler := web.NewHandler(s.logger.Sugar())
+	// Web UI endpoints (serves embedded Vue.js frontend) with selective API key protection.
+	// Spec 080 (FR-006): every serve of the UI entrypoint (index document)
+	// increments the persistent web_ui_opened funnel counter — independent of
+	// the X-MCPProxy-Client-header surface_requests.webui counting. nil-safe
+	// at both layers: no telemetry service or no funnel store → no-op.
+	webUIHandler := web.NewHandlerWithIndexCallback(s.logger.Sugar(), func() {
+		if ts := s.runtime.TelemetryService(); ts != nil {
+			ts.RecordWebUIOpen()
+		}
+	})
 	selectiveProtectedWebUIHandler := s.createSelectiveWebUIProtectedHandler(http.StripPrefix("/ui", webUIHandler))
 	mux.Handle("/ui/", selectiveProtectedWebUIHandler)
 	// Redirect root to web UI
@@ -1927,6 +2352,23 @@ func (rw *responseWriter) WriteHeader(code int) {
 	}
 }
 
+// Flush delegates to the underlying ResponseWriter so that SSE keeps working
+// through this wrapper.
+//
+// Without it, wrapping the writer silently strips http.Flusher, and the MCP
+// transport's CanStream() check fails: GET /mcp — the listening stream the
+// protocol uses for every SERVER-TO-CLIENT message — is rejected with
+// "405 Streaming unsupported". That kills roots, sampling and elicitation over
+// HTTP, since the server has no channel on which to ask the client anything.
+//
+// Found while implementing Spec 082: the roots request went out and timed out
+// every time, because the client was never able to receive it.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // logConnectionState logs HTTP connection state changes for debugging client issues
 func (s *Server) logConnectionState(conn net.Conn, state http.ConnState) {
 	// Handle cases where conn or RemoteAddr might be nil
@@ -2011,6 +2453,15 @@ func (s *Server) GetLogDir() string {
 // GetConfig returns the current configuration
 func (s *Server) GetConfig() (*config.Config, error) {
 	return s.runtime.GetConfig()
+}
+
+// DefaultInstructions returns the built-in default MCP instructions text,
+// independent of any user-configured custom value. It backs the
+// /api/v1/status `default_instructions` field so the Web UI can render the
+// built-in default as the instructions placeholder without hardcoding the
+// text (MCP-2176). This mirrors resolveInstructions("").
+func (s *Server) DefaultInstructions() string {
+	return defaultInstructions
 }
 
 // ValidateConfig validates a configuration
@@ -2163,7 +2614,14 @@ func (s *Server) GetServerLogs(serverName string, tail int) ([]contracts.LogEntr
 		}
 	}
 
-	logFile := filepath.Join(logDir, fmt.Sprintf("server-%s.log", serverName))
+	logFile := filepath.Join(logDir, logs.ServerLogFilename(serverName))
+
+	// Defense-in-depth: logs.ServerLogFilename already sanitizes the (user-controlled)
+	// server name to a single path element, but verify the resolved path stays inside
+	// logDir so a crafted name can never escape the log directory (path-injection barrier).
+	if !strings.HasPrefix(filepath.Clean(logFile), filepath.Clean(logDir)+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("invalid server name: %s", serverName)
+	}
 
 	// Check if file exists
 	if _, err := os.Stat(logFile); os.IsNotExist(err) {
@@ -2254,6 +2712,15 @@ func (s *Server) NotifySecretsChanged(ctx context.Context, operation, secretName
 	return s.runtime.NotifySecretsChanged(ctx, operation, secretName)
 }
 
+// EmitActiveProfileChanged broadcasts an active_profile.changed event so UI
+// surfaces (Web UI, tray) reflect a default-profile switch made by another
+// client (Profiles v2 T2/T5). The REST handler invokes this via an optional
+// capability assertion, so adding it here does not widen the httpapi
+// ServerController interface.
+func (s *Server) EmitActiveProfileChanged(profile string) {
+	s.runtime.EmitActiveProfileChanged(profile)
+}
+
 // GetCurrentConfig returns the current configuration
 func (s *Server) GetCurrentConfig() interface{} {
 	return s.runtime.GetCurrentConfig()
@@ -2323,8 +2790,13 @@ func (s *Server) ListRegistries() ([]interface{}, error) {
 }
 
 // SearchRegistryServers searches for servers in a specific registry (Phase 7)
-func (s *Server) SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, error) {
+func (s *Server) SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, *contracts.RegistryCacheInfo, error) {
 	return s.runtime.SearchRegistryServers(registryID, tag, query, limit)
+}
+
+// RefreshRegistryCache invalidates a registry's cached server lists (spec 070 FR-007).
+func (s *Server) RefreshRegistryCache(registryID string) (int, error) {
+	return s.runtime.RefreshRegistryCache(registryID)
 }
 
 // GetVersionInfo returns the current version information from the update checker.
@@ -2354,6 +2826,17 @@ func (s *Server) StreamActivities(filter storage.ActivityFilter) <-chan *storage
 	return s.runtime.StreamActivities(filter)
 }
 
+// AggregateToolUsage rolls up tool_call activity per (server,tool) since the
+// given time (spec 050).
+func (s *Server) AggregateToolUsage(since time.Time) (map[string]storage.ToolUsageStat, error) {
+	return s.runtime.AggregateToolUsage(since)
+}
+
+// UsageSnapshot returns the actor-owned usage aggregate snapshot (spec 069 A3).
+func (s *Server) UsageSnapshot() *runtime.UsageAggregate {
+	return s.runtime.UsageSnapshot()
+}
+
 // ListToolApprovals returns tool approval records for a server (Spec 032).
 func (s *Server) ListToolApprovals(serverName string) ([]*storage.ToolApprovalRecord, error) {
 	return s.runtime.ListToolApprovals(serverName)
@@ -2367,6 +2850,34 @@ func (s *Server) ApproveTools(serverName string, toolNames []string, approvedBy 
 // ApproveAllTools approves all pending/changed tools for a server (Spec 032).
 func (s *Server) ApproveAllTools(serverName string, approvedBy string) (int, error) {
 	return s.runtime.ApproveAllTools(serverName, approvedBy)
+}
+
+// BlockTools atomically blocks (approve+disable) specific tools (MCP-2198).
+func (s *Server) BlockTools(serverName string, toolNames []string, blockedBy string) (int, error) {
+	return s.runtime.BlockTools(serverName, toolNames, blockedBy)
+}
+
+// BlockAllTools atomically blocks (approve+disable) all pending/changed tools
+// for a server (MCP-2198).
+func (s *Server) BlockAllTools(serverName string, blockedBy string) (int, error) {
+	return s.runtime.BlockAllTools(serverName, blockedBy)
+}
+
+// SetToolEnabled sets whether a tool is enabled for MCP exposure (Spec 032).
+func (s *Server) SetToolEnabled(serverName, toolName string, enabled bool, updatedBy string) error {
+	return s.runtime.SetToolEnabled(serverName, toolName, enabled, updatedBy)
+}
+
+// SetAllToolsEnabled bulk-toggles every known tool for a server to the given
+// state. Returns the count of tools whose state actually changed.
+func (s *Server) SetAllToolsEnabled(serverName string, enabled bool, updatedBy string) (int, error) {
+	return s.runtime.SetAllToolsEnabled(serverName, enabled, updatedBy)
+}
+
+// IsToolConfigDenied reports whether toolName is denied by the server's static
+// enabled_tools / disabled_tools config.
+func (s *Server) IsToolConfigDenied(serverName, toolName string) bool {
+	return s.runtime.IsToolConfigDenied(serverName, toolName)
 }
 
 // GetToolApproval returns the approval record for a specific tool (Spec 032).
@@ -2383,6 +2894,27 @@ func (s *Server) GetToolApprovalStatus(serverName, toolName string) (string, err
 	return string(record.Status), nil
 }
 
+// GetOnboardingState returns the wizard engagement state (Spec 046).
+func (s *Server) GetOnboardingState() (*storage.OnboardingState, error) {
+	return s.runtime.GetOnboardingState()
+}
+
+// SaveOnboardingState persists the wizard engagement state (Spec 046).
+func (s *Server) SaveOnboardingState(state *storage.OnboardingState) error {
+	return s.runtime.SaveOnboardingState(state)
+}
+
+// GetActivationFirstMCPClient returns Spec 044's FirstMCPClientEver flag and
+// the capped list of recognized client names. Used by the v2 onboarding wizard
+// (Spec 046 v2) to drive the Verify tab. Nil-safe: when telemetry isn't wired
+// (e.g. CI/test) returns (false, nil).
+func (s *Server) GetActivationFirstMCPClient() (bool, []string) {
+	if s.runtime == nil {
+		return false, nil
+	}
+	return s.runtime.GetActivationFirstMCPClient()
+}
+
 // serverUnquarantinerAdapter adapts *Server to scanner.ServerUnquarantiner so
 // the security scanner service can unquarantine a server after ApproveServer
 // succeeds. Reuses the existing Server.UnquarantineServer path so the behavior
@@ -2396,6 +2928,60 @@ func (a *serverUnquarantinerAdapter) UnquarantineServer(serverName string) error
 		return fmt.Errorf("server unavailable")
 	}
 	return a.server.UnquarantineServer(serverName)
+}
+
+// scanSummaryEnricherAdapter bridges scanner.Service.GetScanSummary (which
+// returns the scanner-internal *scanner.ScanSummary type) to
+// management.SecurityScanEnricher (which returns the wire-shape
+// *contracts.SecurityScanSummary used by REST and SSE consumers). Plain
+// field copy — the two structs are isomorphic by design.
+type scanSummaryEnricherAdapter struct {
+	scanner *scanner.Service
+}
+
+func (a *scanSummaryEnricherAdapter) GetSecurityScanSummary(ctx context.Context, serverName string) *contracts.SecurityScanSummary {
+	if a == nil || a.scanner == nil {
+		return nil
+	}
+	summary := a.scanner.GetScanSummary(ctx, serverName)
+	if summary == nil {
+		return nil
+	}
+	out := &contracts.SecurityScanSummary{
+		LastScanAt:     summary.LastScanAt,
+		RiskScore:      summary.RiskScore,
+		Status:         summary.Status,
+		ScannersRun:    summary.ScannersRun,
+		ScannersFailed: summary.ScannersFailed,
+		ScannersTotal:  summary.ScannersTotal,
+	}
+	if summary.FindingCounts != nil {
+		out.FindingCounts = &contracts.FindingCounts{
+			Dangerous: summary.FindingCounts.Dangerous,
+			Warning:   summary.FindingCounts.Warning,
+			Info:      summary.FindingCounts.Info,
+			Total:     summary.FindingCounts.Total,
+		}
+	}
+	// Surface the opt-in deep-scan layer status (Spec 077 US3). Always emitted
+	// on a computed summary; when the layer is off it reports enabled=false
+	// plus any enabled-but-skipped Docker scanners (audit FIX 3a).
+	if summary.DeepScan != nil {
+		ds := &contracts.DeepScanDescriptor{
+			Enabled:   summary.DeepScan.Enabled,
+			Ran:       summary.DeepScan.Ran,
+			Available: summary.DeepScan.Available,
+		}
+		for _, f := range summary.DeepScan.ScannersFailed {
+			ds.ScannersFailed = append(ds.ScannersFailed, contracts.DeepScanScannerFailure{
+				ID:     f.ID,
+				Reason: f.Reason,
+			})
+		}
+		ds.SkippedScanners = append(ds.SkippedScanners, summary.DeepScan.SkippedScanners...)
+		out.DeepScan = ds
+	}
+	return out
 }
 
 // keyringSecretStore adapts secret.Resolver to scanner.SecretStore for API key management.
@@ -2417,16 +3003,37 @@ func (k *keyringSecretStore) ResolveSecret(ctx context.Context, refStr string) (
 }
 
 // configServerInfoProvider implements scanner.ServerInfoProvider using the config and server.
+//
+// liveConfig returns the CURRENT config snapshot. It must be preferred over the
+// boot-time cfg field: the runtime swaps in a fresh immutable snapshot on every
+// reload, so a server added at runtime (e.g. from the registry) only appears in
+// the live snapshot. Resolving against the stale boot cfg made such servers
+// invisible to the scanner — the root cause of MCP-2123 ("No Source Available"
+// for a freshly-added Docker-isolated stdio server). cfg is kept as a fallback
+// for callers/tests that don't wire a live accessor.
 type configServerInfoProvider struct {
-	cfg    *config.Config
-	server *Server
+	cfg        *config.Config
+	liveConfig func() *config.Config
+	server     *Server
+}
+
+// currentConfig returns the live config when an accessor is wired, otherwise the
+// boot-time snapshot.
+func (p *configServerInfoProvider) currentConfig() *config.Config {
+	if p.liveConfig != nil {
+		if cfg := p.liveConfig(); cfg != nil {
+			return cfg
+		}
+	}
+	return p.cfg
 }
 
 func (p *configServerInfoProvider) GetServerInfo(serverName string) (*scanner.ServerInfo, error) {
-	if p.cfg == nil {
+	cfg := p.currentConfig()
+	if cfg == nil {
 		return nil, fmt.Errorf("no config available")
 	}
-	for _, sc := range p.cfg.Servers {
+	for _, sc := range cfg.Servers {
 		if sc.Name == serverName {
 			return &scanner.ServerInfo{
 				Name:       sc.Name,
@@ -2447,6 +3054,26 @@ func (p *configServerInfoProvider) GetServerTools(serverName string) ([]map[stri
 		return p.server.GetServerTools(serverName)
 	}
 	return nil, fmt.Errorf("server tools not available")
+}
+
+// GetAllServerTools implements scanner's optional allServerToolsProvider: it
+// returns every configured server's current tool definitions, keyed by server
+// name, so a scan can build a cross-server snapshot for the shadowing check.
+// Best-effort: servers that error or expose no tools are skipped, never fatal.
+func (p *configServerInfoProvider) GetAllServerTools() (map[string][]map[string]interface{}, error) {
+	cfg := p.currentConfig()
+	if cfg == nil || p.server == nil {
+		return nil, nil
+	}
+	all := make(map[string][]map[string]interface{}, len(cfg.Servers))
+	for _, sc := range cfg.Servers {
+		tools, err := p.server.GetServerTools(sc.Name)
+		if err != nil || len(tools) == 0 {
+			continue
+		}
+		all[sc.Name] = tools
+	}
+	return all, nil
 }
 
 // EnsureConnected attempts to connect a disconnected server so tool definitions

@@ -319,6 +319,17 @@ func MergeServerConfig(base, patch *ServerConfig, opts MergeOptions) (*ServerCon
 		merged.OAuth = newOAuth
 	}
 
+	// InitTimeout (MCP-3322): *Duration tri-state. A non-nil pointer in the
+	// patch sets/replaces the per-server override; nil leaves the base value
+	// (already carried by CopyServerConfig) untouched.
+	if patch.InitTimeout != nil {
+		it := *patch.InitTimeout
+		if diff != nil && (base.InitTimeout == nil || *base.InitTimeout != it) {
+			diff.Modified["init_timeout"] = FieldChange{Path: "init_timeout", From: base.InitTimeout, To: patch.InitTimeout}
+		}
+		merged.InitTimeout = &it
+	}
+
 	// Always update the Updated timestamp
 	merged.Updated = time.Now()
 
@@ -528,24 +539,35 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 	}
 
 	dst := &ServerConfig{
-		Name:              src.Name,
-		URL:               src.URL,
-		Protocol:          src.Protocol,
-		Command:           src.Command,
-		WorkingDir:        src.WorkingDir,
-		Enabled:           src.Enabled,
-		Quarantined:       src.Quarantined,
-		SkipQuarantine:    src.SkipQuarantine,
-		Shared:            src.Shared,
-		Created:           src.Created,
-		Updated:           src.Updated,
-		DisableEnrichment: src.DisableEnrichment,
+		Name:                     src.Name,
+		URL:                      src.URL,
+		Protocol:                 src.Protocol,
+		Command:                  src.Command,
+		WorkingDir:               src.WorkingDir,
+		Enabled:                  src.Enabled,
+		Quarantined:              src.Quarantined,
+		SkipQuarantine:           src.SkipQuarantine,
+		Shared:                   src.Shared,
+		Created:                  src.Created,
+		Updated:                  src.Updated,
+		LauncherWaitTimeout:      src.LauncherWaitTimeout,
+		ReconnectOnUse:           src.ReconnectOnUse,
+		SourceRegistryID:         src.SourceRegistryID,
+		SourceRegistryProvenance: src.SourceRegistryProvenance,
 	}
 
 	// Copy slices
 	if src.Args != nil {
 		dst.Args = make([]string, len(src.Args))
 		copy(dst.Args, src.Args)
+	}
+	if src.EnabledTools != nil {
+		dst.EnabledTools = make([]string, len(src.EnabledTools))
+		copy(dst.EnabledTools, src.EnabledTools)
+	}
+	if src.DisabledTools != nil {
+		dst.DisabledTools = make([]string, len(src.DisabledTools))
+		copy(dst.DisabledTools, src.DisabledTools)
 	}
 
 	// Copy maps
@@ -562,27 +584,37 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 		}
 	}
 
+	// Copy *bool by value (not pointer) to avoid shared state (MCP-2930)
+	if src.AutoApproveToolChanges != nil {
+		autoApprove := *src.AutoApproveToolChanges
+		dst.AutoApproveToolChanges = &autoApprove
+	}
+
+	// Copy *Duration overrides by value to avoid shared pointer state (spec 074)
+	if src.HealthCheckInterval != nil {
+		hc := *src.HealthCheckInterval
+		dst.HealthCheckInterval = &hc
+	}
+	if src.ToolDiscoveryInterval != nil {
+		td := *src.ToolDiscoveryInterval
+		dst.ToolDiscoveryInterval = &td
+	}
+	if src.InitTimeout != nil {
+		it := *src.InitTimeout
+		dst.InitTimeout = &it
+	}
+
+	// Copy the per-upstream auth-broker block by value (spec 074, server edition).
+	// In the personal edition AuthBrokerConfig is an empty stub struct, so this is
+	// a no-op there; copying by value keeps the pointer from being shared.
+	if src.AuthBroker != nil {
+		broker := *src.AuthBroker
+		dst.AuthBroker = &broker
+	}
+
 	// Copy nested structs
 	dst.Isolation = copyIsolationConfig(src.Isolation)
 	dst.OAuth = copyOAuthConfig(src.OAuth)
-
-	// Copy search/domain/enrichment fields
-	if src.SearchAliases != nil {
-		dst.SearchAliases = make([]string, len(src.SearchAliases))
-		copy(dst.SearchAliases, src.SearchAliases)
-	}
-	if src.DomainTags != nil {
-		dst.DomainTags = make([]string, len(src.DomainTags))
-		copy(dst.DomainTags, src.DomainTags)
-	}
-	if src.ToolAliases != nil {
-		dst.ToolAliases = make(map[string][]string, len(src.ToolAliases))
-		for k, v := range src.ToolAliases {
-			aliases := make([]string, len(v))
-			copy(aliases, v)
-			dst.ToolAliases[k] = aliases
-		}
-	}
 
 	return dst
 }

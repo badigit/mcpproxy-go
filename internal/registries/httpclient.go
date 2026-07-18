@@ -1,0 +1,276 @@
+package registries
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// registryRequestTimeout bounds a SINGLE registry HTTP request (connect + TLS
+	// handshake + awaiting response headers + body read). Retries layer on top via
+	// registryMaxAttempts so one slow page no longer aborts the whole listing.
+	//
+	// This MUST stay comfortably above what a real registry takes to answer. It
+	// was 15s, and the official registry
+	// (https://registry.modelcontextprotocol.io/v0.1/servers) currently takes
+	// ~18-20s to return its first page — so EVERY attempt timed out, all three
+	// retries burned, and browsing the official registry failed outright with
+	// "context deadline exceeded (Client.Timeout exceeded while awaiting
+	// headers)". That is the "the official registry doesn't work either" half of
+	// GH #783, reproduced live. 45s leaves real headroom over a ~20s registry
+	// without letting a truly hung host stall a fetch indefinitely.
+	registryRequestTimeout = 45 * time.Second
+
+	// registryMaxAttempts is the total number of attempts (1 initial + retries)
+	// for an idempotent registry GET before giving up.
+	registryMaxAttempts = 3
+)
+
+// registryRetryBaseDelay is the first backoff; each subsequent retry doubles it
+// (500ms, then 1s). A var (not const) so tests can shrink it.
+var registryRetryBaseDelay = 500 * time.Millisecond
+
+// registryMaxBodyBytes caps how much of a registry response we buffer in memory,
+// bounding a large or hostile body (a real official page of 100 servers is a few
+// hundred KB, so 16 MiB is generous). A var so tests can shrink it.
+var registryMaxBodyBytes int64 = 16 << 20
+
+var (
+	registryHTTPClientOnce sync.Once
+	registryHTTPClient     *http.Client
+)
+
+// sharedRegistryClient returns a process-wide HTTP client tuned for registry
+// fetches: connection keep-alives are reused across the cursor-follow loop, and
+// a per-request Timeout caps any single attempt so one slow page cannot stall
+// the whole listing. Retries are handled separately by registryGet.
+func sharedRegistryClient() *http.Client {
+	registryHTTPClientOnce.Do(func() {
+		registryHTTPClient = buildRegistryClient()
+	})
+	return registryHTTPClient
+}
+
+// buildRegistryClient constructs the tuned registry HTTP client. Its dialer
+// carries the SSRF Control hook (registryDialControl), so every connection is
+// checked against the blocked-range policy at the moment it dials the resolved
+// IP — the authoritative CWE-918 guard that also closes the DNS-rebinding window
+// a parse-time host check alone cannot.
+func buildRegistryClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 20
+	transport.MaxIdleConnsPerHost = 10
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   registryDialControl,
+	}).DialContext
+	return &http.Client{
+		Timeout:       registryRequestTimeout,
+		Transport:     transport,
+		CheckRedirect: checkRegistryRedirect,
+	}
+}
+
+// checkRegistryRedirect re-applies the fetch guards to EVERY redirect hop.
+//
+// Without this, validateRegistryURL/guardRegistryTargetHost bound only the
+// initial URL while the client happily followed a `302 Location:` anywhere: to
+// the cloud-metadata endpoint (where, with an HTTP(S)_PROXY set, the dial-time
+// Control hook never even sees the real target), or to a different public host,
+// escaping the host pin that exists so a registry-supplied value cannot redirect
+// our fetch elsewhere. A registry is an API on one host; it has no business
+// bouncing us to another one.
+func checkRegistryRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("%w: chain too long (%d hops)", ErrRegistryRedirectRefused, len(via))
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return fmt.Errorf("%w: scheme %q not allowed (want http/https)", ErrRegistryRedirectRefused, req.URL.Scheme)
+	}
+	// Pin every hop to the host we originally dialed.
+	origin := via[0].URL
+	if !strings.EqualFold(req.URL.Host, origin.Host) {
+		return fmt.Errorf("%w: redirect to %q left the configured host %q", ErrRegistryRedirectRefused, req.URL.Host, origin.Host)
+	}
+	if err := hostLiteralBlocked(req.URL.Host, registryAllowPrivateFetch.Load()); err != nil {
+		return err
+	}
+	return guardRegistryTargetHost(req.Context(), req.URL.String())
+}
+
+// registryGet performs an idempotent GET against a registry endpoint with the
+// standard headers (Accept JSON, versioned User-Agent, and any configured key)
+// and returns the fully-read response body on a 200. Transient failures are
+// retried with exponential backoff: connection errors, per-request timeouts
+// (including ones that fire mid-body-read — http.Client.Timeout covers the whole
+// request, so the body is read INSIDE the attempt loop), and 5xx/429 responses.
+// The parent ctx bounds the whole operation — once it is done, no further
+// attempts are made. A non-2xx final status returns an error.
+func registryGet(ctx context.Context, reg *RegistryEntry, reqURL string) ([]byte, error) {
+	// Pin the outbound request to the registry's configured http(s) host before
+	// it is issued. This bounds CWE-918 (request forgery): the official
+	// protocol's cursor-follow pagination builds each page URL from a
+	// registry-supplied nextCursor, and this guard guarantees a hostile cursor
+	// can never redirect the fetch off the configured host or onto a non-http
+	// scheme (file://, gopher://, …).
+	safeURL, err := validateRegistryURL(reqURL, reg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Application-layer SSRF guard: resolve the target host and reject if it
+	// lands in a blocked range. This holds even with an HTTP(S)_PROXY set, where
+	// the dialer connects to the proxy and the dial-time Control never sees the
+	// real target host (CodeQL go/request-forgery — proxy bypass).
+	if err := guardRegistryTargetHost(ctx, safeURL); err != nil {
+		return nil, err
+	}
+
+	client := sharedRegistryClient()
+
+	var lastErr error
+	for attempt := 1; attempt <= registryMaxAttempts; attempt++ {
+		if attempt > 1 {
+			// Back off before retrying, but bail out immediately if the parent
+			// context is already done.
+			delay := registryRetryBaseDelay * time.Duration(1<<(attempt-2))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, safeURL, http.NoBody)
+		if err != nil {
+			// A malformed request is not transient — fail fast.
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Accept", "application/json")
+		// Some registries reject empty/bare User-Agents (issue #566).
+		req.Header.Set("User-Agent", registryUserAgent())
+		// Opt-in registries (RequiresKey, e.g. Smithery) authenticate via their
+		// configured key.
+		applyRegistryAuth(req, reg)
+
+		// Whether a request/response/body-read error is worth retrying is decided
+		// against the PARENT ctx, never the error value. NOTE: a per-request
+		// Client.Timeout (incl. one firing during the body read) surfaces as
+		// context.DeadlineExceeded, so inspecting the parent ctx is what
+		// distinguishes "this attempt was slow" (retry) from "the whole operation
+		// is over" (stop) — the exact slow-page case this fixes.
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+
+		// Cap the buffered body so a large/hostile response can't OOM us. Read
+		// one byte past the cap to detect an over-limit body.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, registryMaxBodyBytes+1))
+		resp.Body.Close()
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, readErr
+			}
+			lastErr = readErr
+			continue
+		}
+		if int64(len(body)) > registryMaxBodyBytes {
+			// Not transient — a retry would hit the same oversized body.
+			return nil, fmt.Errorf("registry response exceeds %d bytes", registryMaxBodyBytes)
+		}
+
+		// Retry server-side failures while attempts remain.
+		if isRetryableStatus(resp.StatusCode) && attempt < registryMaxAttempts {
+			lastErr = fmt.Errorf("registry returned %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, &registryStatusError{StatusCode: resp.StatusCode}
+		}
+
+		return body, nil
+	}
+
+	return nil, lastErr
+}
+
+// ErrRegistryRedirectRefused means a registry answered with a redirect our policy
+// will not follow (off the configured host, a non-http scheme, or too many hops).
+// Like a non-200 status, this is the host ANSWERING — so the add-time probe must
+// treat it as a definitive verdict about the source, not as "the network is down"
+// (which would tolerate it and persist a registry that can never work).
+var ErrRegistryRedirectRefused = errors.New("registry redirect refused")
+
+// registryStatusError is the error registryGet returns when a registry ANSWERED
+// with a non-200 status. It is distinct from a transport failure so the add-time
+// probe can tell "this URL is definitively not a registry" (refuse the add) from
+// "the host is unreachable right now" (tolerate it — the user may be offline).
+type registryStatusError struct {
+	StatusCode int
+}
+
+func (e *registryStatusError) Error() string {
+	return fmt.Sprintf("registry query returned %d %s", e.StatusCode, http.StatusText(e.StatusCode))
+}
+
+// isRetryableStatus reports whether an HTTP status warrants a retry: server-side
+// failures (5xx) and rate limiting (429) are transient; other 4xx client errors
+// are not.
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// validateRegistryURL bounds an outbound registry request (CWE-918 request
+// forgery): the returned URL is re-serialized from a freshly parsed value whose
+// scheme is constrained to http/https and whose host is pinned to the registry's
+// configured ServersURL host. Pagination URLs (which embed a registry-supplied
+// nextCursor) and the base endpoint both flow through here, so a hostile cursor
+// or a redirect-style payload cannot point the fetch at an arbitrary host or a
+// non-http scheme. Returns the validated URL string to use for the request.
+func validateRegistryURL(reqURL string, reg *RegistryEntry) (string, error) {
+	u, err := url.Parse(reqURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid request URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("registry request scheme %q not allowed (want http/https)", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("registry request URL has no host")
+	}
+	// SSRF pre-flight (CWE-918): reject a literal-IP host in a blocked
+	// (loopback/private/link-local/metadata) range before the request is built.
+	// This is defense-in-depth alongside the authoritative dial-time guard
+	// (registryDialControl), which also covers hostnames resolving into those
+	// ranges. Relaxed by the allow_private_registry_fetch config opt-in.
+	if err := hostLiteralBlocked(u.Host, registryAllowPrivateFetch.Load()); err != nil {
+		return "", err
+	}
+	// Pin to the configured registry host so a tainted cursor/path cannot
+	// redirect the request elsewhere.
+	if reg != nil && reg.ServersURL != "" {
+		base, err := url.Parse(reg.ServersURL)
+		if err != nil {
+			return "", fmt.Errorf("invalid registry servers URL %q: %w", reg.ServersURL, err)
+		}
+		if !strings.EqualFold(u.Host, base.Host) {
+			return "", fmt.Errorf("registry request host %q does not match configured host %q", u.Host, base.Host)
+		}
+	}
+	return u.String(), nil
+}

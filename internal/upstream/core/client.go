@@ -19,6 +19,8 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secureenv"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	proxytransport "github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/launcher"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -67,6 +69,14 @@ type Client struct {
 	// when multiple requests are in-flight simultaneously
 	sseRequestMu sync.Mutex
 
+	// brokeredAuth, when set, is the per-user upstream credential the gateway
+	// resolved for this (user, server) connection. The headers-auth strategy
+	// injects it into the configured outbound header, replacing any inbound or
+	// statically-configured auth — the gateway/IdP token is never forwarded
+	// (spec 074 FR-016/FR-017). nil for non-brokered upstreams (unchanged
+	// behaviour).
+	brokeredAuth *proxytransport.BrokeredAuth
+
 	// Transport type and stderr access (for stdio)
 	transportType string
 	stderr        io.Reader
@@ -74,22 +84,48 @@ type Client struct {
 	// Cached tools list from successful immediate call
 	cachedTools []mcp.Tool
 
-	// Stderr monitoring
+	// monitoringMu serializes the stderr/process monitoring lifecycle methods
+	// (Start*/Stop*Monitoring). Connect (StartStderrMonitoring) and Disconnect
+	// (StopStderrMonitoring) can run concurrently on the same client during a
+	// reconcile-vs-shutdown overlap, racing the ctx/cancel/WaitGroup fields
+	// below (notably WG.Add vs WG.Wait). This mutex makes start and stop
+	// mutually exclusive. It is never held across c.mu.
+	monitoringMu sync.Mutex
+
+	// Stderr monitoring. stderrMonitoringDone is a per-cycle channel closed by
+	// the monitor goroutine when it exits; Stop waits on it instead of a reused
+	// sync.WaitGroup, so an abandoned (timed-out) wait never races a later
+	// Start's counter. All three fields are written only under monitoringMu.
 	stderrMonitoringCtx    context.Context
 	stderrMonitoringCancel context.CancelFunc
-	stderrMonitoringWG     sync.WaitGroup
+	stderrMonitoringDone   chan struct{}
+
+	// Ring buffer of recent stderr lines from the subprocess.
+	// Populated by monitorStderr; surfaced in initialize failure messages so
+	// users don't have to hunt through server logs to see why the child
+	// process never responded.
+	recentStderrMu sync.Mutex
+	recentStderr   []string
 
 	// Process monitoring (for stdio transport)
 	processCmd           *exec.Cmd
 	processGroupID       int // Process group ID for proper cleanup
 	processMonitorCtx    context.Context
 	processMonitorCancel context.CancelFunc
-	processMonitorWG     sync.WaitGroup
+	processMonitorDone   chan struct{}
 
 	// Docker container tracking
 	containerID     string
 	containerName   string // Store container name for cleanup via docker container commands
 	isDockerCommand bool
+
+	// Local launcher tracking — only populated when this Client is using
+	// HTTP/SSE/streamable-HTTP transport AND ServerConfig.Command is set.
+	// In that mode mcpproxy spawns the upstream process before connecting,
+	// and owns its lifecycle via the handle below. Stdio servers leave
+	// these fields nil — they spawn through mcp-go's stdio transport.
+	launcherHandle  launcher.Handle
+	launcherCIDFile string
 
 	// Notification callback for tools/list_changed
 	onToolsChanged func(serverName string)
@@ -146,6 +182,10 @@ func NewClientWithOptions(id string, serverConfig *config.ServerConfig, logger *
 		// Create a copy of the config to avoid modifying the original
 		envConfigCopy := *envConfig
 		envConfigCopy.EnhancePath = true
+		// MCP-2769: opt-in proxy env forwarding to spawned stdio upstreams.
+		if globalConfig != nil {
+			envConfigCopy.ForwardProxyEnv = globalConfig.ForwardProxyEnv
+		}
 		envConfig = &envConfigCopy
 	}
 
@@ -212,6 +252,23 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
+// Ping issues the MCP-standard lightweight liveness check (`ping`) to the
+// upstream server. It is used by the managed client's health loop as a cheap
+// replacement for re-listing every tool just to confirm the connection is
+// alive (spec 074, FR-001). Returns an error if the client is not connected or
+// the request fails so the caller can classify and drive reconnection.
+func (c *Client) Ping(ctx context.Context) error {
+	c.mu.RLock()
+	client := c.client
+	c.mu.RUnlock()
+
+	if !c.IsConnected() || client == nil {
+		return fmt.Errorf("client not connected")
+	}
+
+	return client.Ping(ctx)
+}
+
 // ListTools retrieves available tools from the upstream server
 func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) {
 	c.mu.RLock()
@@ -269,11 +326,19 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 			paramsJSON = string(schemaBytes)
 		}
 
+		// Spec 056 (FR-A1): capture the tool's declared output schema so it is
+		// available at call time for output-schema validation. captureOutputSchemaJSON
+		// (Spec 056 / #527) prefers raw schema bytes and normalizes them for a stable
+		// contract hash; a tool with no declared schema yields "", making validation a
+		// no-op (FR-A7).
+		outputSchemaJSON := captureOutputSchemaJSON(tool)
+
 		toolMeta := &config.ToolMetadata{
-			ServerName:  c.config.Name,
-			Name:        tool.Name,
-			Description: tool.Description,
-			ParamsJSON:  paramsJSON,
+			ServerName:       c.config.Name,
+			Name:             tool.Name,
+			Description:      tool.Description,
+			ParamsJSON:       paramsJSON,
+			OutputSchemaJSON: outputSchemaJSON,
 		}
 
 		// Copy tool annotations if any are set
@@ -302,24 +367,9 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 			}
 		}
 
-		// Apply per-server annotation defaults for tools without annotations
-		if c.config.AnnotationDefaults != nil {
-			if toolMeta.Annotations == nil {
-				toolMeta.Annotations = &config.ToolAnnotations{
-					Title:           c.config.AnnotationDefaults.Title,
-					ReadOnlyHint:    c.config.AnnotationDefaults.ReadOnlyHint,
-					DestructiveHint: c.config.AnnotationDefaults.DestructiveHint,
-					IdempotentHint:  c.config.AnnotationDefaults.IdempotentHint,
-					OpenWorldHint:   c.config.AnnotationDefaults.OpenWorldHint,
-				}
-			} else {
-				mergeAnnotationDefaults(toolMeta.Annotations, c.config.AnnotationDefaults)
-			}
-		}
-
-		// Compute hash for tool change detection
-		// Hash is based on serverName + toolName + inputSchema
-		toolMeta.Hash = hash.ComputeToolHash(c.config.Name, tool.Name, tool.Description, tool.InputSchema)
+		// Compute hash for tool change detection.
+		// Hash is based on serverName + toolName + description + inputSchema + outputSchema.
+		toolMeta.Hash = hash.ComputeToolHashWithOutputSchema(c.config.Name, tool.Name, tool.Description, tool.InputSchema, outputSchemaJSON)
 
 		tools = append(tools, toolMeta)
 	}
@@ -356,6 +406,9 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 
 	request := mcp.CallToolRequest{}
 	request.Params.Name = toolName
+	if args == nil {
+		args = map[string]interface{}{}
+	}
 	request.Params.Arguments = args
 
 	// Log to server-specific log
@@ -740,24 +793,4 @@ func containsString(str, substr string) bool {
 		}
 	}
 	return false
-}
-
-// mergeAnnotationDefaults fills nil hint fields in dst from defaults.
-// Explicit upstream values are never overridden.
-func mergeAnnotationDefaults(dst, defaults *config.ToolAnnotations) {
-	if dst.ReadOnlyHint == nil && defaults.ReadOnlyHint != nil {
-		dst.ReadOnlyHint = defaults.ReadOnlyHint
-	}
-	if dst.DestructiveHint == nil && defaults.DestructiveHint != nil {
-		dst.DestructiveHint = defaults.DestructiveHint
-	}
-	if dst.IdempotentHint == nil && defaults.IdempotentHint != nil {
-		dst.IdempotentHint = defaults.IdempotentHint
-	}
-	if dst.OpenWorldHint == nil && defaults.OpenWorldHint != nil {
-		dst.OpenWorldHint = defaults.OpenWorldHint
-	}
-	if dst.Title == "" && defaults.Title != "" {
-		dst.Title = defaults.Title
-	}
 }

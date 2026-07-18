@@ -3,12 +3,6 @@ import Dashboard from '@/views/Dashboard.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
-  scrollBehavior() {
-    // Scroll main content area to top on every navigation
-    const main = document.querySelector('main.overflow-y-auto')
-    if (main) main.scrollTop = 0
-    return { top: 0 }
-  },
   routes: [
     // Server edition auth routes
     {
@@ -89,6 +83,14 @@ const router = createRouter({
       component: () => import('@/views/Sessions.vue'),
       meta: {
         title: 'MCP Sessions',
+      },
+    },
+    {
+      path: '/tools',
+      name: 'tools',
+      component: () => import('@/views/Tools.vue'),
+      meta: {
+        title: 'Tools',
       },
     },
     {

@@ -1,6 +1,6 @@
 # MCPProxy Makefile
 
-.PHONY: help build build-server build-docker build-deb swagger swagger-verify frontend-build frontend-dev backend-dev clean test test-coverage test-e2e test-e2e-oauth lint dev-setup docs-setup docs-dev docs-build docs-clean
+.PHONY: help build build-server build-docker build-deb swagger swagger-verify frontend-build frontend-dev backend-dev clean test test-coverage test-e2e test-e2e-oauth lint dev-setup docs-setup docs-dev docs-build docs-clean bench-discovery
 
 SWAGGER_BIN ?= $(HOME)/go/bin/swag
 SWAGGER_OUT ?= oas
@@ -33,6 +33,9 @@ help:
 	@echo "  make docs-dev        - Start docs dev server (http://localhost:3000)"
 	@echo "  make docs-build      - Build documentation site locally"
 	@echo "  make docs-clean      - Clean documentation build artifacts"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  make bench-discovery - Run the discovery-effectiveness profiler (spec 083, offline arms)"
 
 # Generate OpenAPI specification
 swagger:
@@ -74,8 +77,13 @@ frontend-build:
 	cd frontend && npm install && npm run build
 	@echo "📁 Copying dist files for embedding..."
 	rm -rf web/frontend
-	mkdir -p web/frontend
-	cp -r frontend/dist web/frontend/
+	mkdir -p web/frontend/dist
+	cp -r frontend/dist/. web/frontend/dist/
+	# Recreate the tracked .gitkeep so //go:embed all:frontend/dist still has
+	# something to embed even before the real UI is built (e.g. on a fresh
+	# `go install …@latest`), and so subsequent rebuilds don't show a phantom
+	# "deleted .gitkeep" in `git status`.
+	touch web/frontend/dist/.gitkeep
 	@echo "✅ Frontend build completed"
 
 # Start frontend development server
@@ -134,7 +142,7 @@ test-coverage:
 # Run linter
 lint:
 	@echo "🔍 Running Go linter..."
-	golangci-lint run ./...
+	golangci-lint run --config .github/.golangci.yml ./...
 	@echo "🔍 Running frontend linter..."
 	cd frontend && npm install && npm run lint
 
@@ -190,3 +198,15 @@ docs-clean:
 	@echo "🧹 Cleaning documentation artifacts..."
 	rm -rf website/build website/.docusaurus website/node_modules website/docs
 	@echo "✅ Documentation cleanup complete"
+
+# Discovery-effectiveness profiler (spec 083, SC-008): pinned TSCG shim deps +
+# offline arm run on the schema-bearing frozen corpus. CI calls this target.
+bench-discovery:
+	@echo "📦 Installing pinned TSCG shim dependencies (bench/tscg)..."
+	npm ci --prefix bench/tscg
+	@echo "📊 Running discovery-effectiveness benchmark (offline, all arms)..."
+	go run ./bench/cmd/bench \
+		-corpus-v2 specs/083-discovery-profiler/datasets/corpus_v2.tools.json \
+		-arms all \
+		-out bench/results
+	@echo "✅ Reports written to bench/results/ (report.json + dashboard.html)"

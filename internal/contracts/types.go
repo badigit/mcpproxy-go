@@ -3,6 +3,8 @@ package contracts
 
 import (
 	"time"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
 
 // APIResponse is the standard wrapper for all API responses
@@ -15,41 +17,95 @@ type APIResponse struct {
 
 // Server represents an upstream MCP server configuration and status
 type Server struct {
-	ID                string               `json:"id"`
-	Name              string               `json:"name"`
-	URL               string               `json:"url,omitempty"`
-	Protocol          string               `json:"protocol"`
-	Command           string               `json:"command,omitempty"`
-	Args              []string             `json:"args,omitempty"`
-	WorkingDir        string               `json:"working_dir,omitempty"`
-	Env               map[string]string    `json:"env,omitempty"`
-	Headers           map[string]string    `json:"headers,omitempty"`
-	OAuth             *OAuthConfig         `json:"oauth,omitempty"`
-	Enabled           bool                 `json:"enabled"`
-	Quarantined       bool                 `json:"quarantined"`
-	Connected         bool                 `json:"connected"`
-	Connecting        bool                 `json:"connecting"`
-	Status            string               `json:"status"`
-	LastError         string               `json:"last_error,omitempty"`
-	ConnectedAt       *time.Time           `json:"connected_at,omitempty"`
-	LastReconnectAt   *time.Time           `json:"last_reconnect_at,omitempty"`
-	ReconnectCount    int                  `json:"reconnect_count"`
-	ToolCount         int                  `json:"tool_count"`
-	Created           time.Time            `json:"created"`
-	Updated           time.Time            `json:"updated"`
-	Isolation         *IsolationConfig     `json:"isolation,omitempty"`
-	Authenticated     bool                 `json:"authenticated"`                  // OAuth authentication status
-	OAuthStatus       string               `json:"oauth_status,omitempty"`         // OAuth status: "authenticated", "expired", "error", "none"
-	TokenExpiresAt    *time.Time           `json:"token_expires_at,omitempty"`     // When the OAuth token expires (ISO 8601)
-	ToolListTokenSize int                  `json:"tool_list_token_size,omitempty"` // Token size for this server's tools
-	ShouldRetry       bool                 `json:"should_retry,omitempty"`
-	RetryCount        int                  `json:"retry_count,omitempty"`
-	LastRetryTime     *time.Time           `json:"last_retry_time,omitempty"`
-	UserLoggedOut     bool                 `json:"user_logged_out,omitempty"`  // True if user explicitly logged out (prevents auto-reconnection)
-	Health            *HealthStatus        `json:"health,omitempty"`           // Unified health status calculated by the backend
-	Quarantine        *QuarantineStats     `json:"quarantine,omitempty"`       // Tool quarantine metrics for this server
-	ReconnectOnUse    bool                 `json:"reconnect_on_use,omitempty"` // Attempt reconnection when a tool call targets this disconnected server
-	SecurityScan      *SecurityScanSummary `json:"security_scan,omitempty"`    // Latest security scan results summary
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	URL             string            `json:"url,omitempty"`
+	Protocol        string            `json:"protocol"`
+	Command         string            `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	WorkingDir      string            `json:"working_dir,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	OAuth           *OAuthConfig      `json:"oauth,omitempty"`
+	Enabled         bool              `json:"enabled"`
+	Quarantined     bool              `json:"quarantined"`
+	Connected       bool              `json:"connected"`
+	Connecting      bool              `json:"connecting"`
+	Status          string            `json:"status"`
+	LastError       string            `json:"last_error,omitempty"`
+	ConnectedAt     *time.Time        `json:"connected_at,omitempty"`
+	LastReconnectAt *time.Time        `json:"last_reconnect_at,omitempty"`
+	ReconnectCount  int               `json:"reconnect_count"`
+	ToolCount       int               `json:"tool_count"`
+	Created         time.Time         `json:"created"`
+	Updated         time.Time         `json:"updated"`
+	Isolation       *IsolationConfig  `json:"isolation,omitempty"`
+	// IsolationDefaults exposes the resolved baseline values that
+	// would apply when no per-server override is set. Populated on
+	// list/get responses; never consumed on PATCH requests.
+	IsolationDefaults *IsolationDefaults `json:"isolation_defaults,omitempty"`
+	Authenticated     bool               `json:"authenticated"`                  // OAuth authentication status
+	OAuthStatus       string             `json:"oauth_status,omitempty"`         // OAuth status: "authenticated", "expired", "error", "none"
+	TokenExpiresAt    *time.Time         `json:"token_expires_at,omitempty"`     // When the OAuth token expires (ISO 8601)
+	ToolListTokenSize int                `json:"tool_list_token_size,omitempty"` // Token size for this server's tools
+	ShouldRetry       bool               `json:"should_retry,omitempty"`
+	RetryCount        int                `json:"retry_count,omitempty"`
+	LastRetryTime     *time.Time         `json:"last_retry_time,omitempty"`
+	UserLoggedOut     bool               `json:"user_logged_out,omitempty"`  // True if user explicitly logged out (prevents auto-reconnection)
+	Health            *HealthStatus      `json:"health,omitempty"`           // Unified health status calculated by the backend
+	Quarantine        *QuarantineStats   `json:"quarantine,omitempty"`       // Tool quarantine metrics for this server
+	ReconnectOnUse    bool               `json:"reconnect_on_use,omitempty"` // Attempt reconnection when a tool call targets this disconnected server
+	// AutoApproveToolChanges mirrors config.ServerConfig.AutoApproveToolChanges
+	// (MCP-2930): the per-server intent to auto-approve new/changed tools past
+	// the trust baseline. Tri-state *bool — nil means "never set" (omitted from
+	// the payload), so the Web UI toggle (MCP-2932) can distinguish unset from
+	// an explicit false. Read-only on the GET path; PATCH/POST accept it via
+	// AddServerRequest.
+	AutoApproveToolChanges *bool `json:"auto_approve_tool_changes,omitempty"`
+	// InitTimeout mirrors config.ServerConfig.InitTimeout (MCP-3322 / GH #760):
+	// the per-server MCP `initialize` handshake deadline override. Serialized as
+	// a duration string (e.g. "120s"); nil/omitted means "inherit the global
+	// default". Surfaced on the GET path so clients can read back a configured
+	// override; PATCH/POST accept it via AddServerRequest.
+	InitTimeout  *config.Duration     `json:"init_timeout,omitempty" swaggertype:"string"`
+	SecurityScan *SecurityScanSummary `json:"security_scan,omitempty"` // Latest security scan results summary
+	// Spec 044 — structured diagnostic error and stable error code. Both
+	// are populated when the server is in a failed state and the error
+	// has been classified by internal/diagnostics. Healthy servers omit
+	// these fields.
+	Diagnostic *Diagnostic `json:"diagnostic,omitempty"`
+	ErrorCode  string      `json:"error_code,omitempty"`
+	// MCP-901 — registry provenance of an upstream that was added from a
+	// registry. SourceRegistryID names the source registry (empty for
+	// manually-configured servers); SourceRegistryProvenance is the trust tag
+	// recorded at add time ("official/trusted" or "custom/unverified"). Both
+	// are projected from config.ServerConfig so the approval/quarantine view
+	// can render an "added from <registry> · unverified" origin badge. Optional
+	// and omitted when empty — clients that pre-date this treat them as absent.
+	SourceRegistryID         string `json:"source_registry_id,omitempty"`
+	SourceRegistryProvenance string `json:"source_registry_provenance,omitempty"`
+}
+
+// Diagnostic is the REST-API representation of a classified server failure.
+// It is additive: clients that pre-date spec 044 simply ignore it.
+type Diagnostic struct {
+	Code        string              `json:"code"`
+	Severity    string              `json:"severity"`
+	Cause       string              `json:"cause,omitempty"`
+	DetectedAt  *time.Time          `json:"detected_at,omitempty"`
+	UserMessage string              `json:"user_message,omitempty"`
+	FixSteps    []DiagnosticFixStep `json:"fix_steps,omitempty"`
+	DocsURL     string              `json:"docs_url,omitempty"`
+}
+
+// DiagnosticFixStep mirrors internal/diagnostics.FixStep for the REST API.
+type DiagnosticFixStep struct {
+	Type        string `json:"type"`
+	Label       string `json:"label"`
+	Command     string `json:"command,omitempty"`
+	URL         string `json:"url,omitempty"`
+	FixerKey    string `json:"fixer_key,omitempty"`
+	Destructive bool   `json:"destructive,omitempty"`
 }
 
 // SecurityScanSummary provides a compact scan status for the server list view.
@@ -58,6 +114,44 @@ type SecurityScanSummary struct {
 	RiskScore     int            `json:"risk_score"` // 0-100
 	Status        string         `json:"status"`     // "clean", "warnings", "dangerous", "failed", "not_scanned", "scanning"
 	FindingCounts *FindingCounts `json:"finding_counts,omitempty"`
+	// Scanner coverage for the primary (baseline) scan pass — informational only.
+	// Spec 077 US3 (FR-008/FR-014): Status is derived SOLELY from the
+	// deterministic baseline findings; a failed Docker deep scanner no longer
+	// downgrades a clean verdict. That failure is surfaced via DeepScan instead.
+	ScannersRun    int `json:"scanners_run"`
+	ScannersFailed int `json:"scanners_failed"`
+	ScannersTotal  int `json:"scanners_total"`
+	// DeepScan reports the opt-in "deep scan" layer status (Spec 077 US3),
+	// SEPARATELY from the baseline verdict above. Always emitted on a computed
+	// summary — when deep scan is off (the default) it reports enabled=false
+	// plus any enabled-but-skipped Docker scanners. It never influences Status.
+	DeepScan *DeepScanDescriptor `json:"deep_scan,omitempty"`
+}
+
+// DeepScanDescriptor reports the informational status of the opt-in "deep scan"
+// layer (Docker-based scanners + source extraction) separately from the
+// baseline verdict (Spec 077 US3, FR-008). A disabled, unavailable, or failed
+// deep scan is a quiet note — it never downgrades an otherwise clean baseline
+// and never gates approval.
+//
+// Invariant: when Enabled is false, Ran and Available are false and
+// ScannersFailed is empty; SkippedScanners is only populated in that disabled
+// state.
+type DeepScanDescriptor struct {
+	Enabled        bool                     `json:"enabled"`
+	Ran            bool                     `json:"ran"`
+	Available      bool                     `json:"available"`
+	ScannersFailed []DeepScanScannerFailure `json:"scanners_failed,omitempty"`
+	// SkippedScanners lists Docker scanners the user enabled that are skipped
+	// because security.deep_scan.enabled is false (informational).
+	SkippedScanners []string `json:"skipped_scanners,omitempty"`
+}
+
+// DeepScanScannerFailure names a single deep scanner that could not run and why.
+// It is informational only and never affects the baseline verdict.
+type DeepScanScannerFailure struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // FindingCounts groups findings by user-facing threat category.
@@ -72,6 +166,7 @@ type FindingCounts struct {
 type QuarantineStats struct {
 	PendingCount int `json:"pending_count"` // Number of newly discovered tools awaiting approval
 	ChangedCount int `json:"changed_count"` // Number of tools whose description/schema changed since approval
+	BlockedCount int `json:"blocked_count"` // Number of disabled (blocked) tools
 }
 
 // OAuthConfig represents OAuth configuration for a server
@@ -87,14 +182,39 @@ type OAuthConfig struct {
 	TokenValid     bool              `json:"token_valid,omitempty"`      // Whether token is currently valid
 }
 
-// IsolationConfig represents Docker isolation configuration
+// IsolationConfig represents Docker isolation configuration as it is
+// exposed over the REST API. Mirrors the per-server overrides in
+// config.IsolationConfig so the web UI and native tray can both edit
+// these fields without reaching into config-file internals.
 type IsolationConfig struct {
-	Enabled     bool   `json:"enabled"`
-	Image       string `json:"image,omitempty"`
-	MemoryLimit string `json:"memory_limit,omitempty"`
-	CPULimit    string `json:"cpu_limit,omitempty"`
-	WorkingDir  string `json:"working_dir,omitempty"`
-	Timeout     string `json:"timeout,omitempty"`
+	Enabled     bool     `json:"enabled"`
+	Image       string   `json:"image,omitempty"`
+	NetworkMode string   `json:"network_mode,omitempty"`
+	ExtraArgs   []string `json:"extra_args,omitempty"`
+	MemoryLimit string   `json:"memory_limit,omitempty"`
+	CPULimit    string   `json:"cpu_limit,omitempty"`
+	WorkingDir  string   `json:"working_dir,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+}
+
+// IsolationDefaults reports the resolved baseline Docker isolation
+// settings for a server's detected runtime. UI clients (web UI, macOS
+// tray) use this to render meaningful placeholders for the override
+// fields — e.g. when a Python/uvx server has no Image override, the
+// placeholder shows the actual image (`ghcr.io/astral-sh/uv:python3.13-...`)
+// that will be used. This makes the "empty = inherit" semantic
+// discoverable instead of mysterious.
+//
+// All fields are read-only outputs; clients must not echo them back on
+// PATCH requests. They are computed from the global DockerIsolationConfig
+// + the server's command (via runtime detection) on every server-list
+// response.
+type IsolationDefaults struct {
+	RuntimeType string   `json:"runtime_type,omitempty"`
+	Image       string   `json:"image,omitempty"`
+	NetworkMode string   `json:"network_mode,omitempty"`
+	ExtraArgs   []string `json:"extra_args,omitempty"`
+	WorkingDir  string   `json:"working_dir,omitempty"`
 }
 
 // ToolAnnotation represents MCP tool behavior hints
@@ -121,6 +241,12 @@ type MCPSession struct {
 	HasRoots     bool     `json:"has_roots,omitempty"`
 	HasSampling  bool     `json:"has_sampling,omitempty"`
 	Experimental []string `json:"experimental,omitempty"`
+
+	// Workspace / work session (Spec 082). WorkspaceName is the project's
+	// basename — the full local path is never exposed. WorkSessionID groups the
+	// reconnects that make up one stretch of user work.
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	WorkSessionID string `json:"work_session_id,omitempty"`
 }
 
 // Tool represents an MCP tool with its metadata
@@ -133,6 +259,53 @@ type Tool struct {
 	LastUsed       *time.Time             `json:"last_used,omitempty"`
 	Annotations    *ToolAnnotation        `json:"annotations,omitempty"`
 	ApprovalStatus string                 `json:"approval_status,omitempty"`
+	// Disabled mirrors ToolApprovalRecord.Disabled so per-tool enable state is
+	// available without a second round-trip to the approvals endpoint. Absent
+	// in the JSON when false (default) to keep responses compact.
+	Disabled bool `json:"disabled,omitempty"`
+	// ConfigDenied is true when the tool is denied by the server's static
+	// enabled_tools / disabled_tools config. The user cannot override this toggle.
+	ConfigDenied bool `json:"config_denied,omitempty"`
+}
+
+// DisabledToolStatus is the single machine-branchable reason a tool exists but
+// is not callable (Spec 049). Exactly one value per locked tool. The
+// classifier (classifyServerToolStatus) assigns the index-discoverable reasons
+// by fixed first-match precedence (server-off → config → user → pending →
+// unknown). DisabledStatusServerQuarantined is assigned separately by the
+// quarantined-tool discovery pass (quarantined tools are never in the index),
+// not by the classifier.
+type DisabledToolStatus = string
+
+const (
+	DisabledStatusServerDisabled    DisabledToolStatus = "server_disabled"
+	DisabledStatusServerQuarantined DisabledToolStatus = "server_quarantined"
+	DisabledStatusByConfig          DisabledToolStatus = "disabled_by_config"
+	DisabledStatusByUser            DisabledToolStatus = "disabled_by_user"
+	DisabledStatusPendingApproval   DisabledToolStatus = "pending_approval"
+	DisabledStatusUnknown           DisabledToolStatus = "disabled_unknown"
+)
+
+// LockedToolEntry is the lean discovery shape for a non-callable tool returned
+// by retrieve_tools when include_disabled=true (Spec 049). No input schema —
+// the agent only needs enough to tell the user the capability exists and why.
+type LockedToolEntry struct {
+	Name        string             `json:"name"`
+	Server      string             `json:"server"`
+	Description string             `json:"description"`
+	Status      DisabledToolStatus `json:"status"`
+}
+
+// ServerToolCounts is a compact per-server rollup of tool callability,
+// attached to an upstream_servers entry only when a non-callable count > 0
+// (Spec 049). Zero-valued reasons are omitted to keep the payload minimal.
+type ServerToolCounts struct {
+	Callable         int `json:"callable"`
+	DisabledByConfig int `json:"disabled_by_config,omitempty"`
+	DisabledByUser   int `json:"disabled_by_user,omitempty"`
+	PendingApproval  int `json:"pending_approval,omitempty"`
+	ServerDisabled   int `json:"server_disabled,omitempty"`
+	DisabledUnknown  int `json:"disabled_unknown,omitempty"`
 }
 
 // SearchResult represents a search result for tools
@@ -160,6 +333,66 @@ type ServerTokenMetrics struct {
 	SavedTokens             int            `json:"saved_tokens"`                // Difference
 	SavedTokensPercentage   float64        `json:"saved_tokens_percentage"`     // Percentage saved
 	PerServerToolListSizes  map[string]int `json:"per_server_tool_list_sizes"`  // Token size per server
+}
+
+// UsageAggregateResponse is the GET /api/v1/activity/usage payload (Spec 069 A3).
+// It is served from the actor-owned in-memory usage aggregate snapshot (never a
+// per-request full-log scan, SC-005).
+//
+// Windowing semantics (informed by the A2 aggregate shape, data-model.md §2):
+//   - The per-tool rollup (Tools) carries lifetime-cumulative metrics. `window`
+//     scopes the tool LIST to tools last used within the span (by LastUsed); the
+//     counts/bytes/latency themselves are lifetime totals over the aggregate's
+//     retention horizon. Exact per-tool windowed counts would require per-tool
+//     time buckets in the aggregate and are a deferred follow-on.
+//   - The Timeline buckets are global (not per-tool); `window` trims them to the
+//     requested span. Timeline is therefore not filtered by tool/server/status.
+//   - tool/server/status act as membership filters on the per-tool rollup.
+type UsageAggregateResponse struct {
+	Window                string            `json:"window"`
+	GeneratedAt           time.Time         `json:"generated_at"`
+	FreshnessMs           int64             `json:"freshness_ms"` // age of the underlying snapshot in ms
+	TokenSource           string            `json:"token_source"` // "bytes" (size-based proxy, FR-006)
+	TokensSaved           int               `json:"tokens_saved"` // echoed from ServerTokenMetrics (FR-007)
+	TokensSavedPercentage float64           `json:"tokens_saved_percentage"`
+	Tools                 []UsageToolStat   `json:"tools"`
+	Other                 *UsageOtherBucket `json:"other,omitempty"` // present only when the list was truncated to top-N
+	Timeline              []UsageTimeBucket `json:"timeline"`
+}
+
+// UsageToolStat is the per-(server,tool) rollup row in UsageAggregateResponse.
+type UsageToolStat struct {
+	Server         string    `json:"server"`
+	Tool           string    `json:"tool"`
+	Calls          int64     `json:"calls"`
+	Errors         int64     `json:"errors"`
+	ErrorRate      float64   `json:"error_rate"`
+	Blocked        int64     `json:"blocked"`
+	TotalRespBytes int64     `json:"total_resp_bytes"`
+	AvgRespBytes   *int64    `json:"avg_resp_bytes"` // null when sized_calls == 0 (only legacy 0-byte calls)
+	TotalReqBytes  int64     `json:"total_req_bytes"`
+	AvgReqBytes    *int64    `json:"avg_req_bytes"` // null when no sized request calls
+	SizedCalls     int64     `json:"sized_calls"`   // calls with known response size (basis for avg_resp_bytes)
+	P50Ms          int64     `json:"p50_ms"`
+	P95Ms          int64     `json:"p95_ms"`
+	LastUsed       time.Time `json:"last_used"`
+}
+
+// UsageOtherBucket folds the tail of the per-tool list beyond top-N (FR: charts
+// stay readable on high-cardinality logs).
+type UsageOtherBucket struct {
+	ToolsFolded    int   `json:"tools_folded"`
+	Calls          int64 `json:"calls"`
+	TotalRespBytes int64 `json:"total_resp_bytes"`
+}
+
+// UsageTimeBucket is one timeline bar (executed calls only; blocked attempts and
+// non-tool records are excluded by the aggregate).
+type UsageTimeBucket struct {
+	Start          time.Time `json:"start"`
+	Calls          int64     `json:"calls"`
+	Errors         int64     `json:"errors"`
+	TotalRespBytes int64     `json:"total_resp_bytes"`
 }
 
 // LogEntry represents a single log entry
@@ -231,6 +464,28 @@ type GetServerToolsResponse struct {
 	ServerName string `json:"server_name"`
 	Tools      []Tool `json:"tools"`
 	Count      int    `json:"count"`
+}
+
+// GlobalToolsStats is the aggregate rollup shown on the global tools page
+// (spec 050). Disabled counts a tool that is user-disabled OR config-denied;
+// Enabled = Total - Disabled; PendingApproval counts pending/changed approval.
+type GlobalToolsStats struct {
+	Total           int `json:"total"`
+	Enabled         int `json:"enabled"`
+	Disabled        int `json:"disabled"`
+	PendingApproval int `json:"pending_approval"`
+}
+
+// GlobalToolsResponse is the response for GET /api/v1/tools — every tool from
+// every configured server (including disabled servers and disabled/
+// config-denied tools), enriched with approval state and usage. Partial is set
+// when one or more servers could not be read; the list still contains every
+// tool that could be gathered.
+type GlobalToolsResponse struct {
+	Tools         []Tool           `json:"tools"`
+	Stats         GlobalToolsStats `json:"stats"`
+	Partial       bool             `json:"partial,omitempty"`
+	FailedServers []string         `json:"failed_servers,omitempty"`
 }
 
 // SearchToolsResponse is the response for GET /api/v1/index/search
@@ -672,6 +927,13 @@ type Registry struct {
 	Tags        []string    `json:"tags,omitempty"`
 	Protocol    string      `json:"protocol,omitempty"`
 	Count       interface{} `json:"count,omitempty" swaggertype:"primitive,string"` // number or string
+	// Provenance is the trust tag (MCP-866): "official/trusted" for built-in
+	// defaults, "custom/unverified" for user-added registries.
+	Provenance string `json:"provenance,omitempty"`
+	// Trusted indicates whether this is an official, shipped-by-default
+	// registry. Trust is derived from membership in the default set, never
+	// from self-assertion in config.
+	Trusted bool `json:"trusted"`
 }
 
 // RepositoryInfo represents detected repository type information
@@ -707,13 +969,127 @@ type GetRegistriesResponse struct {
 	Total      int        `json:"total"`
 }
 
+// RegistryCacheInfo describes how fresh a registry search result is. AgeSeconds
+// is the age of the cached server list (0 for a freshly fetched result); Stale
+// is true once the cache entry has passed its TTL but is still served pending a
+// manual refresh (FR-007).
+type RegistryCacheInfo struct {
+	AgeSeconds float64 `json:"age_seconds"`
+	Stale      bool    `json:"stale"`
+}
+
+// RegistryUnavailable marks a registry that could not be queried — e.g. it
+// requires an API key that is not configured. The overall search still
+// succeeds; this block makes the registry's unavailability visible (FR-008).
+type RegistryUnavailable struct {
+	Reason string `json:"reason"`
+}
+
 // SearchRegistryServersResponse is the response for GET /api/v1/registries/{id}/servers
 type SearchRegistryServersResponse struct {
-	RegistryID string             `json:"registry_id"`
-	Servers    []RepositoryServer `json:"servers"`
-	Total      int                `json:"total"`
-	Query      string             `json:"query,omitempty"`
-	Tag        string             `json:"tag,omitempty"`
+	RegistryID  string               `json:"registry_id"`
+	Servers     []RepositoryServer   `json:"servers"`
+	Total       int                  `json:"total"`
+	Query       string               `json:"query,omitempty"`
+	Tag         string               `json:"tag,omitempty"`
+	Cache       *RegistryCacheInfo   `json:"cache,omitempty"`
+	Unavailable *RegistryUnavailable `json:"unavailable,omitempty"`
+}
+
+// RefreshRegistryResponse is the response for POST /api/v1/registries/{id}/refresh.
+type RefreshRegistryResponse struct {
+	RegistryID string `json:"registry_id"`
+	Cleared    int    `json:"cleared"` // number of cached entries dropped
+}
+
+// AddFromRegistryRequest is the optional POST body for adding an upstream from
+// a registry reference (spec 070, POST /registries/{id}/servers/{serverId}/add).
+// The registry id + server id come from the URL path; this body carries only
+// the optional overrides. The client never sends a config blob — the server
+// re-derives the runnable config from the registry entry (CN-001 / security
+// decision D1), so command/args/url and the quarantine flag cannot be smuggled.
+type AddFromRegistryRequest struct {
+	Name    string            `json:"name,omitempty"`    // optional name override
+	Env     map[string]string `json:"env,omitempty"`     // overrides + required-input values
+	Enabled *bool             `json:"enabled,omitempty"` // defaults to true when nil
+}
+
+// AddedServerSummary is the persisted-server view returned on a successful
+// add-from-registry. It is intentionally a slim, stable projection of the
+// re-derived config.ServerConfig (not the full struct) so the cross-surface
+// contract does not leak unrelated config fields.
+type AddedServerSummary struct {
+	Name        string   `json:"name"`
+	Protocol    string   `json:"protocol"`
+	Command     string   `json:"command,omitempty"`
+	Args        []string `json:"args,omitempty"`
+	URL         string   `json:"url,omitempty"`
+	Enabled     bool     `json:"enabled"`
+	Quarantined bool     `json:"quarantined"`
+}
+
+// AddFromRegistryData is the success `data` payload for add-from-registry.
+type AddFromRegistryData struct {
+	Server AddedServerSummary `json:"server"`
+}
+
+// RegistryAddError carries the stable cross-surface failure code for an
+// add-from-registry attempt (spec 070 CN-001). Every surface (REST, MCP, CLI)
+// reports the same Code so a given failure reads identically everywhere.
+// MissingInputs is populated only for code == "missing_required_input" so the
+// caller can name the exact --env keys the user must supply (FR-003).
+type RegistryAddError struct {
+	Code          string   `json:"code"`
+	Message       string   `json:"message"`
+	MissingInputs []string `json:"missing_inputs,omitempty"`
+}
+
+// AddRegistrySourceRequest is the POST body for adding a user-supplied registry
+// source (MCP-866, POST /api/v1/registries). Provenance is NOT part of the
+// request — the server always tags an added source "custom".
+type AddRegistrySourceRequest struct {
+	URL      string `json:"url"`                // required https registry URL
+	Protocol string `json:"protocol,omitempty"` // defaults to modelcontextprotocol/registry
+	ID       string `json:"id,omitempty"`       // derived from the host when empty
+	Name     string `json:"name,omitempty"`     // defaults to the id
+}
+
+// EditRegistrySourceRequest is the PUT body for editing a user-added custom
+// registry (MCP-1072, PUT /api/v1/registries/{id}). All fields are optional;
+// an empty field leaves the existing value unchanged.
+type EditRegistrySourceRequest struct {
+	Name       string `json:"name,omitempty"`        // new display name
+	URL        string `json:"url,omitempty"`         // new base/servers https URL
+	ServersURL string `json:"servers_url,omitempty"` // explicit servers-collection URL
+}
+
+// RegistrySummary is a slim, stable projection of a registry, including its
+// provenance/trust so surfaces can flag third-party sources (MCP-866).
+type RegistrySummary struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	URL        string `json:"url,omitempty"`
+	ServersURL string `json:"servers_url,omitempty"`
+	Protocol   string `json:"protocol,omitempty"`
+	Provenance string `json:"provenance,omitempty"`
+	Trusted    bool   `json:"trusted"`
+}
+
+// AddRegistrySourceData is the success `data` payload for add-source.
+type AddRegistrySourceData struct {
+	Registry RegistrySummary `json:"registry"`
+}
+
+// RemoveRegistrySourceData is the success `data` payload for remove-source
+// (MCP-1057, DELETE /api/v1/registries/{id}). It echoes the removed registry.
+type RemoveRegistrySourceData struct {
+	Registry RegistrySummary `json:"registry"`
+}
+
+// EditRegistrySourceData is the success `data` payload for edit-source
+// (MCP-1072, PUT /api/v1/registries/{id}). It echoes the updated registry.
+type EditRegistrySourceData struct {
+	Registry RegistrySummary `json:"registry"`
 }
 
 // SuccessResponse is the standard success response wrapper for API endpoints.
@@ -751,12 +1127,14 @@ type HealthStatus struct {
 
 // UpdateInfo represents version update check information
 type UpdateInfo struct {
-	Available     bool       `json:"available"`                // Whether an update is available
-	LatestVersion string     `json:"latest_version,omitempty"` // Latest version available (e.g., "v1.2.3")
-	ReleaseURL    string     `json:"release_url,omitempty"`    // URL to the release page
-	CheckedAt     *time.Time `json:"checked_at,omitempty"`     // When the update check was performed
-	IsPrerelease  bool       `json:"is_prerelease,omitempty"`  // Whether the latest version is a prerelease
-	CheckError    string     `json:"check_error,omitempty"`    // Error message if update check failed
+	Available      bool       `json:"available"`                 // Whether an update is available
+	LatestVersion  string     `json:"latest_version,omitempty"`  // Latest version available (e.g., "v1.2.3")
+	ReleaseURL     string     `json:"release_url,omitempty"`     // URL to the release page
+	CheckedAt      *time.Time `json:"checked_at,omitempty"`      // When the update check was performed
+	IsPrerelease   bool       `json:"is_prerelease,omitempty"`   // Whether the latest version is a prerelease
+	CheckError     string     `json:"check_error,omitempty"`     // Error message if update check failed
+	InstallChannel string     `json:"install_channel,omitempty"` // Detected install channel (homebrew, dmg, deb, rpm, docker, go-install, windows-installer, tarball, unknown) — Spec 079 FR-008
+	UpdateCommand  string     `json:"update_command,omitempty"`  // One-line update command for the channel; only set when an update is available and the channel has one — Spec 079 FR-009
 }
 
 // InfoEndpoints represents the available API endpoints

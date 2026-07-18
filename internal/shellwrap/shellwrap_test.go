@@ -88,6 +88,351 @@ func TestResolveDockerPath_CachedAcrossCalls(t *testing.T) {
 	}
 }
 
+// writeFakeDocker writes a no-op executable at <dir>/docker so ResolveDockerPath
+// can find "docker" on a controlled PATH.
+func writeFakeDocker(t *testing.T, dir string) string {
+	t.Helper()
+	script := "#!/bin/sh\nexit 0\n"
+	p := filepath.Join(dir, "docker")
+	require.NoError(t, os.WriteFile(p, []byte(script), 0o755))
+	return p
+}
+
+// TestResolveDockerPath_FastPath verifies that when docker is present on
+// ambient PATH, ResolveDockerPath returns it without invoking the login
+// shell fallback.
+func TestResolveDockerPath_FastPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	dir := t.TempDir()
+	want := writeFakeDocker(t, dir)
+	t.Setenv("PATH", dir)
+	// If the fast path were skipped and the shell fallback ran, it would
+	// invoke this (broken) shell and fail — the assertion below would catch it.
+	t.Setenv("SHELL", "/nonexistent/shell-must-not-be-invoked")
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err)
+	assert.Equal(t, want, got, "should resolve docker via exec.LookPath without shell fallback")
+}
+
+// TestResolveDockerPath_ShellFallback simulates the tray/LaunchAgent scenario:
+// docker is NOT on the ambient PATH but IS on the user's login-shell PATH.
+// The shell fallback must recover the absolute path.
+func TestResolveDockerPath_ShellFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("login-shell fallback is unix-only")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	// Stash the fake docker somewhere that is NOT on ambient PATH.
+	dockerDir := t.TempDir()
+	dockerPath := writeFakeDocker(t, dockerDir)
+
+	// Ambient PATH deliberately excludes dockerDir (mimicking launchd minimal PATH).
+	ambient := t.TempDir()
+	t.Setenv("PATH", ambient)
+
+	// Stub well-known paths to nothing so the shell fallback is the path under test.
+	prev := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return nil }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+
+	// Fake $SHELL emits the absolute path via `command -v docker` — the
+	// fallback issues `<shell> -l -c 'command -v docker'` and trims the output.
+	shellDir := t.TempDir()
+	fakeShell := writeFakeShell(t, shellDir, dockerPath)
+	t.Setenv("SHELL", fakeShell)
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err, "shell fallback must succeed when login shell emits the docker path")
+	assert.Equal(t, dockerPath, got, "should return the path emitted by the login shell")
+}
+
+// TestResolveDockerPath_NotFoundAnywhere verifies the error path when docker
+// is missing from ambient PATH, the login shell, and well-known install
+// locations.
+func TestResolveDockerPath_NotFoundAnywhere(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	t.Setenv("PATH", t.TempDir())
+	// Login shell that emits nothing — mimics `command -v docker` returning empty.
+	shellDir := t.TempDir()
+	fakeShell := writeFakeShell(t, shellDir, "")
+	t.Setenv("SHELL", fakeShell)
+
+	// Stub the well-known paths to a list that cannot exist.
+	prev := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return []string{filepath.Join(t.TempDir(), "no-such-docker")} }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+
+	got, err := ResolveDockerPath(nil)
+	assert.Error(t, err, "should error when docker is missing from PATH, login shell, and well-known paths")
+	assert.Empty(t, got)
+}
+
+// TestResolveDockerPath_NegativeTTLRetry verifies that a failed resolution
+// is retried after dockerPathNegativeTTL elapses, so a transient install-time
+// failure does not permanently disable docker discovery for the daemon.
+func TestResolveDockerPath_NegativeTTLRetry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	// Make negative cache effectively immediate so the second call re-probes.
+	prevTTL := dockerPathNegativeTTL
+	dockerPathNegativeTTL = 0
+	t.Cleanup(func() { dockerPathNegativeTTL = prevTTL })
+
+	// Empty well-known list during the FIRST call so it fails.
+	prevPaths := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return nil }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prevPaths })
+
+	t.Setenv("PATH", t.TempDir())
+	shellDir := t.TempDir()
+	fakeShell := writeFakeShell(t, shellDir, "")
+	t.Setenv("SHELL", fakeShell)
+
+	_, err := ResolveDockerPath(nil)
+	require.Error(t, err, "first call should fail (no docker anywhere)")
+
+	// Now publish a fake docker via well-known paths. The cached failure
+	// must NOT block the retry.
+	dockerDir := t.TempDir()
+	want := writeFakeDocker(t, dockerDir)
+	wellKnownDockerPathsFn = func() []string { return []string{want} }
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err, "second call must retry after negative TTL elapses")
+	assert.Equal(t, want, got)
+}
+
+// TestResolveDockerPath_StatProbeOverridesLiveNegative is the MCP-2744
+// regression guard: a still-LIVE cached negative (within its TTL, NOT expired)
+// must never shadow a docker binary that is sitting at a well-known path right
+// now. The well-known-path probe is a pure os.Stat — it is never sandbox- or
+// login-shell-restricted — so the first resolution failing only because the
+// restricted login-shell leg failed must not poison discovery for the whole
+// TTL window. Distinct from TestResolveDockerPath_NegativeTTLRetry, which
+// relies on TTL expiry; here the TTL stays at its default so the negative is
+// still "live" on the second call.
+func TestResolveDockerPath_StatProbeOverridesLiveNegative(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	// Leave dockerPathNegativeTTL at its default (60s) so the cached negative is
+	// still valid on the second call — we prove the os.Stat probe overrides it.
+
+	// FIRST call fails everywhere: no PATH docker, no well-known docker, the
+	// login shell emits nothing.
+	prevPaths := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return nil }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prevPaths })
+
+	t.Setenv("PATH", t.TempDir())
+	shellDir := t.TempDir()
+	fakeShell := writeFakeShell(t, shellDir, "")
+	t.Setenv("SHELL", fakeShell)
+
+	_, err := ResolveDockerPath(nil)
+	require.Error(t, err, "first call should cache a negative (docker absent everywhere)")
+
+	// Docker Desktop's bundle binary now appears at a well-known path. The cheap
+	// os.Stat probe must override the still-live cached negative on the very
+	// next call — no TTL expiry required.
+	dockerDir := t.TempDir()
+	want := writeFakeDocker(t, dockerDir)
+	wellKnownDockerPathsFn = func() []string { return []string{want} }
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err, "a live negative must not shadow a now-present well-known docker")
+	assert.Equal(t, want, got)
+}
+
+// TestResolveDockerPath_WellKnownPathFallback simulates a PKG-installer
+// context: docker is missing from $PATH and the login shell emits nothing,
+// but Docker Desktop installed a binary at a well-known path. The fallback
+// must find it without invoking the shell.
+func TestResolveDockerPath_WellKnownPathFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("well-known path fallback is unix-only")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	dockerDir := t.TempDir()
+	want := writeFakeDocker(t, dockerDir)
+
+	// Ambient PATH excludes dockerDir.
+	t.Setenv("PATH", t.TempDir())
+
+	// Stub well-known paths to point at our fake docker.
+	prev := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return []string{want} }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+
+	// Sabotage the shell so we can prove the well-known fallback ran first.
+	t.Setenv("SHELL", "/nonexistent/shell-must-not-be-invoked")
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err, "well-known fallback must succeed when docker exists at a known path")
+	assert.Equal(t, want, got)
+}
+
+// TestResolveDockerSource reports which resolution branch found docker so the
+// telemetry layer can emit the coarse #696 fleet signal (path/bundled/
+// login_shell/absent) — never the path string itself.
+func TestResolveDockerSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixtures")
+	}
+
+	t.Run("path", func(t *testing.T) {
+		resetDockerPathCacheForTest()
+		t.Cleanup(resetDockerPathCacheForTest)
+		dir := t.TempDir()
+		writeFakeDocker(t, dir)
+		t.Setenv("PATH", dir)
+		t.Setenv("SHELL", "/nonexistent/shell-must-not-be-invoked")
+		assert.Equal(t, DockerSourcePath, ResolveDockerSource(nil))
+	})
+
+	t.Run("bundled", func(t *testing.T) {
+		resetDockerPathCacheForTest()
+		t.Cleanup(resetDockerPathCacheForTest)
+		dockerDir := t.TempDir()
+		want := writeFakeDocker(t, dockerDir)
+		t.Setenv("PATH", t.TempDir()) // ambient excludes docker
+		prev := wellKnownDockerPathsFn
+		wellKnownDockerPathsFn = func() []string { return []string{want} }
+		t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+		t.Setenv("SHELL", "/nonexistent/shell-must-not-be-invoked")
+		assert.Equal(t, DockerSourceBundled, ResolveDockerSource(nil))
+	})
+
+	t.Run("login_shell", func(t *testing.T) {
+		resetDockerPathCacheForTest()
+		t.Cleanup(resetDockerPathCacheForTest)
+		dockerDir := t.TempDir()
+		dockerPath := writeFakeDocker(t, dockerDir)
+		t.Setenv("PATH", t.TempDir())
+		prev := wellKnownDockerPathsFn
+		wellKnownDockerPathsFn = func() []string { return nil }
+		t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+		shellDir := t.TempDir()
+		t.Setenv("SHELL", writeFakeShell(t, shellDir, dockerPath))
+		assert.Equal(t, DockerSourceLoginShell, ResolveDockerSource(nil))
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		resetDockerPathCacheForTest()
+		t.Cleanup(resetDockerPathCacheForTest)
+		t.Setenv("PATH", t.TempDir())
+		prev := wellKnownDockerPathsFn
+		wellKnownDockerPathsFn = func() []string { return nil }
+		t.Cleanup(func() { wellKnownDockerPathsFn = prev })
+		shellDir := t.TempDir()
+		t.Setenv("SHELL", writeFakeShell(t, shellDir, ""))
+		assert.Equal(t, DockerSourceAbsent, ResolveDockerSource(nil))
+	})
+}
+
+// TestResolveDockerSource_StatProbeUpgradeReportsBundled is the regression
+// guard for the MCP-2744 cache-upgrade path: when a live cached NEGATIVE is
+// overridden by the well-known-path stat probe, the cached source must be
+// upgraded to "bundled" too — otherwise the stale "absent" leaks into the
+// schema-v5 docker_cli_source telemetry even though docker WAS resolved.
+func TestResolveDockerSource_StatProbeUpgradeReportsBundled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	// FIRST resolution fails everywhere → caches a live negative whose source
+	// is "absent". Keep the negative TTL at its default so it stays live.
+	prevPaths := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return nil }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prevPaths })
+
+	t.Setenv("PATH", t.TempDir())
+	shellDir := t.TempDir()
+	t.Setenv("SHELL", writeFakeShell(t, shellDir, ""))
+
+	_, err := ResolveDockerPath(nil)
+	require.Error(t, err, "first call should cache a negative (docker absent everywhere)")
+	require.Equal(t, DockerSourceAbsent, ResolveDockerSource(nil), "cached negative reports absent")
+
+	// Docker now appears at a well-known path. The stat-probe override must
+	// upgrade BOTH the path and the source on the next call.
+	dockerDir := t.TempDir()
+	want := writeFakeDocker(t, dockerDir)
+	wellKnownDockerPathsFn = func() []string { return []string{want} }
+
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err, "stat probe must override the live negative")
+	require.Equal(t, want, got)
+	// The bug: this returned "absent" before the fix because the upgrade path
+	// never updated dockerPathSource.
+	require.Equal(t, DockerSourceBundled, ResolveDockerSource(nil),
+		"source must upgrade to bundled when the stat probe overrides the cached negative")
+}
+
+// TestResolveDockerSource_NegativeTTLProbeOverride is the Codex round-4
+// regression guard: ResolveDockerSource must apply the same well-known-path
+// stat-probe override that ResolveDockerPath does during the negative-TTL
+// window. Before the shared-resolver refactor, ResolveDockerSource returned
+// "absent" off the cached negative without ever probing, so docker_cli_source
+// reported the wrong source while ResolveDockerPath returned the bundled path.
+func TestResolveDockerSource_NegativeTTLProbeOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only fixture")
+	}
+	resetDockerPathCacheForTest()
+	t.Cleanup(resetDockerPathCacheForTest)
+
+	// FIRST resolution fails everywhere → caches a LIVE negative (default TTL).
+	prevPaths := wellKnownDockerPathsFn
+	wellKnownDockerPathsFn = func() []string { return nil }
+	t.Cleanup(func() { wellKnownDockerPathsFn = prevPaths })
+
+	t.Setenv("PATH", t.TempDir())
+	shellDir := t.TempDir()
+	t.Setenv("SHELL", writeFakeShell(t, shellDir, ""))
+
+	_, err := ResolveDockerPath(nil)
+	require.Error(t, err, "first call should cache a live negative")
+
+	// Docker now appears at a well-known path. The very next ResolveDockerSource
+	// call must run the stat probe (not honor the cached "absent") and report
+	// bundled — without any TTL expiry.
+	dockerDir := t.TempDir()
+	want := writeFakeDocker(t, dockerDir)
+	wellKnownDockerPathsFn = func() []string { return []string{want} }
+
+	require.Equal(t, DockerSourceBundled, ResolveDockerSource(nil),
+		"ResolveDockerSource must apply the stat-probe override during the negative-TTL window")
+	// And ResolveDockerPath agrees (cache was upgraded to a permanent success).
+	got, err := ResolveDockerPath(nil)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
 func TestMinimalEnv_DropsSecrets(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_test_dummy_value_00000000")
 	t.Setenv("GITHUB_TOKEN", "ghp_dummy_test_token_1234567890abcdef")
@@ -154,6 +499,57 @@ func writeFakeShell(t *testing.T, dir, wantPath string) string {
 	return p
 }
 
+// writeFakeRealShell writes a POSIX shell script that simulates a real login
+// shell: it prints `bannerOutput` on stdout (mimicking rc-file welcome
+// banners, oh-my-zsh updates, etc.) and then evaluates whatever command
+// follows `-c` so the caller's `printf …` actually runs in a context where
+// PATH is whatever the parent process set.
+func writeFakeRealShell(t *testing.T, dir, bannerOutput string) string {
+	t.Helper()
+	// Use a heredoc-ish embedding so the banner can contain arbitrary text.
+	// The script prints the banner verbatim, then walks its arg list looking
+	// for `-c <cmd>` and evaluates <cmd>.
+	script := `#!/bin/sh
+printf '%s' "$BANNER"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|--login) shift ;;
+    -c) shift; eval "$1"; shift ;;
+    *) shift ;;
+  esac
+done
+`
+	p := filepath.Join(dir, "fake-real-shell")
+	require.NoError(t, os.WriteFile(p, []byte(script), 0o755))
+	t.Setenv("BANNER", bannerOutput)
+	return p
+}
+
+func TestLoginShellPATH_StripsBannerContamination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only")
+	}
+	resetLoginShellPathCacheForTest()
+	t.Cleanup(resetLoginShellPathCacheForTest)
+
+	// Simulate an rc file that prints noisy banner output before our
+	// printf marker — real-world examples: oh-my-zsh "auto-update" line,
+	// motd, fortune, direnv hook, "Loading nvm…" messages.
+	banner := "Last login: Wed Apr 30 12:34 on ttys000\noh-my-zsh: Updating…\n"
+	dir := t.TempDir()
+	fake := writeFakeRealShell(t, dir, banner)
+	t.Setenv("SHELL", fake)
+	// Set the PATH the fake shell will see — this is what our printf must
+	// emit, untouched by the banner.
+	t.Setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+
+	got := LoginShellPATH(nil)
+	assert.Equal(t, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", got,
+		"LoginShellPATH must strip rc-file banner output and return only $PATH")
+	assert.NotContains(t, got, "oh-my-zsh", "banner content must not leak into PATH")
+	assert.NotContains(t, got, "Last login", "banner content must not leak into PATH")
+}
+
 func TestLoginShellPATH_CapturesFromShell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("login-shell PATH capture is Unix-only")
@@ -163,7 +559,10 @@ func TestLoginShellPATH_CapturesFromShell(t *testing.T) {
 
 	dir := t.TempDir()
 	want := "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-	fake := writeFakeShell(t, dir, want)
+	// The login shell exports this PATH; captureLoginShellEnv's `env -0` then
+	// reports it back. PATH must include /usr/bin so the fake shell can locate
+	// the `env` binary.
+	fake := writeFakeLoginEnvShell(t, dir, map[string]string{"PATH": want})
 	t.Setenv("SHELL", fake)
 
 	got := LoginShellPATH(nil)
@@ -197,9 +596,13 @@ func TestMinimalEnv_PrefersLoginShellPATH(t *testing.T) {
 	// Simulate a LaunchAgent-like ambient PATH (missing homebrew/local).
 	t.Setenv("PATH", "/usr/bin:/bin")
 
-	// Point $SHELL at a fake shell that prints the real (enriched) PATH.
+	// Point $SHELL at a fake login shell that exports the real (enriched) PATH,
+	// so captureLoginShellEnv reports it back enriched while the ambient PATH
+	// stays minimal.
 	dir := t.TempDir()
-	fake := writeFakeShell(t, dir, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+	fake := writeFakeLoginEnvShell(t, dir, map[string]string{
+		"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+	})
 	t.Setenv("SHELL", fake)
 
 	env := MinimalEnv()

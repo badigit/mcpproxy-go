@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
@@ -243,6 +244,7 @@ func (m *baseController) ForceReconnectAllServers(reason string) error       { r
 func (m *baseController) GetDockerRecoveryStatus() *storage.DockerRecoveryState {
 	return nil
 }
+func (m *baseController) IsDockerAvailable() bool { return false }
 func (m *baseController) QuarantineServer(serverName string, quarantined bool) error {
 	return nil
 }
@@ -289,8 +291,21 @@ func (m *baseController) GetTokenSavings() (*contracts.ServerTokenMetrics, error
 func (m *baseController) ListRegistries() ([]interface{}, error) {
 	return nil, nil
 }
-func (m *baseController) SearchRegistryServers(registryID, query, tag string, limit int) ([]interface{}, error) {
-	return nil, nil
+func (m *baseController) SearchRegistryServers(registryID, query, tag string, limit int) ([]interface{}, *contracts.RegistryCacheInfo, error) {
+	return nil, nil, nil
+}
+func (m *baseController) RefreshRegistryCache(registryID string) (int, error) { return 0, nil }
+func (m *baseController) AddServerFromRegistryRef(_ context.Context, _, _, _ string, _ map[string]string, _ *bool) (*config.ServerConfig, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *baseController) AddRegistrySourceRef(_, _, _, _ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *baseController) RemoveRegistrySourceRef(_ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
+}
+func (m *baseController) EditRegistrySourceRef(_, _, _, _ string) (*config.RegistryEntry, *contracts.RegistryAddError, error) {
+	return nil, nil, nil
 }
 func (m *baseController) CallTool(ctx context.Context, toolName string, args map[string]interface{}) (interface{}, error) {
 	return nil, nil
@@ -324,6 +339,10 @@ func (m *baseController) ListActivities(_ storage.ActivityFilter) ([]*storage.Ac
 func (m *baseController) GetActivity(_ string) (*storage.ActivityRecord, error) {
 	return nil, nil
 }
+func (m *baseController) AggregateToolUsage(_ time.Time) (map[string]storage.ToolUsageStat, error) {
+	return map[string]storage.ToolUsageStat{}, nil
+}
+func (m *baseController) UsageSnapshot() *runtime.UsageAggregate { return nil }
 func (m *baseController) StreamActivities(_ storage.ActivityFilter) <-chan *storage.ActivityRecord {
 	ch := make(chan *storage.ActivityRecord)
 	close(ch)
@@ -334,7 +353,19 @@ func (m *baseController) ListToolApprovals(_ string) ([]*storage.ToolApprovalRec
 }
 func (m *baseController) ApproveTools(_ string, _ []string, _ string) error { return nil }
 func (m *baseController) ApproveAllTools(_ string, _ string) (int, error)   { return 0, nil }
+func (m *baseController) BlockTools(_ string, _ []string, _ string) (int, error) {
+	return 0, nil
+}
+func (m *baseController) BlockAllTools(_ string, _ string) (int, error) { return 0, nil }
 func (m *baseController) GetToolApproval(_, _ string) (*storage.ToolApprovalRecord, error) {
 	return nil, nil
 }
 func (m *baseController) GetToolApprovalStatus(_, _ string) (string, error) { return "", nil }
+func (m *baseController) GetOnboardingState() (*storage.OnboardingState, error) {
+	return &storage.OnboardingState{}, nil
+}
+func (m *baseController) SaveOnboardingState(_ *storage.OnboardingState) error { return nil }
+func (m *baseController) GetActivationFirstMCPClient() (bool, []string)        { return false, nil }
+func (m *baseController) DefaultInstructions() string {
+	return "test built-in default: use retrieve_tools to discover tools"
+}

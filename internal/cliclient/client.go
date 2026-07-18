@@ -19,10 +19,11 @@ import (
 
 // Client provides HTTP API access for CLI commands.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
-	logger     *zap.SugaredLogger
+	baseURL     string
+	apiKey      string
+	bearerToken string
+	httpClient  *http.Client
+	logger      *zap.SugaredLogger
 }
 
 // clientVersion holds the build-time version reported in X-MCPProxy-Client.
@@ -40,18 +41,31 @@ func SetClientVersion(v string) {
 // surfaceHeaderTransport wraps another http.RoundTripper to inject the
 // X-MCPProxy-Client header on every outbound request. The header value is
 // "cli/<version>". Spec 042 User Story 1.
+//
+// It also injects X-API-Key when the client was constructed with an API key.
+// Doing this at the transport level guarantees every request authenticates
+// over TCP, including methods that skip prepareRequest (e.g. Ping) — the REST
+// API always requires a key on TCP; only socket connections bypass it.
 type surfaceHeaderTransport struct {
-	base http.RoundTripper
+	base   http.RoundTripper
+	apiKey string
 }
 
 func (t *surfaceHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("X-MCPProxy-Client") == "" {
+	needClientHeader := req.Header.Get("X-MCPProxy-Client") == ""
+	needAPIKey := t.apiKey != "" && req.Header.Get("X-API-Key") == ""
+	if needClientHeader || needAPIKey {
 		// Clone the header map so we don't mutate caller-owned state.
 		newHeaders := req.Header.Clone()
 		if newHeaders == nil {
 			newHeaders = http.Header{}
 		}
-		newHeaders.Set("X-MCPProxy-Client", "cli/"+clientVersion)
+		if needClientHeader {
+			newHeaders.Set("X-MCPProxy-Client", "cli/"+clientVersion)
+		}
+		if needAPIKey {
+			newHeaders.Set("X-API-Key", t.apiKey)
+		}
 		reqCopy := req.Clone(req.Context())
 		reqCopy.Header = newHeaders
 		req = reqCopy
@@ -139,11 +153,22 @@ func NewClientWithAPIKey(endpoint, apiKey string, logger *zap.SugaredLogger) *Cl
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // Generous timeout for long operations
 			// Spec 042: wrap transport so every request carries the
-			// X-MCPProxy-Client: cli/<version> header.
-			Transport: &surfaceHeaderTransport{base: transport},
+			// X-MCPProxy-Client: cli/<version> header, plus X-API-Key
+			// when the client was constructed with one.
+			Transport: &surfaceHeaderTransport{base: transport, apiKey: apiKey},
 		},
 		logger: logger,
 	}
+}
+
+// NewClientWithBearer creates a CLI HTTP client that authenticates with a JWT
+// Bearer token. The server edition user/JWT endpoints (e.g. the per-user
+// credential broker surfaces, spec 074) sit behind session-or-Bearer auth
+// rather than the API-key group, so callers must present a user token.
+func NewClientWithBearer(endpoint, bearerToken string, logger *zap.SugaredLogger) *Client {
+	c := NewClientWithAPIKey(endpoint, "", logger)
+	c.bearerToken = bearerToken
+	return c
 }
 
 // DoRaw performs a raw HTTP request to the API and returns the response.
@@ -174,6 +199,9 @@ func (c *Client) prepareRequest(ctx context.Context, req *http.Request) {
 	}
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
+	}
+	if c.bearerToken != "" && req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
 }
 
@@ -415,8 +443,11 @@ func (c *Client) GetServers(ctx context.Context) ([]map[string]interface{}, erro
 
 // GetServerLogs retrieves logs for a specific server.
 func (c *Client) GetServerLogs(ctx context.Context, serverName string, tail int) ([]contracts.LogEntry, error) {
-	url := fmt.Sprintf("%s/api/v1/servers/%s/logs?tail=%d", c.baseURL, serverName, tail)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// PathEscape the server name: official-registry names are namespace/name and
+	// contain "/", which would otherwise inject extra path segments and miss the
+	// chi /servers/{id}/logs route (MCP-1111 / #598).
+	reqURL := fmt.Sprintf("%s/api/v1/servers/%s/logs?tail=%d", c.baseURL, url.PathEscape(serverName), tail)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -551,6 +582,72 @@ func (c *Client) GetDiagnostics(ctx context.Context) (map[string]interface{}, er
 		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
 	}
 
+	return apiResp.Data, nil
+}
+
+// DiagnosticFixResult is the response from POST /api/v1/diagnostics/fix. Spec 044.
+type DiagnosticFixResult struct {
+	Outcome    string `json:"outcome"` // "success" | "failed" | "blocked"
+	Mode       string `json:"mode"`    // "dry_run" | "execute"
+	Preview    string `json:"preview,omitempty"`
+	FailureMsg string `json:"failure_msg,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+}
+
+// InvokeDiagnosticFix runs a registered fixer via the daemon's fix endpoint.
+// Destructive fixers default to dry_run on the server side; callers must
+// pass mode="execute" to mutate state. Spec 044.
+func (c *Client) InvokeDiagnosticFix(ctx context.Context, server, code, fixerKey, mode string) (*DiagnosticFixResult, error) {
+	reqBody := map[string]interface{}{
+		"server":    server,
+		"code":      code,
+		"fixer_key": fixerKey,
+	}
+	if mode != "" {
+		reqBody["mode"] = mode
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/api/v1/diagnostics/fix"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call fix endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var apiResp struct {
+		Success   bool                 `json:"success"`
+		Data      *DiagnosticFixResult `json:"data"`
+		Error     string               `json:"error"`
+		RequestID string               `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	if apiResp.Data == nil {
+		return &DiagnosticFixResult{}, nil
+	}
 	return apiResp.Data, nil
 }
 
@@ -833,6 +930,52 @@ func (c *Client) DisableAll(ctx context.Context) (*BulkOperationResult, error) {
 	return apiResp.Data, nil
 }
 
+// GetGlobalTools retrieves all tools across every configured server from the
+// consolidated GET /api/v1/tools endpoint (Spec 050). The returned slice
+// contains one map per tool with the same fields as the web page's data source.
+func (c *Client) GetGlobalTools(ctx context.Context) ([]map[string]interface{}, error) {
+	url := c.baseURL + "/api/v1/tools"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call global tools API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Tools []map[string]interface{} `json:"tools"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+
+	return apiResp.Data.Tools, nil
+}
+
 // GetServerTools retrieves tools for a specific server from daemon.
 func (c *Client) GetServerTools(ctx context.Context, serverName string) ([]map[string]interface{}, error) {
 	url := fmt.Sprintf("%s/api/v1/servers/%s/tools", c.baseURL, serverName)
@@ -875,6 +1018,97 @@ func (c *Client) GetServerTools(ctx context.Context, serverName string) ([]map[s
 	}
 
 	return apiResp.Data.Tools, nil
+}
+
+// SetToolEnabled flips an individual tool's enabled state for a server. The
+// daemon synthesizes an approval record on demand if the tool has never been
+// quarantined or toggled before — see Runtime.SetToolEnabled.
+func (c *Client) SetToolEnabled(ctx context.Context, serverName, toolName string, enabled bool) error {
+	url := fmt.Sprintf("%s/api/v1/servers/%s/tools/%s/enabled",
+		c.baseURL, serverName, toolName)
+	body, err := json.Marshal(map[string]bool{"enabled": enabled})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call set-tool-enabled API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success   bool   `json:"success"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	return nil
+}
+
+// SetAllToolsEnabled bulk-toggles every known tool for a server. Returns the
+// number of tools whose state actually changed (already-correct tools are
+// skipped on the server side).
+func (c *Client) SetAllToolsEnabled(ctx context.Context, serverName string, enabled bool) (int, error) {
+	path := "disable_all"
+	if enabled {
+		path = "enable_all"
+	}
+	url := fmt.Sprintf("%s/api/v1/servers/%s/tools/%s", c.baseURL, serverName, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call bulk-tool-enable API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Changed int `json:"changed"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return 0, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	return apiResp.Data.Changed, nil
 }
 
 // TriggerOAuthLogin initiates OAuth authentication flow for a server.
@@ -1065,6 +1299,62 @@ func (c *Client) AddServer(ctx context.Context, req *AddServerRequest) (*AddServ
 	}
 
 	return apiResp.Data, nil
+}
+
+// PatchServer issues a partial update against PATCH /api/v1/servers/{name}.
+//
+// The body is sent as raw JSON so callers can include JSON null values
+// for header / env deletion under JSON Merge Patch semantics (RFC 7396).
+// Building the body as `map[string]any{"X": nil}` would round-trip through
+// encoding/json fine, but `map[string]*string` is cleaner for fixed-shape
+// callers that want type safety — both forms are supported because
+// callers pass already-marshaled bytes.
+//
+// Example body shapes:
+//
+//	{"headers": {"X-New": "value"}}                  -- upsert
+//	{"headers": {"X-Stale": null}}                   -- delete
+//	{"headers": {"X-Set": "v", "X-Old": null}}       -- combined
+//	{"env": {"API_KEY": null}, "enabled": true}      -- env delete + enable
+func (c *Client) PatchServer(ctx context.Context, serverName string, body []byte) error {
+	url := fmt.Sprintf("%s/api/v1/servers/%s", c.baseURL, serverName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call patch API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("server '%s' not found", serverName)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var apiResp struct {
+		Success   bool   `json:"success"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	return nil
 }
 
 // RemoveServer removes an upstream server via the daemon API.
@@ -1432,4 +1722,390 @@ func (c *Client) ApproveTools(ctx context.Context, serverName string, toolNames 
 	}
 
 	return apiResp.Data.Approved, nil
+}
+
+// BlockTools blocks specific tools or all pending/changed tools for a server
+// (Spec 032). Block atomically approves AND disables the tool so it is never
+// left in the approved+enabled state — mirroring the Web UI "Block" action.
+func (c *Client) BlockTools(ctx context.Context, serverName string, toolNames []string, blockAll bool) (int, error) {
+	url := fmt.Sprintf("%s/api/v1/servers/%s/tools/block", c.baseURL, serverName)
+
+	reqBody := struct {
+		Tools    []string `json:"tools,omitempty"`
+		BlockAll bool     `json:"block_all,omitempty"`
+	}{
+		Tools:    toolNames,
+		BlockAll: blockAll,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call block tools API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Blocked int `json:"blocked"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !apiResp.Success {
+		return 0, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+
+	return apiResp.Data.Blocked, nil
+}
+
+// ListRegistries returns the MCP server registries known to the daemon
+// (spec 070). Mirrors GetServers: GET /api/v1/registries → data.registries.
+func (c *Client) ListRegistries(ctx context.Context) ([]map[string]interface{}, error) {
+	u := c.baseURL + "/api/v1/registries"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call registries API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Registries []map[string]interface{} `json:"registries"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	return apiResp.Data.Registries, nil
+}
+
+// SearchRegistry searches the servers in a registry via the daemon (spec 070).
+// GET /api/v1/registries/{id}/servers?q=&tag=&limit= → data.servers.
+func (c *Client) SearchRegistry(ctx context.Context, registryID, tag, query string, limit int) ([]map[string]interface{}, error) {
+	u := fmt.Sprintf("%s/api/v1/registries/%s/servers", c.baseURL, url.PathEscape(registryID))
+	q := url.Values{}
+	if query != "" {
+		q.Set("q", query)
+	}
+	if tag != "" {
+		q.Set("tag", tag)
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if encoded := q.Encode(); encoded != "" {
+		u += "?" + encoded
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call registry search API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Servers []map[string]interface{} `json:"servers"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	return apiResp.Data.Servers, nil
+}
+
+// RegistryAddError is the client-side projection of a failed add-from-registry
+// (spec 070). It carries the stable cross-surface Code and, for
+// missing_required_input, the names of the inputs the user must supply so the
+// CLI can name the exact --env keys.
+type RegistryAddError struct {
+	Code          string
+	Message       string
+	MissingInputs []string
+	RequestID     string
+}
+
+func (e *RegistryAddError) Error() string { return e.Message }
+
+// AddFromRegistry adds an upstream server from a registry reference via the
+// daemon (spec 070 keystone). The daemon re-derives the runnable config from
+// the registry entry — the client only sends optional overrides. On failure it
+// returns a *RegistryAddError carrying the stable code.
+func (c *Client) AddFromRegistry(ctx context.Context, registryID, serverID, name string, env map[string]string, enabled *bool) (*contracts.AddedServerSummary, error) {
+	body := contracts.AddFromRegistryRequest{Name: name, Env: env, Enabled: enabled}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	u := fmt.Sprintf("%s/api/v1/registries/%s/servers/%s/add",
+		c.baseURL, url.PathEscape(registryID), url.PathEscape(serverID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call add-from-registry API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp struct {
+		Success       bool                           `json:"success"`
+		Data          *contracts.AddFromRegistryData `json:"data"`
+		Error         string                         `json:"error"`
+		Code          string                         `json:"code"`
+		MissingInputs []string                       `json:"missing_inputs"`
+		RequestID     string                         `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if !apiResp.Success || resp.StatusCode != http.StatusOK {
+		msg := apiResp.Error
+		if msg == "" {
+			msg = fmt.Sprintf("API returned status %d", resp.StatusCode)
+		}
+		return nil, &RegistryAddError{
+			Code:          apiResp.Code,
+			Message:       msg,
+			MissingInputs: apiResp.MissingInputs,
+			RequestID:     apiResp.RequestID,
+		}
+	}
+	if apiResp.Data == nil {
+		return nil, fmt.Errorf("daemon returned success with no server data")
+	}
+	return &apiResp.Data.Server, nil
+}
+
+// AddRegistrySource adds a user-supplied registry source via the daemon
+// (MCP-866). POST /api/v1/registries → data.registry. On failure it returns a
+// *RegistryAddError carrying the stable cross-surface code.
+func (c *Client) AddRegistrySource(ctx context.Context, sourceURL, protocol, id, name string) (*contracts.RegistrySummary, error) {
+	body := contracts.AddRegistrySourceRequest{URL: sourceURL, Protocol: protocol, ID: id, Name: name}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	u := c.baseURL + "/api/v1/registries"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call add-registry-source API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp struct {
+		Success   bool                             `json:"success"`
+		Data      *contracts.AddRegistrySourceData `json:"data"`
+		Error     string                           `json:"error"`
+		Code      string                           `json:"code"`
+		RequestID string                           `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if !apiResp.Success || resp.StatusCode != http.StatusOK {
+		msg := apiResp.Error
+		if msg == "" {
+			msg = fmt.Sprintf("API returned status %d", resp.StatusCode)
+		}
+		return nil, &RegistryAddError{Code: apiResp.Code, Message: msg, RequestID: apiResp.RequestID}
+	}
+	if apiResp.Data == nil {
+		return nil, fmt.Errorf("daemon returned success with no registry data")
+	}
+	return &apiResp.Data.Registry, nil
+}
+
+// RemoveRegistrySource removes a user-added custom registry source via the daemon
+// (MCP-1057). DELETE /api/v1/registries/{id} → data.registry. On failure it
+// returns a *RegistryAddError carrying the stable cross-surface code
+// (registry_not_found, registry_shadows_builtin, registries_locked).
+func (c *Client) RemoveRegistrySource(ctx context.Context, id string) (*contracts.RegistrySummary, error) {
+	u := c.baseURL + "/api/v1/registries/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call remove-registry-source API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp struct {
+		Success   bool                                `json:"success"`
+		Data      *contracts.RemoveRegistrySourceData `json:"data"`
+		Error     string                              `json:"error"`
+		Code      string                              `json:"code"`
+		RequestID string                              `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if !apiResp.Success || resp.StatusCode != http.StatusOK {
+		msg := apiResp.Error
+		if msg == "" {
+			msg = fmt.Sprintf("API returned status %d", resp.StatusCode)
+		}
+		return nil, &RegistryAddError{Code: apiResp.Code, Message: msg, RequestID: apiResp.RequestID}
+	}
+	if apiResp.Data == nil {
+		return nil, fmt.Errorf("daemon returned success with no registry data")
+	}
+	return &apiResp.Data.Registry, nil
+}
+
+// EditRegistrySource updates a user-added custom registry source via the daemon
+// (MCP-1072). PUT /api/v1/registries/{id} → data.registry. Empty fields are left
+// unchanged. On failure it returns a *RegistryAddError carrying the stable
+// cross-surface code (registry_not_found, registry_shadows_builtin,
+// registries_locked, invalid_registry_url).
+func (c *Client) EditRegistrySource(ctx context.Context, id, name, sourceURL, serversURL string) (*contracts.RegistrySummary, error) {
+	body := contracts.EditRegistrySourceRequest{Name: name, URL: sourceURL, ServersURL: serversURL}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	u := c.baseURL + "/api/v1/registries/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call edit-registry-source API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp struct {
+		Success   bool                              `json:"success"`
+		Data      *contracts.EditRegistrySourceData `json:"data"`
+		Error     string                            `json:"error"`
+		Code      string                            `json:"code"`
+		RequestID string                            `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if !apiResp.Success || resp.StatusCode != http.StatusOK {
+		msg := apiResp.Error
+		if msg == "" {
+			msg = fmt.Sprintf("API returned status %d", resp.StatusCode)
+		}
+		return nil, &RegistryAddError{Code: apiResp.Code, Message: msg, RequestID: apiResp.RequestID}
+	}
+	if apiResp.Data == nil {
+		return nil, fmt.Errorf("daemon returned success with no registry data")
+	}
+	return &apiResp.Data.Registry, nil
 }

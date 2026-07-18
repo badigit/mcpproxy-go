@@ -145,7 +145,7 @@ final class ModelsTests: XCTestCase {
     // MARK: - HealthAction Enum
 
     func testHealthActionLabels() {
-        XCTAssertEqual(HealthAction.login.label, "Log In")
+        XCTAssertEqual(HealthAction.login.label, "Sign in")
         XCTAssertEqual(HealthAction.restart.label, "Restart")
         XCTAssertEqual(HealthAction.enable.label, "Enable")
         XCTAssertEqual(HealthAction.approve.label, "Approve")
@@ -643,7 +643,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(stats.tokenMetrics?.totalServerToolListSize, 120000)
         XCTAssertEqual(stats.tokenMetrics?.averageQueryResultSize, 5000)
         XCTAssertEqual(stats.tokenMetrics?.savedTokens, 115000)
-        XCTAssertEqual(stats.tokenMetrics?.savedTokensPercentage, 95.83, accuracy: 0.01)
+        XCTAssertEqual(try XCTUnwrap(stats.tokenMetrics?.savedTokensPercentage), 95.83, accuracy: 0.01)
         XCTAssertEqual(stats.tokenMetrics?.perServerToolListSizes?["github"], 80000)
         XCTAssertEqual(stats.tokenMetrics?.perServerToolListSizes?["gitlab"], 40000)
     }

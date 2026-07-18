@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
@@ -226,8 +227,8 @@ func TestAnnotationFiltering_ReadOnlyOnly(t *testing.T) {
 		},
 		{
 			serverName:  "s1",
-			toolName:    "delete_item",
-			annotations: nil, // no readOnlyHint; "delete" verb => destructive, excluded
+			toolName:    "unknown_tool",
+			annotations: nil, // nil readOnlyHint defaults to not read-only
 		},
 	}
 
@@ -387,52 +388,75 @@ func TestAnnotationFiltering_NoFiltersPassAll(t *testing.T) {
 	assert.Len(t, filtered, 3)
 }
 
-// TestAnnotationFiltering_ReadOnlyOnly_UnannotatedReadVerbsKept is the primary
-// regression for retrieve-tools-read-only-filter-drops-unannotated-tools: upstreams
-// like mcpvault/obsidian emit NO annotations object at all. read_only_only must fall
-// back to the verb-based READ classification and keep genuinely read-only tools.
-func TestAnnotationFiltering_ReadOnlyOnly_UnannotatedReadVerbsKept(t *testing.T) {
-	tools := []annotatedSearchResult{
-		{serverName: "obsidian", toolName: "search_notes", annotations: nil},
-		{serverName: "obsidian", toolName: "read_note", annotations: nil},
-		{serverName: "obsidian", toolName: "list_directory", annotations: nil},
-		{serverName: "obsidian", toolName: "get_active_file", annotations: nil},
-		// Write/destructive verbs with no annotations must still be excluded.
-		{serverName: "obsidian", toolName: "create_note", annotations: nil},
-		{serverName: "obsidian", toolName: "delete_note", annotations: nil},
+// TestBuildSessionRiskResponse_WarningOmittedByDefault verifies that the prose
+// `warning` field is excluded from the session_risk map when the include flag
+// is false, even when the trifecta is detected. This is the issue #406 fix:
+// default-off behavior to reduce token overhead and LLM distraction.
+func TestBuildSessionRiskResponse_WarningOmittedByDefault(t *testing.T) {
+	risk := SessionRisk{
+		Level:          "high",
+		HasOpenWorld:   true,
+		HasDestructive: true,
+		HasWrite:       true,
+		LethalTrifecta: true,
+		Warning:        "LETHAL TRIFECTA DETECTED: ...",
 	}
 
-	filtered := filterByAnnotations(tools, true, false, false)
+	out := buildSessionRiskResponse(risk, false)
 
-	got := make([]string, 0, len(filtered))
-	for _, f := range filtered {
-		got = append(got, f.toolName)
-	}
-	assert.ElementsMatch(t,
-		[]string{"search_notes", "read_note", "list_directory", "get_active_file"},
-		got,
-		"unannotated read-verb tools must be kept; write/destructive verbs excluded")
+	// Structured fields are always present
+	assert.Equal(t, "high", out["level"])
+	assert.Equal(t, true, out["has_open_world_tools"])
+	assert.Equal(t, true, out["has_destructive_tools"])
+	assert.Equal(t, true, out["has_write_tools"])
+	assert.Equal(t, true, out["lethal_trifecta"])
+
+	// Warning prose must NOT appear when include flag is false
+	_, hasWarning := out["warning"]
+	assert.False(t, hasWarning, "warning prose must be omitted when includeWarning=false")
 }
 
-// TestAnnotationFiltering_ReadOnlyOnly_ExplicitFalseExcluded asserts that a tool
-// EXPLICITLY annotated readOnlyHint=false stays excluded even if its name looks
-// read-ish — the explicit server hint wins over the name heuristic.
-func TestAnnotationFiltering_ReadOnlyOnly_ExplicitFalseExcluded(t *testing.T) {
-	tools := []annotatedSearchResult{
-		{
-			serverName:  "beget",
-			toolName:    "get_thing", // read-ish name ...
-			annotations: &config.ToolAnnotations{ReadOnlyHint: boolPtr(false)}, // ... but server says NOT read-only
-		},
-		{
-			serverName:  "obsidian",
-			toolName:    "search_notes",
-			annotations: nil, // unannotated read verb => kept
-		},
+// TestBuildSessionRiskResponse_WarningIncludedWhenOptedIn verifies that the
+// prose `warning` field is present when the caller opts in (config flag or
+// per-call argument).
+func TestBuildSessionRiskResponse_WarningIncludedWhenOptedIn(t *testing.T) {
+	risk := SessionRisk{
+		Level:          "high",
+		HasOpenWorld:   true,
+		HasDestructive: true,
+		HasWrite:       true,
+		LethalTrifecta: true,
+		Warning:        "LETHAL TRIFECTA DETECTED: prose warning",
 	}
 
-	filtered := filterByAnnotations(tools, true, false, false)
+	out := buildSessionRiskResponse(risk, true)
 
-	assert.Len(t, filtered, 1)
-	assert.Equal(t, "search_notes", filtered[0].toolName)
+	// Structured fields are always present
+	assert.Equal(t, "high", out["level"])
+	assert.Equal(t, true, out["lethal_trifecta"])
+
+	// Warning prose IS present when opted in
+	warning, hasWarning := out["warning"].(string)
+	require.True(t, hasWarning, "warning prose must be present when includeWarning=true")
+	assert.Contains(t, warning, "LETHAL TRIFECTA")
+}
+
+// TestBuildSessionRiskResponse_NoWarningWhenLowRisk verifies that the warning
+// field stays absent for low-risk sessions even when the include flag is true,
+// because analyzeSessionRisk only sets Warning for the trifecta case.
+func TestBuildSessionRiskResponse_NoWarningWhenLowRisk(t *testing.T) {
+	risk := SessionRisk{
+		Level:          "low",
+		HasOpenWorld:   false,
+		HasDestructive: false,
+		HasWrite:       false,
+		LethalTrifecta: false,
+		Warning:        "",
+	}
+
+	out := buildSessionRiskResponse(risk, true)
+
+	assert.Equal(t, "low", out["level"])
+	_, hasWarning := out["warning"]
+	assert.False(t, hasWarning, "warning must not be present when no trifecta")
 }

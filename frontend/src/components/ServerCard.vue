@@ -4,7 +4,7 @@
       <!-- Header -->
       <div class="flex justify-between items-start mb-4">
         <div class="flex-1 min-w-0 mr-2">
-          <h3 class="card-title text-lg truncate">{{ server.name }}</h3>
+          <h3 class="card-title text-lg truncate" :title="server.name" data-test="server-card-title">{{ displayName }}</h3>
           <p class="text-sm text-base-content/70 truncate">
             {{ server.protocol }} • {{ server.url || server.command || 'No endpoint' }}
           </p>
@@ -14,11 +14,12 @@
         <!-- M-004: Add tooltip showing health.detail if present -->
         <div
           :class="[
-            'badge badge-sm flex-shrink-0',
+            'badge badge-sm shrink-0',
             statusBadgeClass,
             statusTooltip ? 'tooltip tooltip-left' : ''
           ]"
           :data-tip="statusTooltip"
+          data-test="server-status-chip"
         >
           {{ statusText }}
         </div>
@@ -29,13 +30,19 @@
         <div class="stat bg-base-200 rounded-lg p-3">
           <div class="stat-title text-xs">Tools</div>
           <div class="stat-value text-lg">{{ server.tool_count }}</div>
+          <div v-if="blockedToolCount > 0" class="stat-desc text-xs text-error flex items-center gap-1">
+            <svg class="w-3 h-3 inline-block shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            {{ blockedToolCount }} disabled
+          </div>
           <div v-if="quarantineToolCount > 0" class="stat-desc text-xs text-warning flex items-center gap-1">
-            <svg class="w-3 h-3 inline-block flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="w-3 h-3 inline-block shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
             {{ quarantineToolCount }} pending approval
           </div>
-          <div v-else-if="server.tool_list_token_size" class="stat-desc text-xs">
+          <div v-if="blockedToolCount === 0 && quarantineToolCount === 0 && server.tool_list_token_size" class="stat-desc text-xs">
             {{ server.tool_list_token_size.toLocaleString() }} tokens
           </div>
         </div>
@@ -66,7 +73,7 @@
         >
           <!-- Shield icon -->
           <svg
-            class="w-4 h-4 flex-shrink-0"
+            class="w-4 h-4 shrink-0"
             :class="securityBadgeColor"
             fill="currentColor"
             viewBox="0 0 24 24"
@@ -100,12 +107,33 @@
         <span class="text-xs">{{ server.last_error }}</span>
       </div>
 
-      <!-- Quarantine warning -->
+      <!-- Server-level quarantine warning. Server is held back entirely until
+           the user approves it. Drives the Approve button below via
+           health.action='approve'. -->
       <div v-if="server.quarantined" class="alert alert-warning alert-sm mb-4">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.732-.833-2.5 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
         </svg>
         <span class="text-xs">Server is quarantined</span>
+      </div>
+
+      <!-- Tool-level quarantine warning (Spec 032). Independent of server
+           quarantine: when a server is trusted at the server level but ships
+           tools with descriptions/schemas that have not yet been approved
+           (or that changed since last approval — rug-pull guard), they are
+           silently blocked from agent use. Surface this on the list so users
+           don't have to open Details to discover it. -->
+      <div v-else-if="quarantineToolCount > 0" class="alert alert-warning alert-sm mb-4">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.732-.833-2.5 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
+        </svg>
+        <span class="text-xs flex-1">{{ toolQuarantineSummary }}</span>
+        <router-link
+          :to="serverDetailPath(server.name, 'tools')"
+          class="btn btn-xs btn-warning"
+        >
+          Review
+        </router-link>
       </div>
 
       <!-- Actions - uses unified health.action when available -->
@@ -153,7 +181,7 @@
 
         <router-link
           v-if="healthAction === 'view_logs'"
-          :to="`/servers/${server.name}?tab=logs`"
+          :to="serverDetailPath(server.name, 'logs')"
           class="btn btn-sm btn-primary"
         >
           View Logs
@@ -169,7 +197,7 @@
 
         <router-link
           v-if="healthAction === 'configure'"
-          :to="`/servers/${server.name}?tab=config`"
+          :to="serverDetailPath(server.name, 'config')"
           class="btn btn-sm btn-primary"
         >
           Configure
@@ -204,7 +232,7 @@
           </div>
           <router-link
             v-else
-            :to="`/servers/${server.name}?tab=security`"
+            :to="serverDetailPath(server.name, 'security')"
             class="btn btn-sm btn-outline btn-ghost"
             title="Security Scan"
           >
@@ -216,8 +244,9 @@
         </template>
 
         <router-link
-          :to="`/servers/${server.name}`"
+          :to="serverDetailPath(server.name)"
           class="btn btn-sm btn-outline"
+          data-test="server-detail-link"
         >
           Details
         </router-link>
@@ -236,11 +265,11 @@
     <div v-if="showApproveConfirmation" class="modal modal-open">
       <div class="modal-box">
         <h3 class="font-bold text-lg mb-4">
-          {{ approveDialogMode === 'no_scan' ? 'No Security Scan Run' : 'Critical Findings Detected' }}
+          {{ approveDialogMode === 'no_scan' ? 'No Security Scan Run' : 'Dangerous Findings Detected' }}
         </h3>
         <p v-if="approveDialogMode === 'critical'" class="mb-4">
           <strong>{{ server.name }}</strong> has
-          <span class="text-error font-semibold">{{ criticalFindingCount }} critical finding{{ criticalFindingCount === 1 ? '' : 's' }}</span>
+          <span class="text-error font-semibold">{{ dangerousFindingCount }} dangerous finding{{ dangerousFindingCount === 1 ? '' : 's' }}</span>
           in its most recent security scan. Approving this server will allow it to run despite these warnings.
         </p>
         <p v-else class="mb-4">
@@ -259,7 +288,7 @@
           </button>
           <router-link
             v-if="approveDialogMode === 'no_scan'"
-            :to="`/servers/${server.name}?tab=security`"
+            :to="serverDetailPath(server.name, 'security')"
             class="btn btn-primary"
             @click="showApproveConfirmation = false"
           >
@@ -315,12 +344,18 @@ import type { Server } from '@/types'
 import { useServersStore } from '@/stores/servers'
 import { useSystemStore } from '@/stores/system'
 import { useSecurityScannerStatus } from '@/composables/useSecurityScannerStatus'
+import { serverDetailPath, serverDisplayName } from '@/utils/serverRoute'
+import { oauthSignInState } from '@/utils/health'
 
 interface Props {
   server: Server
 }
 
 const props = defineProps<Props>()
+
+// MCP-1112: title-preferring display label. The '/'-safe detail links call
+// serverDetailPath() directly in the template.
+const displayName = computed(() => serverDisplayName(props.server))
 
 const serversStore = useServersStore()
 const systemStore = useSystemStore()
@@ -334,6 +369,12 @@ const isHttpProtocol = computed(() => {
   return props.server.protocol === 'http' || props.server.protocol === 'streamable-http'
 })
 
+// MCP-1821 — OAuth sign-in state (null when no sign-in is required). When set,
+// the status chip reads a calm amber "Sign-in required" instead of red
+// "Disconnected"/"Unhealthy", matching the ServerDetail Sign-in CTA. The
+// existing health.action==='login' Login button (below) drives the action.
+const signInState = computed(() => oauthSignInState(props.server))
+
 // Unified health status computed properties
 const statusBadgeClass = computed(() => {
   const health = props.server.health
@@ -343,8 +384,14 @@ const statusBadgeClass = computed(() => {
       case 'disabled':
         return 'badge-neutral' // gray
       case 'quarantined':
+        // MCP-1821 — a quarantined server can ALSO be login-required; the
+        // actionable amber "Sign-in required" chip takes precedence over the
+        // purple quarantine chip so the user sees the next action.
+        if (signInState.value) return 'badge-warning'
         return 'badge-secondary' // purple-ish
       default:
+        // MCP-1821 — sign-in required reads amber, not red.
+        if (signInState.value) return 'badge-warning'
         // Use health level
         switch (health.level) {
           case 'healthy':
@@ -359,6 +406,9 @@ const statusBadgeClass = computed(() => {
     }
   }
   // Fallback to legacy logic
+  // MCP-1857 — a diagnostic-only OAuth login state (no health object) still
+  // reads calm amber, not red, mirroring the in-health branch above.
+  if (signInState.value) return 'badge-warning'
   if (props.server.connected) return 'badge-success'
   if (props.server.connecting) return 'badge-warning'
   return 'badge-error'
@@ -367,9 +417,15 @@ const statusBadgeClass = computed(() => {
 const statusText = computed(() => {
   const health = props.server.health
   if (health) {
+    // MCP-1821 — surface an actionable "Sign-in required" for OAuth login states,
+    // including a quarantined-and-login-required server (quarantine + sign-in coexist).
+    if (signInState.value && health.admin_state !== 'disabled') return 'Sign-in required'
     return health.summary || health.level
   }
   // Fallback to legacy logic
+  // MCP-1857 — surface the actionable "Sign-in required" for a diagnostic-only
+  // OAuth login state even when the record carries no health object.
+  if (signInState.value) return 'Sign-in required'
   if (props.server.connected) return 'Connected'
   if (props.server.connecting) return 'Connecting'
   return 'Disconnected'
@@ -394,6 +450,40 @@ const quarantineToolCount = computed(() => {
   const q = props.server.quarantine
   if (!q) return 0
   return (q.pending_count ?? 0) + (q.changed_count ?? 0)
+})
+
+const blockedToolCount = computed(() => {
+  const q = props.server.quarantine
+  if (!q) return 0
+  return q.blocked_count ?? 0
+})
+
+// Human-readable summary for the tool-quarantine banner. Differentiates
+// fully-quarantined (every tool needs approval) from partially-quarantined,
+// and surfaces "changed" tools separately because they indicate a rug-pull
+// rather than a first-time review.
+const toolQuarantineSummary = computed(() => {
+  const q = props.server.quarantine
+  if (!q) return ''
+  const pending = q.pending_count ?? 0
+  const changed = q.changed_count ?? 0
+  const total = pending + changed
+  if (total === 0) return ''
+  const toolCount = props.server.tool_count ?? 0
+  const noun = (n: number) => (n === 1 ? 'tool' : 'tools')
+  if (changed > 0 && pending > 0) {
+    return `${pending} ${noun(pending)} pending, ${changed} changed — approval needed`
+  }
+  if (changed > 0) {
+    return `${changed} ${noun(changed)} changed since approval — re-review needed`
+  }
+  if (toolCount > 0 && pending === toolCount) {
+    return `All ${pending} ${noun(pending)} pending security approval`
+  }
+  if (toolCount > 0) {
+    return `${pending} of ${toolCount} ${noun(toolCount)} pending security approval`
+  }
+  return `${pending} ${noun(pending)} pending security approval`
 })
 
 // Security scan badge (Spec 039)
@@ -632,14 +722,17 @@ async function triggerLogout() {
   }
 }
 
-// Counts critical findings from the scan summary if available. Used to gate
-// the Approve button behind an extra confirmation (F-04).
-const criticalFindingCount = computed(() => {
+// Counts baseline DANGEROUS findings from the scan summary if available. Used to
+// gate the Approve button behind an extra confirmation (F-04). Spec 077 FR-021:
+// the gate blocks on baseline dangerous (hard-tier) findings only, matching the
+// tier-driven server verdict — not on `critical` severity, which a non-blocking
+// soft finding could also carry.
+const dangerousFindingCount = computed(() => {
   const scan = props.server.security_scan as any
   if (!scan) return 0
-  // finding_counts.critical is populated from the latest report summary.
+  // finding_counts.dangerous is populated from the latest report summary.
   const fc = scan.finding_counts as Record<string, number> | undefined
-  if (fc && typeof fc.critical === 'number') return fc.critical
+  if (fc && typeof fc.dangerous === 'number') return fc.dangerous
   return 0
 })
 
@@ -660,7 +753,7 @@ function handleApproveClick() {
     showApproveConfirmation.value = true
     return
   }
-  if (criticalFindingCount.value > 0) {
+  if (dangerousFindingCount.value > 0) {
     approveDialogMode.value = 'critical'
     showApproveConfirmation.value = true
     return

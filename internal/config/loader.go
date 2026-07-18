@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -110,7 +111,7 @@ func Load() (*Config, error) {
 				return nil, fmt.Errorf("failed to create default config file: %w", err)
 			}
 
-			fmt.Printf("INFO: Created default configuration file at %s\n", defaultConfigPath)
+			fmt.Fprintf(os.Stderr, "INFO: Created default configuration file at %s\n", defaultConfigPath)
 		}
 	}
 
@@ -244,6 +245,23 @@ func loadConfigFile(path string, cfg *Config) error {
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Back-compat (MCP-1086): the server-edition block was renamed from the
+	// legacy "teams" key to "server_edition". An existing config that still uses
+	// "teams" is normalized onto ServerEdition on read. The new key always wins;
+	// only fall back to the legacy key when "server_edition" is absent. This
+	// compiles in both editions because ServerEditionConfig is a struct{} stub
+	// in the personal build (it simply unmarshals to an empty value there).
+	if _, hasNew := rawConfig["server_edition"]; !hasNew {
+		if legacy, hasLegacy := rawConfig["teams"]; hasLegacy {
+			if raw, err := json.Marshal(legacy); err == nil {
+				var se ServerEditionConfig
+				if err := json.Unmarshal(raw, &se); err == nil {
+					cfg.ServerEdition = &se
+				}
+			}
+		}
+	}
+
 	// Set created time if not specified
 	for _, server := range cfg.Servers {
 		if server.Created.IsZero() {
@@ -349,37 +367,23 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 // SaveConfig saves configuration to file
 func SaveConfig(cfg *Config, path string) error {
-	fmt.Printf("[DEBUG] SaveConfig called with path: %s\n", path)
-	fmt.Printf("[DEBUG] SaveConfig - server count: %d\n", len(cfg.Servers))
-
-	// Log server states for debugging
-	for _, server := range cfg.Servers {
-		fmt.Printf("[DEBUG] SaveConfig - server %s: enabled=%v, quarantined=%v\n",
-			server.Name, server.Enabled, server.Quarantined)
-	}
-
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - JSON marshal failed: %v\n", err)
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - MkdirAll failed: %v\n", err)
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
 	// Atomic write with fsync to prevent race conditions
 	// This ensures core never reads partially written config files
-	fmt.Printf("[DEBUG] SaveConfig - about to write file atomically: %s\n", path)
 	if err := atomicWriteFile(path, data, 0600); err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - atomicWriteFile failed: %v\n", err)
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	fmt.Printf("[DEBUG] SaveConfig - successfully wrote file: %s\n", path)
 	return nil
 }
 
@@ -414,6 +418,7 @@ func LoadOrCreateConfig(dataDir string) (*Config, error) {
 		// Config doesn't exist, create a new one
 		cfg := DefaultConfig()
 		cfg.DataDir = dataDir
+		applyFirstRunDockerIsolation(cfg)
 		if err := SaveConfig(cfg, configPath); err != nil {
 			return nil, fmt.Errorf("failed to create initial config: %w", err)
 		}
@@ -421,6 +426,41 @@ func LoadOrCreateConfig(dataDir string) (*Config, error) {
 	}
 
 	return LoadFromFile(configPath)
+}
+
+// applyFirstRunDockerIsolation turns on DockerIsolation.Enabled for a freshly
+// created config if (and only if) a Docker daemon is reachable at install
+// time. Existing installs are unaffected — DefaultConfig() still returns
+// Enabled=false so LoadFromFile's default-then-merge path preserves whatever
+// the user has (or doesn't have) in their config file.
+//
+// Probing here keeps new users secure-by-default without breaking the ~75%
+// of current users who don't have Docker: if `docker info` fails, we keep
+// isolation off and the user can flip it on later via the Web UI toggle or
+// by editing mcp_config.json.
+func applyFirstRunDockerIsolation(cfg *Config) {
+	if cfg == nil || cfg.DockerIsolation == nil {
+		return
+	}
+	if !dockerDaemonProbe() {
+		return
+	}
+	cfg.DockerIsolation.Enabled = true
+}
+
+// dockerDaemonProbe is the function used to detect Docker at first-run.
+// Tests override it to return deterministic values without spawning a
+// subprocess. Production code uses probeDockerDaemonAvailable.
+var dockerDaemonProbe = probeDockerDaemonAvailable
+
+// probeDockerDaemonAvailable runs `docker info` with a short timeout to check
+// whether the host has a reachable Docker daemon. Returns false on any
+// failure (binary missing, daemon down, permissions). Used only during
+// initial config creation — not on every start.
+func probeDockerDaemonAvailable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}").Run() == nil
 }
 
 // CreateSampleConfig creates a sample configuration file
@@ -455,12 +495,35 @@ func createDefaultConfigFile(path string, cfg *Config) error {
 	defaultCfg := DefaultConfig()
 	defaultCfg.DataDir = cfg.DataDir
 	defaultCfg.Servers = []*ServerConfig{} // Empty servers list
+	applyFirstRunDockerIsolation(defaultCfg)
 
 	return SaveConfig(defaultCfg, path)
 }
 
 // initializeRegistries initializes the registries package with config data
 func initializeRegistries(cfg *Config) {
+	// One-time migration (MCP-1049): drop former-default registries that were
+	// trimmed from the shipped set so an existing config converges to the current
+	// defaults instead of resurrecting them on every load. Idempotent and only
+	// touches the known former-default id set, never user-added customs.
+	PruneDeprecatedRegistries(cfg)
+
+	// One-time migration (MCP-1072): map legacy provenance strings
+	// ("official/trusted" / "custom/unverified") persisted by earlier builds onto
+	// the current two-value vocabulary so existing installs don't break on read.
+	normalizeRegistryProvenanceValues(cfg)
+
+	// One-time migration (MCP-2930): map the deprecated per-server skip_quarantine
+	// flag onto auto_approve_tool_changes so existing configs converge on the new
+	// field. Runs on initial load and every hot-reload (LoadFromFile path).
+	normalizeServerQuarantineFlags(cfg)
+
+	// One-time migration (Spec 077 US3): fold the deprecated top-level
+	// scanner_fetch_package_source / scanner_disable_no_new_privileges keys into
+	// the unified security.deep_scan block, and drop the removed
+	// auto_scan_quarantined key. Existing configs load unchanged.
+	migrateDeepScanConfig(cfg)
+
 	// This function will be implemented to avoid circular imports
 	// For now, we'll create a callback mechanism
 	if registriesInitCallback != nil {
@@ -526,5 +589,12 @@ func applyTLSEnvOverrides(cfg *Config) {
 	// Override data directory from environment (for backward compatibility)
 	if value := os.Getenv("MCPPROXY_DATA"); value != "" {
 		cfg.DataDir = value
+	}
+
+	// Override retrieve_tools serialization mode from environment (Spec 085).
+	// Explicit MCPPROXY_* alias per the established loader convention; the
+	// value is validated by cfg.Validate() right after these overrides apply.
+	if value := os.Getenv("MCPPROXY_TOOL_RESPONSE_MODE"); value != "" {
+		cfg.ToolResponseMode = value
 	}
 }

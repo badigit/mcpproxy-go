@@ -216,6 +216,20 @@ Create `.vscode/mcp.json` in your workspace:
 
 ---
 
+### 🧩 OpenCode
+
+OpenCode can be connected through MCPProxy's Connect Clients flow.
+
+- Client ID: `opencode`
+- Config section: `mcp`
+- macOS/Linux global config path: `~/.config/opencode/opencode.json`
+- Windows global config path: `%LOCALAPPDATA%\opencode\opencode.json`
+- OpenCode config must already exist; MCPProxy does not create it for you.
+- On connect, MCPProxy writes or updates only the OpenCode `mcp` subtree and preserves unrelated root config.
+- MCPProxy treats endpoint-equivalent existing entries as already connected, even if they use a non-canonical server name.
+
+---
+
 ### 🤖 Claude Desktop
 
 Claude Desktop supports two different approaches depending on your plan:
@@ -239,6 +253,8 @@ Add mcpproxy as a remote MCP server via Settings → Connectors → Add Custom C
 **Setup Steps:**
 
 #### Option A: Free Plan — JSON Configuration
+
+> **💡 Built-in wizard:** mcpproxy's **Connect** wizard (Web UI / tray) can write this bridge configuration for you — pick **Claude Desktop**, click **Review & connect** to see the exact entry that will be written (a timestamped backup is created first), then confirm with **Connect**. It registers the `npx -y mcp-remote` bridge shown below (Node.js required). The manual steps remain available if you prefer to edit the file yourself. Changed your mind? The wizard offers a one-click **Undo** right next to the backup path it just showed: it reverts the connect by restoring the config byte-for-byte from that backup (or removing the file if the connect created it), and it refuses — rather than clobbering your edits — if the file changed in the meantime. Backups are never overwritten: two operations in the same second get distinct names (`.bak.<timestamp>-1`, `-2`, …), and none are deleted automatically.
 
 1. Create the config file if it doesn't exist:
 

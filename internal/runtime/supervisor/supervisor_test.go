@@ -2,7 +2,10 @@ package supervisor
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,17 +14,18 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 )
 
 // MockUpstreamAdapter is a test double for UpstreamAdapter
 type MockUpstreamAdapter struct {
-	mu              sync.Mutex
-	addedServers    map[string]*config.ServerConfig
-	removedServers  []string
-	connected       map[string]bool
-	disconnected    []string
-	eventCh         chan Event
-	states          map[string]*ServerState
+	mu             sync.Mutex
+	addedServers   map[string]*config.ServerConfig
+	removedServers []string
+	connected      map[string]bool
+	disconnected   []string
+	eventCh        chan Event
+	states         map[string]*ServerState
 }
 
 func NewMockUpstreamAdapter() *MockUpstreamAdapter {
@@ -556,6 +560,126 @@ func TestSupervisor_RefreshToolsFromDiscovery_EmptyTools(t *testing.T) {
 	}
 }
 
+// TestSupervisor_ReconnectRepopulatesStateViewTools verifies that after a
+// server disconnects (which clears the StateView per-server tool set) and then
+// reconnects, the StateView tool set is repopulated from the retained
+// Supervisor snapshot instead of being left empty until background discovery
+// re-runs. This is the root-cause regression behind MCP-2083 (tracked as
+// MCP-2094): StateView consumers that don't route through the #635 read
+// fallback (tray counts, SSE servers.changed, health/diagnostics) would
+// otherwise report 0 tools for a connected server that has tools.
+func TestSupervisor_ReconnectRepopulatesStateViewTools(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "server1", Enabled: true},
+		},
+	}
+
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+	_ = mockUpstream.AddServer("server1", cfg.Servers[0])
+
+	sup := New(configSvc, mockUpstream, zap.NewNop())
+
+	// Populate initial state + tools (simulating a connected server whose
+	// background discovery has completed).
+	_ = sup.reconcile(configSvc.Current())
+	tools := []*config.ToolMetadata{
+		{Name: "tool1", ServerName: "server1", Description: "Test tool 1"},
+		{Name: "tool2", ServerName: "server1", Description: "Test tool 2"},
+	}
+	if err := sup.RefreshToolsFromDiscovery(tools); err != nil {
+		t.Fatalf("RefreshToolsFromDiscovery failed: %v", err)
+	}
+	mockUpstream.SetServerTools("server1", tools)
+
+	// Sanity: StateView shows the 2 tools.
+	if got := len(sup.StateView().Snapshot().Servers["server1"].Tools); got != 2 {
+		t.Fatalf("setup: expected 2 tools in StateView, got %d", got)
+	}
+
+	// Disconnect: StateView deliberately clears the per-server tool set.
+	sup.updateSnapshotFromEvent(Event{
+		Type:       EventServerDisconnected,
+		ServerName: "server1",
+		Timestamp:  time.Now(),
+		Payload:    map[string]interface{}{"connected": false},
+	})
+	if got := len(sup.StateView().Snapshot().Servers["server1"].Tools); got != 0 {
+		t.Fatalf("after disconnect: expected StateView tools cleared, got %d", got)
+	}
+
+	// Reconnect: StateView must be repopulated from the retained Supervisor
+	// snapshot immediately, without waiting for background discovery to re-run.
+	sup.updateSnapshotFromEvent(Event{
+		Type:       EventServerConnected,
+		ServerName: "server1",
+		Timestamp:  time.Now(),
+		Payload:    map[string]interface{}{"connected": true},
+	})
+
+	status := sup.StateView().Snapshot().Servers["server1"]
+	if status.ToolCount != 2 {
+		t.Errorf("after reconnect: expected ToolCount 2, got %d", status.ToolCount)
+	}
+	if len(status.Tools) != 2 {
+		t.Errorf("after reconnect: expected StateView repopulated with 2 tools, got %d", len(status.Tools))
+	}
+	if len(status.Tools) == 2 && status.Tools[0].Name != "tool1" {
+		t.Errorf("after reconnect: expected first tool 'tool1', got %q", status.Tools[0].Name)
+	}
+}
+
+// TestSupervisor_RefreshToolsFromDiscovery_ShrinkingToolSet verifies that a
+// later discovery reporting fewer (but non-empty) tools updates StateView
+// rather than being silently skipped. The old size-based guard pinned
+// StateView to a stale higher count, diverging from the Supervisor snapshot
+// (which is updated unconditionally). Part of MCP-2094.
+func TestSupervisor_RefreshToolsFromDiscovery_ShrinkingToolSet(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "server1", Enabled: true},
+		},
+	}
+
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	sup := New(configSvc, mockUpstream, zap.NewNop())
+	_ = sup.reconcile(configSvc.Current())
+
+	threeTools := []*config.ToolMetadata{
+		{Name: "tool1", ServerName: "server1"},
+		{Name: "tool2", ServerName: "server1"},
+		{Name: "tool3", ServerName: "server1"},
+	}
+	if err := sup.RefreshToolsFromDiscovery(threeTools); err != nil {
+		t.Fatalf("RefreshToolsFromDiscovery (3 tools) failed: %v", err)
+	}
+
+	// Upstream now legitimately exposes only one tool.
+	oneTool := []*config.ToolMetadata{{Name: "tool1", ServerName: "server1"}}
+	if err := sup.RefreshToolsFromDiscovery(oneTool); err != nil {
+		t.Fatalf("RefreshToolsFromDiscovery (1 tool) failed: %v", err)
+	}
+
+	status := sup.StateView().Snapshot().Servers["server1"]
+	if status.ToolCount != 1 {
+		t.Errorf("expected ToolCount 1 after shrink, got %d", status.ToolCount)
+	}
+	if len(status.Tools) != 1 {
+		t.Errorf("expected StateView to reflect 1 tool after shrink, got %d", len(status.Tools))
+	}
+}
+
 func TestSupervisor_InspectionExemption_GrantAndRevoke(t *testing.T) {
 	cfg := &config.Config{
 		Listen:  "127.0.0.1:8080",
@@ -731,4 +855,155 @@ func TestSupervisor_InspectionExemption_MultipleServers(t *testing.T) {
 	if !supervisor.IsInspectionExempted("server3") {
 		t.Error("Expected server3 to still be exempted")
 	}
+}
+
+// TestSupervisor_ErrorCodeNotifierSynchronous asserts Spec 080 FR-012: the
+// error-code notifier fires synchronously at the classification site, so the
+// pre-churn last_error_code write completes before updateStateView returns —
+// a crash immediately after classification cannot lose the final pre-crash
+// code. The unsynchronized `got` variable is deliberate: if the notifier were
+// still dispatched on a goroutine, this assertion would flake and `go test
+// -race` would flag the write.
+func TestSupervisor_ErrorCodeNotifierSynchronous(t *testing.T) {
+	cfg := &config.Config{
+		Listen:  "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	sup := New(configSvc, mockUpstream, zap.NewNop())
+
+	var got string
+	sup.SetErrorCodeNotifier(func(code string) { got = code })
+
+	sup.updateStateView("srv", &ServerState{
+		Name:    "srv",
+		Config:  &config.ServerConfig{Name: "srv", URL: "http://127.0.0.1:1/mcp", Enabled: true},
+		Enabled: true,
+		ConnectionInfo: &types.ConnectionInfo{
+			State:     types.StateError,
+			LastError: errors.New("dial tcp 127.0.0.1:1: connect: connection refused"),
+		},
+	})
+
+	if got == "" {
+		t.Fatal("notifier did not fire synchronously during updateStateView")
+	}
+	if !strings.HasPrefix(got, "MCPX_") {
+		t.Fatalf("notifier received a non-MCPX code: %q", got)
+	}
+}
+
+// barrierUpstreamAdapter wraps MockUpstreamAdapter and counts any upstream
+// call that happens after the barrier is armed. Used to prove Stop() is a
+// write barrier for the delayed initial-reconciliation goroutine (Spec 080).
+type barrierUpstreamAdapter struct {
+	*MockUpstreamAdapter
+	barrier    atomic.Bool
+	violations atomic.Int32
+}
+
+func (b *barrierUpstreamAdapter) check() {
+	if b.barrier.Load() {
+		b.violations.Add(1)
+	}
+}
+
+func (b *barrierUpstreamAdapter) AddServer(name string, cfg *config.ServerConfig) error {
+	b.check()
+	return b.MockUpstreamAdapter.AddServer(name, cfg)
+}
+
+func (b *barrierUpstreamAdapter) RemoveServer(name string) error {
+	b.check()
+	return b.MockUpstreamAdapter.RemoveServer(name)
+}
+
+func (b *barrierUpstreamAdapter) ConnectServer(ctx context.Context, name string) error {
+	b.check()
+	return b.MockUpstreamAdapter.ConnectServer(ctx, name)
+}
+
+func (b *barrierUpstreamAdapter) DisconnectServer(name string) error {
+	b.check()
+	return b.MockUpstreamAdapter.DisconnectServer(name)
+}
+
+func (b *barrierUpstreamAdapter) ConnectAll(ctx context.Context) error {
+	b.check()
+	return b.MockUpstreamAdapter.ConnectAll(ctx)
+}
+
+func (b *barrierUpstreamAdapter) GetServerState(name string) (*ServerState, error) {
+	b.check()
+	return b.MockUpstreamAdapter.GetServerState(name)
+}
+
+func (b *barrierUpstreamAdapter) GetAllStates() map[string]*ServerState {
+	b.check()
+	return b.MockUpstreamAdapter.GetAllStates()
+}
+
+func (b *barrierUpstreamAdapter) IsUserLoggedOut(name string) bool {
+	b.check()
+	return b.MockUpstreamAdapter.IsUserLoggedOut(name)
+}
+
+// TestSupervisor_StopBeforeInitialReconcileIsBarrier (Spec 080 FR-010/FR-011,
+// review round 5): Start() arms a delayed (500ms) initial reconciliation.
+// Stop() must be a barrier for it — the goroutine is registered in s.wg and
+// waits on a ctx-aware timer, so Stop() (cancel + wg.Wait) deterministically
+// either cancels it inside the window or waits for the reconcile to finish.
+// Before the fix it was a bare `go func() { time.Sleep(500ms); reconcile() }`:
+// Stop() returned with nothing to wait for, Runtime.Close resolved the clean-
+// shutdown marker, and the goroutine then woke and wrote diagnostics/state
+// (reconcile -> updateStateView -> notifyErrorCode) after the marker — or
+// against a closed DB.
+func TestSupervisor_StopBeforeInitialReconcileIsBarrier(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "late-server", Enabled: true},
+		},
+	}
+
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	upstream := &barrierUpstreamAdapter{MockUpstreamAdapter: NewMockUpstreamAdapter()}
+	sup := New(configSvc, upstream, zap.NewNop())
+
+	var stopReturned atomic.Bool
+	var notifierAfterStop atomic.Int32
+	sup.SetErrorCodeNotifier(func(string) {
+		if stopReturned.Load() {
+			notifierAfterStop.Add(1)
+		}
+	})
+
+	sup.Start()
+	sup.Stop() // well inside the 500ms initial-reconcile delay
+
+	// Everything the supervisor owns (reconciliation loop, event forwarding,
+	// exemption cleanup, the initial-reconcile goroutine, in-flight actions)
+	// is joined by Stop() via s.wg / drainActions, so from this point on no
+	// upstream call and no notifier call may ever happen again.
+	upstream.barrier.Store(true)
+	stopReturned.Store(true)
+
+	// Regression net: the pre-fix bare goroutine would wake ~500ms after
+	// Start() and run reconcile() against the stopped supervisor. Wait out the
+	// full window plus slack, then assert the barrier held. With the fix this
+	// sleep is pure idle time — the wg-joined goroutine already exited before
+	// Stop() returned, via the s.ctx.Done() arm of its select.
+	time.Sleep(700 * time.Millisecond)
+
+	require.Zero(t, upstream.violations.Load(),
+		"upstream adapter was called after Supervisor.Stop() returned")
+	require.Zero(t, notifierAfterStop.Load(),
+		"error-code notifier fired after Supervisor.Stop() returned")
 }

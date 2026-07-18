@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -86,14 +87,17 @@ func (b *BoltDB) initBuckets() error {
 			ToolStatsBucket,
 			ToolHashBucket,
 			ToolApprovalBucket,
-			ToolEnrichmentBucket,
 			OAuthTokenBucket,
 			MetaBucket,
 			ActivityRecordsBucket,
+			ActivityStatsBucket,
 			ScannersBucket,
 			ScanJobsBucket,
+			ScanJobIndexBucket,
 			ScanReportsBucket,
 			IntegrityBaselinesBucket,
+			OnboardingBucket,
+			SessionsBucket,
 		}
 
 		for _, bucket := range buckets {
@@ -102,11 +106,29 @@ func (b *BoltDB) initBuckets() error {
 			}
 		}
 
-		// Set schema version
+		// Move MCP session records out of the shared "sessions" bucket, which the
+		// server edition also used for USER LOGIN sessions. Each side swept the
+		// bucket believing it owned every key, deleting the other's data.
+		// Idempotent; leaves auth sessions untouched, so nobody is logged out.
+		if err := migrateLegacySessions(tx); err != nil {
+			return fmt.Errorf("failed to migrate legacy sessions bucket: %w", err)
+		}
+
+		// Backfill the scan-job index for databases created before MCP-2205.
+		// Idempotent: only runs when the index is empty but jobs exist.
+		if err := backfillScanJobIndex(tx); err != nil {
+			return fmt.Errorf("failed to backfill scan job index: %w", err)
+		}
+
+		// Set schema version only for new databases. Existing databases keep their
+		// stored version so migrations can observe and upgrade them.
 		metaBucket := tx.Bucket([]byte(MetaBucket))
-		versionBytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(versionBytes, CurrentSchemaVersion)
-		return metaBucket.Put([]byte(SchemaVersionKey), versionBytes)
+		if metaBucket.Get([]byte(SchemaVersionKey)) == nil {
+			versionBytes := make([]byte, 8)
+			binary.LittleEndian.PutUint64(versionBytes, CurrentSchemaVersion)
+			return metaBucket.Put([]byte(SchemaVersionKey), versionBytes)
+		}
+		return nil
 	})
 }
 
@@ -130,6 +152,20 @@ func (b *BoltDB) GetSchemaVersion() (uint64, error) {
 	})
 
 	return version, err
+}
+
+// SetSchemaVersion stores the current migration schema version.
+func (b *BoltDB) SetSchemaVersion(version uint64) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(MetaBucket))
+		if bucket == nil {
+			return fmt.Errorf("meta bucket not found")
+		}
+
+		versionBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(versionBytes, version)
+		return bucket.Put([]byte(SchemaVersionKey), versionBytes)
+	})
 }
 
 // Upstream operations
@@ -327,7 +363,10 @@ func (b *BoltDB) SaveToolApproval(record *ToolApprovalRecord) error {
 	})
 }
 
-// GetToolApproval retrieves a tool approval record by server and tool name
+// GetToolApproval retrieves a tool approval record by server and tool name.
+// Returns ErrToolApprovalNotFound (wrapped so callers can use errors.Is) when
+// no record exists. Any other error indicates a real read failure (decode
+// error, closed DB, etc.) and MUST NOT be treated as "missing" by callers.
 func (b *BoltDB) GetToolApproval(serverName, toolName string) (*ToolApprovalRecord, error) {
 	var record *ToolApprovalRecord
 
@@ -336,7 +375,7 @@ func (b *BoltDB) GetToolApproval(serverName, toolName string) (*ToolApprovalReco
 		key := ToolApprovalKey(serverName, toolName)
 		data := bucket.Get([]byte(key))
 		if data == nil {
-			return fmt.Errorf("tool approval not found: %s", key)
+			return fmt.Errorf("%w: %s", ErrToolApprovalNotFound, key)
 		}
 
 		record = &ToolApprovalRecord{}
@@ -406,6 +445,45 @@ func (b *BoltDB) DeleteServerToolApprovals(serverName string) error {
 		}
 		return nil
 	})
+}
+
+// PruneToolApprovalsNotIn deletes tool-approval records whose ServerName is not
+// present in keep, returning the number removed. This GCs orphaned approvals
+// for servers that left the config without an explicit delete (e.g. the config
+// file was hand-edited, or an old migration). Records for configured servers —
+// including disabled ones — are kept so re-enabling a server doesn't re-trigger
+// quarantine of its previously-approved tools (MCP-1002).
+func (b *BoltDB) PruneToolApprovalsNotIn(keep map[string]bool) (int, error) {
+	removed := 0
+	err := b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ToolApprovalBucket))
+		if bucket == nil {
+			return nil
+		}
+		var keysToDelete [][]byte
+		scanErr := bucket.ForEach(func(k, v []byte) error {
+			var record ToolApprovalRecord
+			if err := json.Unmarshal(v, &record); err != nil {
+				// Unparseable record: leave it alone rather than risk dropping data.
+				return nil
+			}
+			if !keep[record.ServerName] {
+				keysToDelete = append(keysToDelete, append([]byte(nil), k...))
+			}
+			return nil
+		})
+		if scanErr != nil {
+			return scanErr
+		}
+		for _, key := range keysToDelete {
+			if err := bucket.Delete(key); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	})
+	return removed, err
 }
 
 // Generic operations
@@ -602,4 +680,46 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	})
 
 	return records, err
+}
+
+// Onboarding wizard operations (Spec 046)
+
+// GetOnboardingState returns the current onboarding state.
+// If no state has been recorded, returns a zero-value OnboardingState
+// (i.e. Engaged=false) with nil error.
+func (b *BoltDB) GetOnboardingState() (*OnboardingState, error) {
+	state := &OnboardingState{}
+
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(OnboardingBucket))
+		if bucket == nil {
+			return nil
+		}
+
+		data := bucket.Get([]byte(OnboardingStateKey))
+		if data == nil {
+			return nil
+		}
+
+		return json.Unmarshal(data, state)
+	})
+
+	return state, err
+}
+
+// SaveOnboardingState persists the wizard state.
+func (b *BoltDB) SaveOnboardingState(state *OnboardingState) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(OnboardingBucket))
+		if bucket == nil {
+			return fmt.Errorf("onboarding bucket not found")
+		}
+
+		data, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+
+		return bucket.Put([]byte(OnboardingStateKey), data)
+	})
 }

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
 )
@@ -124,6 +126,117 @@ func TestListServers(t *testing.T) {
 		assert.Equal(t, 1, stats.QuarantinedServers)
 	})
 
+	// MCP-901: source registry provenance is projected onto contracts.Server so
+	// the approval/quarantine view (and the SSE servers.changed embed, which
+	// shares this projection) can show a server's origin.
+	t.Run("source registry provenance projected", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":                         "everything",
+				"name":                       "everything",
+				"enabled":                    true,
+				"source_registry_id":         "modelcontextprotocol",
+				"source_registry_provenance": "custom",
+			},
+			{
+				"id":      "manual",
+				"name":    "manual",
+				"enabled": true,
+			},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+		require.NoError(t, err)
+		require.Len(t, servers, 2)
+
+		byName := map[string]*contracts.Server{}
+		for _, s := range servers {
+			byName[s.Name] = s
+		}
+		require.Contains(t, byName, "everything")
+		assert.Equal(t, "modelcontextprotocol", byName["everything"].SourceRegistryID)
+		assert.Equal(t, "custom", byName["everything"].SourceRegistryProvenance)
+
+		require.Contains(t, byName, "manual")
+		assert.Empty(t, byName["manual"].SourceRegistryID)
+		assert.Empty(t, byName["manual"].SourceRegistryProvenance)
+	})
+
+	// MCP-2940: auto_approve_tool_changes must be projected onto contracts.Server
+	// so the Web UI toggle (MCP-2932) can reflect the persisted per-server value.
+	t.Run("auto_approve_tool_changes projected", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":                        "auto-on",
+				"name":                      "auto-on",
+				"enabled":                   true,
+				"auto_approve_tool_changes": true,
+			},
+			{
+				"id":                        "auto-off",
+				"name":                      "auto-off",
+				"enabled":                   true,
+				"auto_approve_tool_changes": false,
+			},
+			{
+				"id":      "unset",
+				"name":    "unset",
+				"enabled": true,
+			},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+		require.NoError(t, err)
+		require.Len(t, servers, 3)
+
+		byName := map[string]*contracts.Server{}
+		for _, s := range servers {
+			byName[s.Name] = s
+		}
+		require.Contains(t, byName, "auto-on")
+		require.NotNil(t, byName["auto-on"].AutoApproveToolChanges)
+		assert.True(t, *byName["auto-on"].AutoApproveToolChanges)
+
+		require.Contains(t, byName, "auto-off")
+		require.NotNil(t, byName["auto-off"].AutoApproveToolChanges)
+		assert.False(t, *byName["auto-off"].AutoApproveToolChanges)
+
+		require.Contains(t, byName, "unset")
+		assert.Nil(t, byName["unset"].AutoApproveToolChanges,
+			"a server that never set the flag must omit it (nil), not coerce to false")
+	})
+
+	// MCP-3322: init_timeout must project from the runtime serverMap (a duration
+	// string) onto contracts.Server so a configured override round-trips through
+	// GET /api/v1/servers and `mcpproxy upstream list -o json`.
+	t.Run("init_timeout projected", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{"id": "warmup", "name": "warmup", "enabled": true, "init_timeout": "2m0s"},
+			{"id": "unset", "name": "unset", "enabled": true},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+		require.NoError(t, err)
+		require.Len(t, servers, 2)
+
+		byName := map[string]*contracts.Server{}
+		for _, s := range servers {
+			byName[s.Name] = s
+		}
+		require.Contains(t, byName, "warmup")
+		require.NotNil(t, byName["warmup"].InitTimeout)
+		assert.Equal(t, 2*time.Minute, byName["warmup"].InitTimeout.Duration())
+
+		require.Contains(t, byName, "unset")
+		assert.Nil(t, byName["unset"].InitTimeout, "a server that never set init_timeout must omit it (nil)")
+	})
+
 	// T094: Test that TotalTools only counts enabled servers' tools (Issue #285 fix)
 	t.Run("TotalTools excludes disabled servers", func(t *testing.T) {
 		runtime := newMockRuntime()
@@ -230,6 +343,142 @@ func TestListServers(t *testing.T) {
 		assert.Equal(t, "https://oauth.example.com/authorize", server.OAuth.AuthURL)
 		assert.Equal(t, "https://oauth.example.com/token", server.OAuth.TokenURL)
 	})
+
+	// ListServers must populate SecurityScan via the wired enricher so that
+	// REST and the SSE servers.changed embed (which both call ListServers)
+	// share one enrichment site. Without parity, mergeServers on the Web UI
+	// strips security_scan from each store-side server on every SSE delivery.
+	t.Run("populates SecurityScan via enricher", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{"id": "alpha", "name": "alpha", "enabled": true, "connected": true},
+			{"id": "beta", "name": "beta", "enabled": true, "connected": true},
+		}
+
+		enricher := &fakeScanEnricher{
+			byServer: map[string]*contracts.SecurityScanSummary{
+				"alpha": {RiskScore: 42, Status: "warnings"},
+				// beta intentionally missing — must stay nil.
+			},
+		}
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		svc.SetScanSummaryEnricher(enricher)
+
+		servers, _, err := svc.ListServers(context.Background())
+		require.NoError(t, err)
+		require.Len(t, servers, 2)
+		require.NotNil(t, servers[0].SecurityScan, "alpha must carry its scan summary")
+		assert.Equal(t, "warnings", servers[0].SecurityScan.Status)
+		assert.Equal(t, 42, servers[0].SecurityScan.RiskScore)
+		assert.Nil(t, servers[1].SecurityScan, "beta must stay nil — enricher returned nil")
+		assert.Equal(t, []string{"alpha", "beta"}, enricher.calls, "enricher called once per server")
+	})
+
+	t.Run("nil enricher is a no-op", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{"id": "alpha", "name": "alpha", "enabled": true},
+		}
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		// SetScanSummaryEnricher not called — must still succeed.
+		servers, _, err := svc.ListServers(context.Background())
+		require.NoError(t, err)
+		require.Len(t, servers, 1)
+		assert.Nil(t, servers[0].SecurityScan)
+	})
+
+	// Verifies that headers and env extracted from the runtime map make it
+	// onto contracts.Server in both the typed (map[string]string, in-process
+	// StateView path) and generic (map[string]interface{}, JSON-round-trip
+	// path) shapes. Without this, the Web UI / macOS Edit Config screens see
+	// no headers and cannot round-trip configuration.
+	t.Run("headers and env (typed shape)", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":       "synapbus",
+				"name":     "synapbus",
+				"protocol": "streamable-http",
+				"enabled":  true,
+				"headers": map[string]string{
+					"Authorization": "Bearer abc123",
+					"X-Trace":       "on",
+				},
+				"env": map[string]string{
+					"LOG_LEVEL": "debug",
+				},
+			},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+
+		require.NoError(t, err)
+		require.Len(t, servers, 1)
+		s := servers[0]
+		assert.Equal(t, "Bearer abc123", s.Headers["Authorization"])
+		assert.Equal(t, "on", s.Headers["X-Trace"])
+		assert.Equal(t, "debug", s.Env["LOG_LEVEL"])
+	})
+
+	t.Run("headers and env (generic shape from JSON round-trip)", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":       "synapbus",
+				"name":     "synapbus",
+				"protocol": "streamable-http",
+				"enabled":  true,
+				"headers": map[string]interface{}{
+					"Authorization": "Bearer abc123",
+				},
+				"env": map[string]interface{}{
+					"LOG_LEVEL": "debug",
+				},
+			},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+
+		require.NoError(t, err)
+		require.Len(t, servers, 1)
+		s := servers[0]
+		assert.Equal(t, "Bearer abc123", s.Headers["Authorization"])
+		assert.Equal(t, "debug", s.Env["LOG_LEVEL"])
+	})
+
+	t.Run("missing headers and env stay nil", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":       "plain",
+				"name":     "plain",
+				"protocol": "stdio",
+				"enabled":  true,
+			},
+		}
+
+		svc := NewService(runtime, cfg, "", emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+
+		require.NoError(t, err)
+		require.Len(t, servers, 1)
+		assert.Nil(t, servers[0].Headers)
+		assert.Nil(t, servers[0].Env)
+	})
+}
+
+// fakeScanEnricher records which servers were asked about and returns a
+// canned summary per server (nil when the server isn't in byServer).
+type fakeScanEnricher struct {
+	byServer map[string]*contracts.SecurityScanSummary
+	calls    []string
+}
+
+func (f *fakeScanEnricher) GetSecurityScanSummary(_ context.Context, serverName string) *contracts.SecurityScanSummary {
+	f.calls = append(f.calls, serverName)
+	return f.byServer[serverName]
 }
 
 // T019: Unit test for EnableServer

@@ -352,6 +352,14 @@ mcpproxy upstream restart --all
 
 **Note:** Restart does not require confirmation as it's non-destructive.
 
+**Locally-launched HTTP/SSE upstreams:** when a server is configured with both
+`command` and an HTTP/SSE `url` (see [docs/configuration.md](configuration.md#locally-launched-http--sse-servers)),
+`restart` stops the spawned child (`SIGTERM` → grace → `SIGKILL`) before
+re-running Connect. The grace timeout is fixed at 5s today; the next start
+won't begin until the previous child is fully reaped, so you can rely on the
+port being free after the command returns. Stop ordering is: close MCP client
+→ stop launched child → release per-server state.
+
 ---
 
 ### `mcpproxy doctor`
@@ -367,6 +375,7 @@ mcpproxy doctor [flags]
 - `--output, -o` - Output format (pretty, json) [default: pretty]
 - `--log-level, -l` - Log level [default: warn]
 - `--config, -c` - Path to config file
+- `--server` - Limit health checks to a single upstream server by name (Spec 044)
 
 **Requirements:**
 - Daemon must be running
@@ -378,6 +387,9 @@ mcpproxy doctor
 
 # JSON output for scripting
 mcpproxy doctor --output=json
+
+# Only show issues for a single server
+mcpproxy doctor --server=github
 ```
 
 **Health Checks:**
@@ -391,6 +403,44 @@ mcpproxy doctor --output=json
 - Total issue count
 - Categorized issues with actionable remediation steps
 - Exit code 0 even if issues found (for scripting)
+
+---
+
+### `mcpproxy doctor fix <CODE>` (Spec 044)
+
+Run a registered diagnostics fixer for a specific (server, code) pair.
+By default the fix runs as a non-destructive dry_run; pass `--execute`
+to apply mutating changes.
+
+**Usage:**
+```bash
+mcpproxy doctor fix <CODE> --server <name> [--execute] [--fixer-key <key>] [flags]
+```
+
+**Flags:**
+- `--server` - Upstream server name (required)
+- `--fixer-key` - Override the auto-resolved fixer_key (rare; needed only
+  when a code defines multiple button-type fix steps)
+- `--execute` - Apply the fix (default behaviour is dry_run)
+- `--output, -o` - Output format (pretty, json) [default: pretty]
+
+**Requirements:**
+- Daemon must be running
+
+**Examples:**
+```bash
+# Dry-run an OAuth re-login for the github server
+mcpproxy doctor fix MCPX_OAUTH_REFRESH_EXPIRED --server github
+
+# Actually re-run the OAuth flow (destructive)
+mcpproxy doctor fix MCPX_OAUTH_REFRESH_EXPIRED --server github --execute
+
+# JSON output for scripting / CI
+mcpproxy doctor fix MCPX_STDIO_SPAWN_ENOENT --server my-stdio -o json
+```
+
+**Error code reference:** run `mcpproxy doctor list-codes` for the full
+catalog with associated fix steps and fixer keys.
 
 ---
 
@@ -525,6 +575,166 @@ Confirmation prompt shows count:
 ```
 
 Shows what will be affected before proceeding.
+
+---
+
+## Tool Management (`mcpproxy tools`)
+
+Global view and per-tool enable/disable across all configured servers.
+
+### `mcpproxy tools list`
+
+List tools from upstream servers. Without `--server`, lists every tool across
+all servers from the consolidated endpoint (requires daemon). With `--server`,
+lists tools from that specific server only (daemon or standalone).
+
+**Usage:**
+```bash
+mcpproxy tools list [flags]
+```
+
+**Flags:**
+- `--server, -s` - Server name (optional; omit for global list)
+- `--status` - Filter by state: `enabled`, `disabled`, `config-denied`
+- `--risk` - Filter by risk level: `read`, `write`, `destructive`
+- `--approval` - Filter by approval: `approved`, `pending`, `changed`
+- `--output, -o` - Output format: `table`, `json`, `yaml`
+- `--log-level, -l` - Log level [default: info]
+- `--config, -c` - Path to config file
+- `--timeout, -t` - Connection timeout [default: 30s]
+- `--trace-transport` - Enable HTTP/SSE frame-by-frame tracing
+
+**Examples:**
+```bash
+# Global list (all servers) — requires daemon
+mcpproxy tools list
+mcpproxy tools list -o json | jq '.[0]'
+
+# Filtered list
+mcpproxy tools list --status disabled
+mcpproxy tools list --risk read
+mcpproxy tools list --approval pending
+
+# Server-scoped debug listing (daemon or standalone)
+mcpproxy tools list --server=github-server
+mcpproxy tools list --server=github-server --log-level=trace
+```
+
+**Output Columns (global view):**
+- NAME, SERVER, STATE (enabled/disabled/config-denied), APPROVAL, USAGE, LAST USED, DESCRIPTION
+
+---
+
+### `mcpproxy tools enable <server:tool> [...]`
+
+Enable one or more tools. Requires daemon.
+
+**Usage:**
+```bash
+mcpproxy tools enable <server:tool> [<server:tool>...]
+```
+
+**Examples:**
+```bash
+mcpproxy tools enable github:create_issue
+mcpproxy tools enable github:create_issue github:list_repos memory:create_entities
+```
+
+**Behavior:**
+- Each `server:tool` is parsed by splitting on the first `:` (tool names may contain `:`)
+- All targets are attempted independently; invalid targets are reported without aborting others
+- Prints `OK <server:tool>: enabled` or `FAILED <server:tool>: <reason>` per target
+- Exits non-zero if any target failed (enabling partial failure detection in scripts)
+
+---
+
+### `mcpproxy tools disable <server:tool> [...]`
+
+Disable one or more tools. Requires daemon.
+
+**Usage:**
+```bash
+mcpproxy tools disable <server:tool> [<server:tool>...]
+```
+
+**Examples:**
+```bash
+mcpproxy tools disable github:create_issue
+mcpproxy tools disable everything:echo memory:foo
+echo "exit: $?"   # non-zero if any failed
+```
+
+**Behavior:**
+- Same per-target processing and exit-code semantics as `tools enable`
+- Config-denied tools fail individually (server rejects) without aborting other targets
+
+---
+
+### `mcpproxy tools approve [<server:tool>...]`
+
+Approve tools pending tool-level quarantine (Spec 032), clearing `pending` /
+`changed` tools for use without the Web UI or MCP. Requires daemon.
+
+**Usage:**
+```bash
+mcpproxy tools approve <server:tool> [<server:tool>...]
+mcpproxy tools approve --server <name> <tool> [<tool>...]
+mcpproxy tools approve --server <name> --all
+```
+
+**Flags:**
+- `-s, --server <name>` - Scope bare tool names to this server (required with `--all`)
+- `--all` - Approve every pending/changed tool for `--server`
+
+**Examples:**
+```bash
+mcpproxy tools approve github:create_issue
+mcpproxy tools approve github:create_issue github:list_repos
+mcpproxy tools approve --server github create_issue list_repos
+mcpproxy tools approve --server github --all
+mcpproxy tools approve --server github --all -o json
+```
+
+**Behavior:**
+- Targets are either `<server>:<tool>` pairs (the colon form wins) or bare tool
+  names scoped via `--server`; bare names without `--server` are rejected
+- Targets are grouped per server; each server group is processed independently
+- `--all` requires `--server` and cannot be combined with explicit targets
+- Prints `OK <server>: approved N tool(s)` per server group; exits non-zero if
+  any server group failed
+- `-o json|yaml` (or `MCPPROXY_OUTPUT`) emits a structured per-server result array
+
+---
+
+### `mcpproxy tools reject [<server:tool>...]`
+
+Reject (block) tools pending tool-level quarantine (Spec 032). Reject maps to
+the **block** action: the tool is atomically approved **and** disabled (hidden),
+so it is never left in the approved+enabled state — mirroring the Web UI "Block"
+button. Requires daemon.
+
+**Usage:**
+```bash
+mcpproxy tools reject <server:tool> [<server:tool>...]
+mcpproxy tools reject --server <name> <tool> [<tool>...]
+mcpproxy tools reject --server <name> --all
+```
+
+**Flags:**
+- `-s, --server <name>` - Scope bare tool names to this server (required with `--all`)
+- `--all` - Reject every pending/changed tool for `--server`
+
+**Examples:**
+```bash
+mcpproxy tools reject github:delete_repo
+mcpproxy tools reject --server github delete_repo force_push
+mcpproxy tools reject --server github --all
+```
+
+**Behavior:**
+- Same target parsing, per-server grouping, exit-code, and output-format
+  semantics as `tools approve`
+- Prints `OK <server>: blocked N tool(s)` per server group
 
 ---
 

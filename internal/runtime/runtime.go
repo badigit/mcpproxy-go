@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cache"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/experiments"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
@@ -29,8 +31,10 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/toolsig"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
@@ -68,18 +72,40 @@ type Runtime struct {
 	eventMu   sync.RWMutex
 	eventSubs map[chan Event]struct{}
 
-	storageManager    *storage.Manager
-	indexManager      *index.Manager
-	upstreamManager   *upstream.Manager
-	cacheManager      *cache.Manager
-	truncator         *truncate.Truncator
-	secretResolver    *secret.Resolver
-	tokenizer         tokens.Tokenizer
-	refreshManager    *oauth.RefreshManager // Proactive OAuth token refresh
-	updateChecker     *updatecheck.Checker  // Background version checking
-	telemetryService  *telemetry.Service    // Anonymous usage telemetry (Spec 036)
-	managementService interface{}           // Initialized later to avoid import cycle
-	activityService   *ActivityService      // Activity logging service
+	storageManager   *storage.Manager
+	indexManager     *index.Manager
+	upstreamManager  *upstream.Manager
+	cacheManager     *cache.Manager
+	truncator        *truncate.Truncator
+	sigCache         *toolsig.Cache // Spec 085 FR-008: single process-wide signature cache (indexing warms, MCP reads)
+	secretResolver   *secret.Resolver
+	tokenizer        tokens.Tokenizer
+	refreshManager   *oauth.RefreshManager // Proactive OAuth token refresh
+	updateChecker    *updatecheck.Checker  // Background version checking
+	telemetryService *telemetry.Service    // Anonymous usage telemetry (Spec 036)
+
+	// Spec 080 (US3): pre-churn snapshot. prechurnStore owns the BBolt
+	// shutdown marker + last_error_code record; previousShutdown is the
+	// outcome of the PREVIOUS process instance, derived exactly once in New
+	// when the marker is armed (FR-010/FR-011) and handed to the telemetry
+	// service in SetTelemetry.
+	prechurnStore     telemetry.PreChurnStore
+	previousShutdown  string
+	managementService interface{}      // Initialized later to avoid import cycle
+	activityService   *ActivityService // Activity logging service
+
+	// workSessions derives a unit of USER WORK from the churn of transport
+	// sessions underneath it (Spec 082).
+	workSessions *WorkSessionTracker
+
+	// Spec 047: coalesces servers.changed bursts and embeds the server list +
+	// stats payload so SSE subscribers can update without a follow-up
+	// GET /api/v1/servers.
+	coalescer *serversChangedCoalescer
+
+	// Spec 077 US4 (MCP-2207): debounces the per-scanner security-scan
+	// lifecycle storm into one settled event per server per scan.
+	scanNotify *scanNotifyDebouncer
 
 	// Phase 6: Supervisor for state reconciliation (lock-free reads via StateView)
 	supervisor *supervisor.Supervisor
@@ -88,14 +114,32 @@ type Runtime struct {
 	// Key: serverName, Value: struct{} (presence indicates discovery in progress)
 	discoveryInProgress sync.Map
 
-	// Schema v3 (telemetry): memoized Docker daemon availability. Probed
-	// once lazily on first IsDockerAvailable() call and reused for the
-	// process lifetime — running `docker info` on every heartbeat would be
-	// wasteful. A startup-captured value is good enough for daily-cadence
-	// telemetry; if the user installs/uninstalls Docker mid-session we'll
-	// report the value from startup until the next process restart.
-	dockerProbeOnce   sync.Once
+	// Last-good tool snapshots per server used to avoid transient tool loss during
+	// global discovery races/restarts.
+	lastGoodToolsMu sync.RWMutex
+	lastGoodTools   map[string][]*config.ToolMetadata
+
+	// Profiles v2 (Spec 057, T1): tracks the last-synced effective server set per
+	// profile so a config reload can rebuild only the profiles whose membership
+	// actually changed and drop profiles removed from config. Guards the
+	// per-profile Bleve index reconciliation (internal/runtime/profile_index.go).
+	profileIndexMu    sync.Mutex
+	profileMembership map[string][]string
+
+	// Schema v3 (telemetry): time-cached Docker daemon availability. The
+	// probe has a 2s `docker info` cost, so we don't want to run it on every
+	// heartbeat — but we also can't memoize it for the whole process lifetime:
+	// users often install or launch Docker Desktop after mcpproxy starts, and
+	// we want the next heartbeat to pick up the change. Cache semantics:
+	//   - Fresh positive result reused for up to 15 minutes.
+	//   - Fresh negative result reused for only 5 minutes so a late Docker
+	//     launch flips `server_docker_available_bool` promptly.
+	// A transition between states is logged at info level; steady-state
+	// probes stay silent to keep logs clean.
+	dockerProbeMu     sync.Mutex
 	dockerProbeResult bool
+	dockerProbedAt    time.Time
+	dockerProbeKnown  bool
 
 	appCtx    context.Context
 	appCancel context.CancelFunc
@@ -110,6 +154,23 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 	storageManager, err := storage.NewManager(cfg.DataDir, logger.Sugar())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage manager: %w", err)
+	}
+
+	// Spec 080 (US3, FR-010): derive the previous instance's shutdown outcome
+	// and immediately re-arm the marker. This is the FIRST DB operation after
+	// storage.NewManager succeeds — before stale-session cleanup or any other
+	// DB work — so a crash/hang anywhere later in startup still reads as a
+	// crash next time (crash loops stay visible). Single-writer safety is the
+	// BBolt file lock itself: a second instance fails storage.NewManager with
+	// DatabaseLockedError (exit code 3) and never reaches this code (FR-013).
+	prechurnStore := telemetry.NewPreChurnStore()
+	previousShutdown := telemetry.PreviousShutdownUnknown
+	if db := storageManager.GetDB(); db != nil {
+		if prev, err := prechurnStore.ArmShutdownMarker(db); err != nil {
+			logger.Warn("Failed to arm shutdown marker; previous_shutdown will be omitted", zap.Error(err))
+		} else {
+			previousShutdown = prev
+		}
 	}
 
 	// Close any stale sessions from previous runs
@@ -187,14 +248,23 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 			zap.Bool("scan_responses", cfg.SensitiveDataDetection.ScanResponses))
 	}
 
+	// Wire observability usage persistence cadence from config (Spec 069 A2).
+	if cfg.Observability != nil && cfg.Observability.UsagePersistInterval.Duration() > 0 {
+		activityService.SetUsagePersistInterval(cfg.Observability.UsagePersistInterval.Duration())
+	}
+
 	// Wire activity retention config from config file
-	if cfg.ActivityRetentionDays > 0 || cfg.ActivityMaxRecords > 0 || cfg.ActivityCleanupIntervalMin > 0 {
+	if cfg.ActivityRetentionDays > 0 || cfg.ActivityMaxRecords > 0 || cfg.ActivityCleanupIntervalMin > 0 || cfg.ActivityMaxSizeMB >= 0 {
 		maxAge := time.Duration(cfg.ActivityRetentionDays) * 24 * time.Hour
 		checkInterval := time.Duration(cfg.ActivityCleanupIntervalMin) * time.Minute
-		activityService.SetRetentionConfig(maxAge, cfg.ActivityMaxRecords, checkInterval)
+		// ActivityMaxSizeMB: 0 disables the size cap, so pass the explicit byte
+		// value (>= 0 is applied; -1 would mean "unchanged").
+		maxSizeBytes := int64(cfg.ActivityMaxSizeMB) * 1024 * 1024
+		activityService.SetRetentionConfig(maxAge, cfg.ActivityMaxRecords, checkInterval, maxSizeBytes)
 		logger.Info("Activity retention config applied",
 			zap.Int("retention_days", cfg.ActivityRetentionDays),
 			zap.Int("max_records", cfg.ActivityMaxRecords),
+			zap.Int("max_size_mb", cfg.ActivityMaxSizeMB),
 			zap.Int("cleanup_interval_min", cfg.ActivityCleanupIntervalMin))
 	}
 
@@ -214,31 +284,46 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 	}
 
 	rt := &Runtime{
-		cfg:             cfg,
-		cfgPath:         cfgPath,
-		logger:          logger,
-		configSvc:       configSvc,
-		storageManager:  storageManager,
-		indexManager:    indexManager,
-		upstreamManager: upstreamManager,
-		cacheManager:    cacheManager,
-		truncator:       truncator,
-		secretResolver:  secretResolver,
-		tokenizer:       tokenizer,
-		refreshManager:  refreshManager,
-		activityService: activityService,
-		supervisor:      supervisorInstance,
-		appCtx:          appCtx,
-		appCancel:       appCancel,
+		cfg:              cfg,
+		cfgPath:          cfgPath,
+		logger:           logger,
+		configSvc:        configSvc,
+		storageManager:   storageManager,
+		indexManager:     indexManager,
+		upstreamManager:  upstreamManager,
+		cacheManager:     cacheManager,
+		truncator:        truncator,
+		sigCache:         toolsig.NewCache(),
+		secretResolver:   secretResolver,
+		tokenizer:        tokenizer,
+		refreshManager:   refreshManager,
+		activityService:  activityService,
+		supervisor:       supervisorInstance,
+		prechurnStore:    prechurnStore,
+		previousShutdown: previousShutdown,
+		appCtx:           appCtx,
+		appCancel:        appCancel,
 		status: Status{
 			Phase:       PhaseInitializing,
 			Message:     "Runtime is initializing...",
 			LastUpdated: time.Now(),
 		},
-		statusCh:     make(chan Status, 10),
-		eventSubs:    make(map[chan Event]struct{}),
-		phaseMachine: newPhaseMachine(PhaseInitializing),
+		statusCh:          make(chan Status, 10),
+		eventSubs:         make(map[chan Event]struct{}),
+		phaseMachine:      newPhaseMachine(PhaseInitializing),
+		lastGoodTools:     make(map[string][]*config.ToolMetadata),
+		profileMembership: make(map[string][]string),
 	}
+
+	// Spec 047: drainer goroutine that publishes coalesced servers.changed
+	// events. Lifetime is tied to appCtx so it shuts down with the runtime.
+	rt.coalescer = newServersChangedCoalescer(rt, 50*time.Millisecond)
+	rt.coalescer.start(appCtx)
+
+	// Spec 077 US4 (MCP-2207): collapse the per-scanner scan-notification storm
+	// into one settled event per server. 750ms bridges the rapid lifecycle
+	// signals of a reconnect storm without noticeably delaying the result.
+	rt.scanNotify = newScanNotifyDebouncer(rt, 750*time.Millisecond)
 
 	return rt, nil
 }
@@ -501,6 +586,14 @@ func (r *Runtime) Truncator() *truncate.Truncator {
 	return r.truncator
 }
 
+// SignatureCache exposes the process-wide compact-signature cache (Spec 085
+// FR-008). Exactly one instance exists: the indexing path warms it and the
+// MCP request path (via NewMCPProxyServer) reads it. Never construct a second
+// cache — warming a cache the request path does not hold is a silent no-op.
+func (r *Runtime) SignatureCache() *toolsig.Cache {
+	return r.sigCache
+}
+
 // ActivityService exposes the activity service for testing.
 func (r *Runtime) ActivityService() *ActivityService {
 	return r.activityService
@@ -555,55 +648,13 @@ func (r *Runtime) Close() error {
 			}
 		}
 
-		// Verify all containers stopped with retry loop (15 attempts = 15 seconds)
-		if r.upstreamManager.HasDockerContainers() {
-			if r.logger != nil {
-				r.logger.Warn("Docker containers still running after shutdown, verifying cleanup...")
-			}
-
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
-
-			for attempt := 0; attempt < 15; attempt++ {
-				select {
-				case <-shutdownCtx.Done():
-					if r.logger != nil {
-						r.logger.Error("Cleanup verification timeout")
-					}
-					// Force cleanup as last resort
-					r.upstreamManager.ForceCleanupAllContainers()
-					return nil
-				case <-ticker.C:
-					if !r.upstreamManager.HasDockerContainers() {
-						if r.logger != nil {
-							r.logger.Info("All containers cleaned up successfully", zap.Int("attempts", attempt+1))
-						}
-						return nil
-					}
-					if r.logger != nil {
-						r.logger.Debug("Waiting for container cleanup...", zap.Int("attempt", attempt+1))
-					}
-				}
-			}
-
-			// Timeout reached - force cleanup
-			if r.logger != nil {
-				r.logger.Error("Some containers failed to stop gracefully - forcing cleanup")
-			}
-			r.upstreamManager.ForceCleanupAllContainers()
-
-			// Give force cleanup a moment to complete
-			time.Sleep(2 * time.Second)
-
-			if r.upstreamManager.HasDockerContainers() {
-				if r.logger != nil {
-					r.logger.Error("WARNING: Some containers may still be running after force cleanup")
-				}
-			} else {
-				if r.logger != nil {
-					r.logger.Info("Force cleanup succeeded - all containers removed")
-				}
-			}
+		// Verify all containers stopped with retry loop (15 attempts = 15 seconds).
+		// Only when Docker isolation could have launched containers — otherwise
+		// the `docker ps` probe + this loop are pure waste (and add ~17s per
+		// Close in test processes, which made internal/runtime exceed CI's
+		// -race timeout). No isolation ⇒ no managed containers ⇒ nothing to verify.
+		if r.upstreamManager.UsesDockerIsolation() && r.upstreamManager.HasDockerContainers() {
+			r.verifyContainerCleanup(shutdownCtx)
 		}
 	}
 
@@ -617,7 +668,69 @@ func (r *Runtime) Close() error {
 		}
 	}
 
+	// Spec 080 (FR-010, review round 4): the ActivityService owns BBolt
+	// writers — activity records, retention pruning, usage-snapshot flushes,
+	// async sensitive-data detection. The appCancel at the top of Close
+	// triggered its flush-on-shutdown; await that flush AND all its worker
+	// goroutines here, BEFORE the async-op drain and the shutdown-marker
+	// resolve below, so no activity write can land after the marker claims
+	// the shutdown was clean (or after the DB closes). This writer-vs-close
+	// race pre-dates Spec 080 (Stop existed but was never called); the marker
+	// invariant makes it observable, so it is closed here. Stop returns
+	// immediately when Start never ran and is itself idempotent.
+	if r.activityService != nil {
+		r.activityService.Stop()
+	}
+
+	// Spec 080 (FR-010, review round 6): the telemetry heartbeat loop is a
+	// BBolt writer too — v7's buildHeartbeat records funnel activity
+	// (funnelStore.RecordActivity) and the first tick clears the
+	// installer-pending activation flag. The appCancel above stops the loop
+	// between ticks and aborts an in-flight HTTP send promptly (the request
+	// carries the loop context), but an in-flight tick must be JOINED, not
+	// just cancelled — otherwise its BBolt write could land after the marker
+	// below claims "clean", or against a closed DB. Stop blocks until the
+	// loop (including any in-flight buildHeartbeat/sendHeartbeat, bounded by
+	// the HTTP client's 10s timeout) has exited; it returns immediately when
+	// Start never ran, is idempotent on double Close, and — like
+	// ActivityService.Stop above — terminally stops the service so a Start
+	// goroutine not yet scheduled (lifecycle.go launches it via `go`) becomes
+	// a no-op instead of writing after this point.
+	if r.telemetryService != nil {
+		r.telemetryService.Stop()
+	}
+
+	// Spec 080 (US3, FR-010): resolve the shutdown marker to "clean" at the
+	// LAST point the DB is still open — i.e. after the async storage manager
+	// has stopped AND drained its queue (those queued operations perform BBolt
+	// writes; StopAsync below runs that drain), immediately before the BBolt
+	// handle closes. Every branch above — including the container-cleanup
+	// verification, whose early exits live inside verifyContainerCleanup —
+	// reaches this point, so a graceful Close always resolves; conversely a
+	// hang/SIGKILL/panic ANYWHERE earlier in shutdown — including mid-drain —
+	// leaves the marker armed and the next instance honestly reports
+	// previous_shutdown="crash". Idempotent on double Close (StopAsync no-ops,
+	// and storageManager.Close's internal async stop no-ops after StopAsync);
+	// on an already-closed DB the marker write fails harmlessly (logged at
+	// debug) and the marker is left untouched.
 	if r.storageManager != nil {
+		// (1) Stop + drain queued async DB operations — the last DB writes
+		// other than the marker resolve itself.
+		r.storageManager.StopAsync()
+
+		// (2) Resolve the marker to clean, now that no other DB work remains.
+		if r.prechurnStore != nil {
+			if db := r.storageManager.GetDB(); db != nil {
+				if err := r.prechurnStore.ResolveCleanShutdown(db); err != nil {
+					if r.logger != nil {
+						r.logger.Debug("Failed to resolve shutdown marker to clean", zap.Error(err))
+					}
+				}
+			}
+		}
+
+		// (3) Close the BBolt handle; the async stop inside Close is a no-op,
+		// so no DB work intervenes between the marker resolve and db.Close.
 		if err := r.storageManager.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close storage manager: %w", err))
 		}
@@ -632,6 +745,62 @@ func (r *Runtime) Close() error {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// verifyContainerCleanup polls until all Docker-isolation containers are gone,
+// force-cleaning as a last resort on timeout. Extracted from Close so that its
+// early exits (context timeout, all-clean) return HERE instead of returning
+// from Close — every Close path must still reach the shutdown-marker resolve
+// and the cache/index/storage/configSvc close sequence (Spec 080 FR-010;
+// previously these branches leaked all four and skipped the marker).
+func (r *Runtime) verifyContainerCleanup(ctx context.Context) {
+	if r.logger != nil {
+		r.logger.Warn("Docker containers still running after shutdown, verifying cleanup...")
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for attempt := 0; attempt < 15; attempt++ {
+		select {
+		case <-ctx.Done():
+			if r.logger != nil {
+				r.logger.Error("Cleanup verification timeout")
+			}
+			// Force cleanup as last resort
+			r.upstreamManager.ForceCleanupAllContainers()
+			return
+		case <-ticker.C:
+			if !r.upstreamManager.HasDockerContainers() {
+				if r.logger != nil {
+					r.logger.Info("All containers cleaned up successfully", zap.Int("attempts", attempt+1))
+				}
+				return
+			}
+			if r.logger != nil {
+				r.logger.Debug("Waiting for container cleanup...", zap.Int("attempt", attempt+1))
+			}
+		}
+	}
+
+	// Timeout reached - force cleanup
+	if r.logger != nil {
+		r.logger.Error("Some containers failed to stop gracefully - forcing cleanup")
+	}
+	r.upstreamManager.ForceCleanupAllContainers()
+
+	// Give force cleanup a moment to complete
+	time.Sleep(2 * time.Second)
+
+	if r.upstreamManager.HasDockerContainers() {
+		if r.logger != nil {
+			r.logger.Error("WARNING: Some containers may still be running after force cleanup")
+		}
+	} else {
+		if r.logger != nil {
+			r.logger.Info("Force cleanup succeeded - all containers removed")
+		}
+	}
 }
 
 func extractToolCount(stats map[string]interface{}) int {
@@ -1100,8 +1269,19 @@ func (r *Runtime) GetRecentSessions(limit int) ([]*contracts.MCPSession, int, er
 			HasRoots:      rec.HasRoots,
 			HasSampling:   rec.HasSampling,
 			Experimental:  rec.Experimental,
+			WorkspaceName: rec.WorkspaceName,
+			WorkSessionID: rec.WorkSessionID,
 		})
 	}
+
+	// Stable order for UI consumers: most-recently-active first, break ties
+	// by session ID so the list doesn't reshuffle on identical timestamps.
+	sort.SliceStable(sessions, func(i, j int) bool {
+		if !sessions[i].LastActivity.Equal(sessions[j].LastActivity) {
+			return sessions[i].LastActivity.After(sessions[j].LastActivity)
+		}
+		return sessions[i].ID < sessions[j].ID
+	})
 
 	return sessions, total, nil
 }
@@ -1129,6 +1309,8 @@ func (r *Runtime) GetSessionByID(sessionID string) (*contracts.MCPSession, error
 		HasRoots:      rec.HasRoots,
 		HasSampling:   rec.HasSampling,
 		Experimental:  rec.Experimental,
+		WorkspaceName: rec.WorkspaceName,
+		WorkSessionID: rec.WorkSessionID,
 	}, nil
 }
 
@@ -1160,6 +1342,14 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 			Success: false,
 		}, fmt.Errorf("configuration validation failed: %v", validationErrors[0].Error())
 	}
+
+	// Normalize the submitted config the same way LoadFromFile does before we
+	// diff/save it (Spec 077 US3): fold the deprecated security.scanner_* keys
+	// into security.deep_scan. The /api/v1/config/apply path bypasses
+	// LoadFromFile, so without this an API apply carrying the deprecated keys
+	// would re-serialize them instead of the unified deep_scan surface (SC-007).
+	// Idempotent + nil-safe.
+	config.MigrateDeepScanConfig(newCfg)
 
 	// Detect changes and determine if restart is required
 	result := DetectConfigChanges(r.cfg, newCfg)
@@ -1204,6 +1394,15 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 		r.cfgPath = cfgPath
 	}
 
+	// Propagate the new global config to the upstream manager and every running
+	// managed client so their background health-check loops re-resolve the new
+	// global health_check_interval (and Docker/discovery decisions) without a
+	// restart (spec 074, FR-012/SC-002). The loops re-read the interval each
+	// cycle, so this atomic swap is all that's needed.
+	if r.upstreamManager != nil {
+		r.upstreamManager.SetGlobalConfig(newCfg)
+	}
+
 	// Apply configuration changes to components
 	r.logger.Info("Applying configuration hot-reload",
 		zap.Strings("changed_fields", result.ChangedFields))
@@ -1224,6 +1423,23 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 		r.truncator = truncate.NewTruncator(newCfg.ToolResponseLimit)
 	}
 
+	// Apply observability usage cadence (Spec 069 A2 — hot-reloadable). The
+	// usage flush loop re-reads the interval each cycle, so the setter suffices.
+	if contains(result.ChangedFields, "observability") && r.activityService != nil &&
+		newCfg.Observability != nil && newCfg.Observability.UsagePersistInterval.Duration() > 0 {
+		r.logger.Info("Observability usage persist interval changed",
+			zap.Duration("new_interval", newCfg.Observability.UsagePersistInterval.Duration()))
+		r.activityService.SetUsagePersistInterval(newCfg.Observability.UsagePersistInterval.Duration())
+	}
+
+	// Apply update-check settings (Spec 079 FR-012 — hot-reloadable). The
+	// checker gates its poll + CheckNow on the flag internally; a
+	// disabled→enabled flip (or channel switch) triggers a prompt background
+	// re-check. Safe while holding r.mu: SetConfig only touches checker state.
+	if contains(result.ChangedFields, "update_check") {
+		r.applyUpdateCheckConfig(newCfg)
+	}
+
 	// Capture app context, config path, and config copy while we still hold the lock
 	appCtx := r.appCtx
 	cfgPathCopy := r.cfgPath
@@ -1238,6 +1454,14 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 	// IMPORTANT: Unlock before emitting events to prevent deadlocks
 	// Event handlers may need to acquire locks on other resources
 	r.mu.Unlock()
+
+	// MCP-2482: drive the one-time telemetry opt-out beacon on an
+	// enabled->disabled flip. NotifyConfigChanged is fire-and-forget and
+	// nil-safe, so this never blocks the apply path. Covers web UI + macOS app,
+	// which both reach this via the REST /config apply pipeline.
+	if r.telemetryService != nil {
+		r.telemetryService.NotifyConfigChanged(newCfg)
+	}
 
 	// Update configSvc to notify subscribers (like supervisor)
 	// This must happen BEFORE LoadConfiguredServers to ensure supervisor reconciles
@@ -1400,33 +1624,27 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// ListRegistries returns the list of available MCP server registries (Phase 7)
+// ListRegistries returns the list of available MCP server registries (Phase 7).
+//
+// It routes through the SAME merged source (built-in defaults + user-configured
+// registries, keyed by ID) that search/add use via SetRegistriesFromConfig, so
+// `mcpproxy registry list` / the Web UI never omit a built-in that is still
+// searchable/addable and never show the legacy hard-coded Smithery entry instead
+// of the shipped defaults (FR-006 / MCP-800 finding 2).
 func (r *Runtime) ListRegistries() ([]interface{}, error) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	cfg := r.cfg
+	r.mu.RUnlock()
 
-	// Import registries package dynamically to avoid import cycles
-	// For now, we'll return registries from config or use defaults
-	registries := r.cfg.Registries
-	if len(registries) == 0 {
-		// Return default registry (Smithery)
-		defaultRegistry := map[string]interface{}{
-			"id":          "smithery",
-			"name":        "Smithery MCP Registry",
-			"description": "The official community registry for Model Context Protocol (MCP) servers.",
-			"url":         "https://smithery.ai/protocols",
-			"servers_url": "https://smithery.ai/api/smithery-protocol-registry",
-			"tags":        []string{"official", "community"},
-			"protocol":    "modelcontextprotocol/registry",
-			"count":       -1,
-		}
-		return []interface{}{defaultRegistry}, nil
-	}
+	// Rebuild the effective catalog (defaults merged with custom) — same call the
+	// search/add paths make — then read it back.
+	registries.SetRegistriesFromConfig(cfg)
+	merged := registries.ListRegistries()
 
-	// Convert config registries to interface slice
-	result := make([]interface{}, 0, len(registries))
-	for _, reg := range registries {
-		regMap := map[string]interface{}{
+	result := make([]interface{}, 0, len(merged))
+	for i := range merged {
+		reg := &merged[i]
+		result = append(result, map[string]interface{}{
 			"id":          reg.ID,
 			"name":        reg.Name,
 			"description": reg.Description,
@@ -1435,15 +1653,37 @@ func (r *Runtime) ListRegistries() ([]interface{}, error) {
 			"tags":        reg.Tags,
 			"protocol":    reg.Protocol,
 			"count":       reg.Count,
-		}
-		result = append(result, regMap)
+			// MCP-866: provenance/trust so every surface can flag third-party
+			// sources. "trusted" is the convenience boolean the UI reads to decide
+			// whether to show the one-time third-party-registry warning.
+			"provenance": reg.Provenance,
+			"trusted":    reg.IsTrusted(),
+		})
 	}
 
 	return result, nil
 }
 
-// SearchRegistryServers searches for servers in a specific registry (Phase 7)
-func (r *Runtime) SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, error) {
+// registryServersCachePrefix is the stable cache-key prefix for a registry's
+// cached server lists. A single RefreshRegistryCache drops every tag/query/limit
+// variant under it (FR-007).
+func registryServersCachePrefix(registryID string) string {
+	return fmt.Sprintf("registry-servers:%s:", registryID)
+}
+
+// registryServersCacheKey keys a specific (registry, tag, query, limit) search.
+func registryServersCacheKey(registryID, tag, query string, limit int) string {
+	return fmt.Sprintf("%s%s:%s:%d", registryServersCachePrefix(registryID), tag, query, limit)
+}
+
+// SearchRegistryServers searches for servers in a specific registry (Phase 7).
+// Results are cached per (registry, tag, query, limit) via the cache manager;
+// a cached list is served while flagging its freshness (FR-007), and the
+// returned *contracts.RegistryCacheInfo carries the age/stale indicator. A
+// registry that requires an unconfigured API key surfaces as a wrapped
+// registries.ErrRegistryKeyMissing so the caller can mark it unavailable
+// without failing the overall search (FR-008).
+func (r *Runtime) SearchRegistryServers(registryID, tag, query string, limit int) ([]interface{}, *contracts.RegistryCacheInfo, error) {
 	r.mu.RLock()
 	cfg := r.cfg
 	r.mu.RUnlock()
@@ -1457,16 +1697,39 @@ func (r *Runtime) SearchRegistryServers(registryID, tag, query string, limit int
 	// Initialize registries from config
 	registries.SetRegistriesFromConfig(cfg)
 
+	cacheKey := registryServersCacheKey(registryID, tag, query, limit)
+
+	// Serve a cached server list when present, flagging its age/freshness.
+	if r.cacheManager != nil {
+		if rec, ok := r.cacheManager.Peek(cacheKey); ok {
+			var cached []interface{}
+			if err := json.Unmarshal([]byte(rec.FullContent), &cached); err == nil {
+				info := &contracts.RegistryCacheInfo{
+					AgeSeconds: time.Since(rec.CreatedAt).Seconds(),
+					Stale:      rec.IsExpired(),
+				}
+				r.logger.Debug("Registry search served from cache",
+					zap.String("registry_id", registryID),
+					zap.Float64("age_seconds", info.AgeSeconds),
+					zap.Bool("stale", info.Stale))
+				return cached, info, nil
+			}
+		}
+	}
+
 	// Create a guesser for repository detection (with caching)
 	guesser := experiments.NewGuesser(r.cacheManager, r.logger)
 
-	// Search the registry
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Search the registry. 30s was too tight: a single slow page in the official
+	// registry's multi-page cursor walk exhausted it with no retry headroom. 60s
+	// absorbs several slow/retried pages (registries.registryGet) without letting
+	// a wedged registry hang the request indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	servers, err := registries.SearchServers(ctx, registryID, tag, query, limit, guesser)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search registry: %w", err)
+		return nil, nil, fmt.Errorf("failed to search registry: %w", err)
 	}
 
 	// Convert to interface slice
@@ -1500,11 +1763,39 @@ func (r *Runtime) SearchRegistryServers(registryID, tag, query string, limit int
 		result[i] = serverMap
 	}
 
+	// Cache the freshly fetched list so subsequent searches surface its age.
+	var cacheInfo *contracts.RegistryCacheInfo
+	if r.cacheManager != nil {
+		if data, mErr := json.Marshal(result); mErr == nil {
+			if sErr := r.cacheManager.Store(cacheKey, "registry-servers", nil, string(data), "", len(result)); sErr != nil {
+				r.logger.Warn("Failed to cache registry search", zap.Error(sErr))
+			}
+		}
+		cacheInfo = &contracts.RegistryCacheInfo{AgeSeconds: 0, Stale: false}
+	}
+
 	r.logger.Info("Registry search completed",
 		zap.String("registry_id", registryID),
 		zap.Int("results", len(result)))
 
-	return result, nil
+	return result, cacheInfo, nil
+}
+
+// RefreshRegistryCache invalidates all cached server lists for a registry,
+// forcing the next search to re-fetch from the source (FR-007). Returns the
+// number of cache entries dropped.
+func (r *Runtime) RefreshRegistryCache(registryID string) (int, error) {
+	if r.cacheManager == nil {
+		return 0, nil
+	}
+	cleared, err := r.cacheManager.InvalidatePrefix(registryServersCachePrefix(registryID))
+	if err != nil {
+		return 0, fmt.Errorf("failed to refresh registry cache: %w", err)
+	}
+	r.logger.Info("Registry cache refreshed",
+		zap.String("registry_id", registryID),
+		zap.Int("cleared", cleared))
+	return cleared, nil
 }
 
 // GetDockerRecoveryStatus returns the current Docker recovery status from the upstream manager
@@ -1725,9 +2016,104 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			"authenticated":   authenticated,
 		}
 
+		// Expose config fields the UI needs for edit mode (args, working
+		// dir, isolation overrides, headers, env). These used to be
+		// dropped on the floor here, so the tray/webui could not
+		// round-trip stdio server configuration or display the auth
+		// headers attached to HTTP servers.
+		if serverStatus.Config != nil {
+			if len(serverStatus.Config.Args) > 0 {
+				serverMap["args"] = serverStatus.Config.Args
+			}
+			if serverStatus.Config.WorkingDir != "" {
+				serverMap["working_dir"] = serverStatus.Config.WorkingDir
+			}
+			if len(serverStatus.Config.Headers) > 0 {
+				// Headers are redacted at the httpapi/MCP serialization
+				// boundary (see Server.redactServerHeaders) — emit the
+				// raw values here so reveal-secret-headers users still
+				// see plaintext.
+				serverMap["headers"] = serverStatus.Config.Headers
+			}
+			if len(serverStatus.Config.Env) > 0 {
+				serverMap["env"] = serverStatus.Config.Env
+			}
+			if iso := serverStatus.Config.Isolation; iso != nil {
+				isoMap := map[string]interface{}{
+					"enabled": iso.IsEnabled(),
+				}
+				if iso.Image != "" {
+					isoMap["image"] = iso.Image
+				}
+				if iso.NetworkMode != "" {
+					isoMap["network_mode"] = iso.NetworkMode
+				}
+				if len(iso.ExtraArgs) > 0 {
+					isoMap["extra_args"] = iso.ExtraArgs
+				}
+				if iso.WorkingDir != "" {
+					isoMap["working_dir"] = iso.WorkingDir
+				}
+				serverMap["isolation"] = isoMap
+			}
+		}
+
 		// Add reconnect_on_use from config
 		if serverStatus.Config != nil && serverStatus.Config.ReconnectOnUse {
 			serverMap["reconnect_on_use"] = true
+		}
+
+		// MCP-2940: surface the per-server auto-approve intent so the REST GET
+		// payload (and SSE servers.changed embed) can drive the Web UI toggle.
+		// Tri-state *bool — only emit the key when set so the projection stays
+		// nil for servers that never configured it.
+		if serverStatus.Config != nil && serverStatus.Config.AutoApproveToolChanges != nil {
+			serverMap["auto_approve_tool_changes"] = *serverStatus.Config.AutoApproveToolChanges
+		}
+
+		// MCP-3322: surface the per-server init_timeout override so the REST GET
+		// payload (and SSE servers.changed embed) can read it back. Emitted as a
+		// duration string (e.g. "2m0s"); omitted when unset so the projection
+		// stays nil for servers that inherit the global default.
+		if serverStatus.Config != nil && serverStatus.Config.InitTimeout != nil {
+			serverMap["init_timeout"] = serverStatus.Config.InitTimeout.Duration().String()
+		}
+
+		// MCP-901: carry registry provenance through to the REST/SSE projection
+		// so the approval/quarantine view can show a server's origin. Empty for
+		// manually-configured servers.
+		if serverStatus.Config != nil {
+			if serverStatus.Config.SourceRegistryID != "" {
+				serverMap["source_registry_id"] = serverStatus.Config.SourceRegistryID
+			}
+			if serverStatus.Config.SourceRegistryProvenance != "" {
+				serverMap["source_registry_provenance"] = serverStatus.Config.SourceRegistryProvenance
+			}
+		}
+
+		// Spec 044: include structured diagnostic error when available.
+		if serverStatus.Diagnostic != nil {
+			d := serverStatus.Diagnostic
+			diagMap := map[string]interface{}{
+				"code":        d.Code,
+				"severity":    d.Severity,
+				"cause":       d.Cause,
+				"detected_at": d.DetectedAt,
+			}
+			if entry, ok := diagnostics.Get(d.Code); ok {
+				// MCP-2909: prefer the runtime-aware remediation when present so
+				// the user sees the detected runtime + recommended image instead
+				// of the generic catalog message.
+				if d.Remediation != "" {
+					diagMap["user_message"] = d.Remediation
+				} else {
+					diagMap["user_message"] = entry.UserMessage
+				}
+				diagMap["fix_steps"] = entry.FixSteps
+				diagMap["docs_url"] = entry.DocsURL
+			}
+			serverMap["diagnostic"] = diagMap
+			serverMap["error_code"] = string(d.Code)
 		}
 
 		// Add OAuth status fields if available
@@ -1741,9 +2127,14 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		// Add user_logged_out flag from managed client
 		// This indicates if the user explicitly logged out, which prevents auto-reconnection
 		var userLoggedOut bool
+		// MCP-2084: call-time OAuth requirement — set when an anonymously-connected
+		// server rejected a tools/call with "authorization required". Drives a
+		// proactive Sign-in CTA even though the server looks connected.
+		var callTimeOAuthRequired bool
 		if r.upstreamManager != nil {
 			if client, exists := r.upstreamManager.GetClient(serverStatus.Name); exists && client != nil {
 				userLoggedOut = client.IsUserLoggedOut()
+				callTimeOAuthRequired = client.IsOAuthCallRequired()
 			}
 		}
 		serverMap["user_logged_out"] = userLoggedOut
@@ -1755,19 +2146,20 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		}
 
 		healthInput := health.HealthCalculatorInput{
-			Name:            serverStatus.Name,
-			Enabled:         serverStatus.Enabled,
-			Quarantined:     serverStatus.Quarantined,
-			State:           serverStatus.State,
-			Connected:       connected,
-			LastError:       serverStatus.LastError,
-			OAuthRequired:   oauthConfig != nil,
-			OAuthStatus:     oauthStatus,
-			HasRefreshToken: hasRefreshToken,
-			UserLoggedOut:   userLoggedOut,
-			ToolCount:       serverStatus.ToolCount,
-			MissingSecret:   health.ExtractMissingSecret(serverStatus.LastError),
-			OAuthConfigErr:  health.ExtractOAuthConfigError(serverStatus.LastError),
+			Name:                  serverStatus.Name,
+			Enabled:               serverStatus.Enabled,
+			Quarantined:           serverStatus.Quarantined,
+			State:                 serverStatus.State,
+			Connected:             connected,
+			LastError:             serverStatus.LastError,
+			OAuthRequired:         oauthConfig != nil,
+			OAuthStatus:           oauthStatus,
+			HasRefreshToken:       hasRefreshToken,
+			UserLoggedOut:         userLoggedOut,
+			CallTimeOAuthRequired: callTimeOAuthRequired,
+			ToolCount:             serverStatus.ToolCount,
+			MissingSecret:         health.ExtractMissingSecret(serverStatus.LastError),
+			OAuthConfigErr:        health.ExtractOAuthConfigError(serverStatus.LastError),
 		}
 		if !tokenExpiresAt.IsZero() {
 			healthInput.TokenExpiresAt = &tokenExpiresAt
@@ -1796,6 +2188,16 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 
 		result = append(result, serverMap)
 	}
+
+	// Stable alphabetical order by name — StateView is backed by a map, so
+	// iteration order is non-deterministic. UI consumers (tray, web) expect
+	// a stable list so the "Servers Needing Attention" and similar filtered
+	// views don't shuffle between polls.
+	sort.SliceStable(result, func(i, j int) bool {
+		ni, _ := result[i]["name"].(string)
+		nj, _ := result[j]["name"].(string)
+		return ni < nj
+	})
 
 	r.logger.Debug("GetAllServers completed", zap.Int("server_count", len(result)))
 	return result, nil
@@ -1833,6 +2235,20 @@ func (r *Runtime) getAllServersLegacy() ([]map[string]interface{}, error) {
 			"connecting":  false,
 			"tool_count":  0,
 			"status":      "unknown",
+		}
+
+		// MCP-901: registry provenance in parity with the StateView path.
+		if srv.SourceRegistryID != "" {
+			serverInfo["source_registry_id"] = srv.SourceRegistryID
+		}
+		if srv.SourceRegistryProvenance != "" {
+			serverInfo["source_registry_provenance"] = srv.SourceRegistryProvenance
+		}
+
+		// MCP-2940: per-server auto-approve intent in parity with the
+		// StateView path. Tri-state *bool — only emit when set.
+		if srv.AutoApproveToolChanges != nil {
+			serverInfo["auto_approve_tool_changes"] = *srv.AutoApproveToolChanges
 		}
 
 		// Try to get connection status
@@ -1887,6 +2303,49 @@ func (r *Runtime) GetServerTools(serverName string) ([]map[string]interface{}, e
 			toolMap["annotations"] = tool.Annotations
 		}
 		tools = append(tools, toolMap)
+	}
+
+	// Defensive fallback (MCP-2083): the per-server StateView tool list is volatile
+	// derived state — it is cleared on disconnect (supervisor clears Tools on a
+	// connection-down event) and only repopulated asynchronously by background
+	// discovery. Approving a quarantined server triggers a disconnect/reconnect
+	// cycle, and in the field this can leave StateView holding zero tools even
+	// though the durable search index already indexed the server's tools. Serving
+	// that empty snapshot makes the Tools tab show "No tools available" for a
+	// connected server that demonstrably has tools. When StateView reports no tools
+	// for a server, fall back to the authoritative search index so we never serve
+	// an empty list when indexed tools exist.
+	if len(tools) == 0 && r.indexManager != nil {
+		if indexed, err := r.indexManager.GetToolsByServer(serverName); err == nil && len(indexed) > 0 {
+			tools = make([]map[string]interface{}, 0, len(indexed))
+			for _, tool := range indexed {
+				// Index stores the full tool name; normalize to the bare tool name
+				// (no "server:" prefix) to match the StateView/approval-record
+				// convention used by the enrichment layer.
+				name := tool.Name
+				if idx := strings.Index(name, ":"); idx != -1 {
+					name = name[idx+1:]
+				}
+				toolMap := map[string]interface{}{
+					"name":        name,
+					"description": tool.Description,
+					"server_name": serverName,
+				}
+				if tool.ParamsJSON != "" {
+					var inputSchema map[string]interface{}
+					if err := json.Unmarshal([]byte(tool.ParamsJSON), &inputSchema); err == nil {
+						toolMap["inputSchema"] = inputSchema
+					}
+				}
+				if tool.Annotations != nil {
+					toolMap["annotations"] = tool.Annotations
+				}
+				tools = append(tools, toolMap)
+			}
+			r.logger.Debug("GetServerTools: StateView empty, served tools from search index fallback",
+				zap.String("server", serverName),
+				zap.Int("tool_count", len(tools)))
+		}
 	}
 
 	return tools, nil
@@ -1991,7 +2450,20 @@ func (r *Runtime) RefreshOAuthToken(serverName string) error {
 
 	// Delegate to upstream manager to refresh the token
 	if err := r.upstreamManager.RefreshOAuthToken(serverName); err != nil {
-		return fmt.Errorf("failed to refresh OAuth token: %w", err)
+		// Spec 044 — attribute terminal refresh outcomes to a stable
+		// diagnostics code so downstream consumers (web UI ErrorPanel,
+		// tray, doctor fix) don't have to re-parse free-text messages.
+		// The string-match classifier fallback catches these too, but
+		// explicit typing is cheaper and survives message rewording.
+		wrapped := fmt.Errorf("failed to refresh OAuth token: %w", err)
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "expired") || strings.Contains(msg, "no refresh token"):
+			return diagnostics.WrapOAuthRefreshExpired(wrapped)
+		case strings.Contains(msg, "403") || strings.Contains(msg, "invalid_grant"):
+			return diagnostics.WrapOAuthRefresh403(wrapped)
+		}
+		return wrapped
 	}
 
 	return nil
@@ -2006,7 +2478,23 @@ func (r *Runtime) SetVersion(version string) {
 	}
 
 	r.updateChecker = updatecheck.New(r.logger, version)
+	// Gate the checker on the update_check config block before its background
+	// loop starts (Spec 079 FR-012); the env switches win inside the checker.
+	r.applyUpdateCheckConfig(r.Config())
 	r.logger.Info("Update checker initialized", zap.String("version", version))
+}
+
+// applyUpdateCheckConfig pushes the update_check config block (Spec 079
+// FR-012) onto the running update checker. Called at init (SetVersion) and on
+// both config hot-reload paths (ApplyConfig + disk ReloadConfiguration) so an
+// update_check.{enabled,channel} edit takes effect without a restart.
+// Nil-safe and idempotent; the checker itself resolves env-var precedence.
+func (r *Runtime) applyUpdateCheckConfig(cfg *config.Config) {
+	if r.updateChecker == nil || cfg == nil {
+		return
+	}
+	uc := cfg.UpdateCheck
+	r.updateChecker.SetConfig(uc.IsEnabled(), uc.IncludePrereleases())
 }
 
 // GetVersionInfo returns the current version information from the update checker.
@@ -2036,6 +2524,94 @@ func (r *Runtime) SetTelemetry(version, edition string) {
 
 	r.telemetryService = telemetry.New(r.cfg, r.cfgPath, version, edition, r.logger)
 	r.telemetryService.SetRuntimeStats(r)
+
+	// Spec 044: wire the activation store onto the shared BBolt DB. The
+	// bucket is created lazily on first write, but we proactively ensure it
+	// exists at startup to avoid write-race on concurrent first-ever events
+	// (MCP initialize + upstream connect-success can arrive in the same tick).
+	if r.storageManager != nil {
+		if db := r.storageManager.GetDB(); db != nil {
+			if err := telemetry.EnsureActivationBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure activation bucket", zap.Error(err))
+			}
+			store := telemetry.NewActivationStore()
+			r.telemetryService.SetActivationStore(store, db)
+
+			// Spec 044 (T052): one-shot installer-launch marker. When the
+			// installer invokes mcpproxy with MCPPROXY_LAUNCHED_BY=installer,
+			// persist a pending flag so the first heartbeat (which may be
+			// minutes away) can emit launch_source=installer even across
+			// restarts. The flag is cleared the moment the heartbeat builder
+			// sees it (resolveLaunchSource).
+			if os.Getenv("MCPPROXY_LAUNCHED_BY") == "installer" {
+				if err := store.SetInstallerPending(db, true); err != nil {
+					r.logger.Debug("Failed to set installer_heartbeat_pending", zap.Error(err))
+				} else {
+					r.logger.Info("Installer-launched process: installer_heartbeat_pending=true")
+				}
+			}
+
+			// Spec 044 Phase H: wire diagnostics counter store. Pre-create the
+			// bucket to avoid write-race on first DiagnosticError classification.
+			if err := telemetry.EnsureDiagnosticsCountersBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure diagnostics_counters bucket", zap.Error(err))
+			}
+			diagStore := telemetry.NewDiagnosticsCounterStore()
+			r.telemetryService.SetDiagnosticsCounterStore(diagStore, db)
+
+			// Wire error-code notifier into supervisor so every classified
+			// DiagnosticError increments the 24h per-code counter. Spec 080
+			// (US3, FR-012): the same stream also refreshes last_error_code —
+			// the single most recent MCPX_* code, persisted across restarts so
+			// the post-crash heartbeat carries the pre-crash code.
+			if r.supervisor != nil {
+				prechurnStore := r.prechurnStore
+				r.supervisor.SetErrorCodeNotifier(func(code string) {
+					// Spec 080 FR-012: the pre-churn last_error_code write is
+					// synchronous at the classification site — a crash right
+					// after classification must not lose the final pre-crash
+					// code (that loss window is the one case the field exists
+					// for). Sub-ms BBolt Update; no supervisor re-entry.
+					if prechurnStore != nil {
+						_ = prechurnStore.RecordLastErrorCode(db, code)
+					}
+					// The 24h aggregate counter write is synchronous too
+					// (review round 4): an untracked goroutine here could run
+					// after Close resolves the shutdown marker (FR-010) or
+					// after the DB handle closes. Synchronous means the write
+					// completes inside the supervisor's call stack, so
+					// supervisor.Stop() — which joins its goroutines before
+					// Close touches storage — is a hard barrier: after it
+					// returns, no notifier-driven DB write remains. Same
+					// safety argument as above: sub-ms BBolt Update, no
+					// supervisor re-entry, so no lock cycle even when the
+					// caller holds stateMu.
+					_ = diagStore.RecordErrorCode(db, code)
+				})
+			}
+
+			// Spec 080 (US3): hand the startup-derived previous_shutdown value
+			// (stable for this instance, FR-011) and the pre-churn store to
+			// the telemetry service so heartbeats can surface the snapshot.
+			r.telemetryService.SetPreChurn(r.previousShutdown, r.prechurnStore, db)
+
+			// Spec 080 (US2): wire the funnel observability store and record
+			// this process start as activity immediately — the first-install
+			// day stamp must persist on first run (FR-007) and short sessions
+			// that die before the first heartbeat must still count as active
+			// days (FR-008). Local persistence is independent of the opt-out
+			// gate; transmission is gated elsewhere (FR-017 unchanged).
+			if err := telemetry.EnsureFunnelBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure telemetry funnel bucket", zap.Error(err))
+			}
+			funnelStore := telemetry.NewFunnelStore()
+			r.telemetryService.SetFunnelStore(funnelStore, db)
+			if err := funnelStore.RecordActivity(db, time.Now().UTC()); err != nil {
+				r.logger.Debug("Failed to record funnel activity at startup", zap.Error(err))
+			}
+		}
+	}
+
 	r.logger.Info("Telemetry service initialized", zap.String("version", version), zap.String("edition", edition))
 }
 
@@ -2054,22 +2630,144 @@ func (r *Runtime) TelemetryRegistry() *telemetry.CounterRegistry {
 	return r.telemetryService.Registry()
 }
 
-// GetServerConfig returns a pointer to the ServerConfig with the given
-// name from the current runtime snapshot, or nil if no such server is
-// configured. Callers must treat the return value as read-only —
-// mutating it would race with the config hot-reload path.
-func (r *Runtime) GetServerConfig(name string) *config.ServerConfig {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.cfg == nil {
-		return nil
+// RecordMCPClientForActivation records a sanitized MCP client name and marks
+// the first-ever-client flag (Spec 044 US2). No-op if activation store not
+// wired or if the raw name cannot be plumbed through (nil-safe all the way
+// down). Intentionally takes the raw name; sanitization happens inside the
+// store.
+func (r *Runtime) RecordMCPClientForActivation(rawClientName string) {
+	if r.telemetryService == nil {
+		return
 	}
-	for _, s := range r.cfg.Servers {
-		if s != nil && s.Name == name {
-			return s
-		}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
 	}
-	return nil
+	if err := store.MarkFirstMCPClient(db); err != nil {
+		r.logger.Debug("activation: MarkFirstMCPClient failed", zap.Error(err))
+	}
+	if err := store.RecordMCPClient(db, rawClientName); err != nil {
+		r.logger.Debug("activation: RecordMCPClient failed", zap.Error(err))
+	}
+}
+
+// RecordRetrieveToolsCallForActivation bumps the 24h retrieve_tools counter
+// and marks the first-ever-call flag (Spec 044 US2). No-op if the activation
+// store is not wired.
+func (r *Runtime) RecordRetrieveToolsCallForActivation() {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstRetrieveToolsCall(db); err != nil {
+		r.logger.Debug("activation: MarkFirstRetrieveToolsCall failed", zap.Error(err))
+	}
+	if err := store.IncrementRetrieveToolsCall(db); err != nil {
+		r.logger.Debug("activation: IncrementRetrieveToolsCall failed", zap.Error(err))
+	}
+}
+
+// SetSessionClientResolver wires the session -> MCP client lookup that stamps
+// client_name / client_version onto every activity record at write time.
+// No-op if the activity service is not wired.
+func (r *Runtime) SetSessionClientResolver(resolver SessionClientResolver) {
+	if r.activityService == nil {
+		return
+	}
+	r.activityService.SetSessionClientResolver(resolver)
+}
+
+// SetWorkSessionResolver wires the session -> work-session lookup used to stamp
+// every activity record (Spec 082).
+//
+// The resolver reads the id CACHED on the connection rather than re-deriving it.
+// Re-deriving per record would let one connection's records disagree: the first
+// resolves before the client's project has arrived, the second after.
+func (r *Runtime) SetWorkSessionResolver(resolver SessionWorkSessionResolver) {
+	if r.activityService == nil {
+		return
+	}
+	r.activityService.SetWorkSessionResolver(resolver)
+	r.activityService.SetWorkSessionReaper(r.ReapWorkSessions)
+}
+
+// ResolveWorkSession derives the work session for an identity, opening a new one
+// when it has been idle past the window. Called once per connection.
+func (r *Runtime) ResolveWorkSession(id WorkSessionIdentity) string {
+	if r.workSessions == nil {
+		r.workSessions = NewWorkSessionTracker(DefaultWorkSessionIdleWindow)
+	}
+	return r.workSessions.Resolve(id)
+}
+
+// ReapWorkSessions drops work sessions idle past maxIdle, so a long-lived daemon
+// does not accumulate one map entry per identity forever.
+func (r *Runtime) ReapWorkSessions(maxIdle time.Duration) int {
+	if r.workSessions == nil {
+		return 0
+	}
+	return r.workSessions.Reap(maxIdle)
+}
+
+// RecordRealToolCallForActivation marks the first-ever real (upstream) tool
+// call. "Real" means a call proxied to an upstream server, as opposed to a
+// built-in tool such as retrieve_tools.
+//
+// This is the lifetime counterpart of RecordRetrieveToolsCallForActivation.
+// Until it existed, the retrieve step had a lifetime flag while the call step
+// had only a windowed counter, so the retrieve→call funnel compared a
+// lifetime value against a 24h one and understated conversion badly.
+//
+// No-op if the activation store is not wired.
+func (r *Runtime) RecordRealToolCallForActivation() {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstRealToolCall(db); err != nil {
+		r.logger.Debug("activation: MarkFirstRealToolCall failed", zap.Error(err))
+	}
+}
+
+// RecordTokensSavedForActivation adds n to the 24h tokens-saved estimator.
+// n <= 0 is a no-op. Spec 044 US2.
+func (r *Runtime) RecordTokensSavedForActivation(n int) {
+	if n <= 0 || r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.AddTokensSaved(db, n); err != nil {
+		r.logger.Debug("activation: AddTokensSaved failed", zap.Error(err))
+	}
+}
+
+// MarkFirstConnectedServerForActivation sets the first_connected_server_ever
+// flag. Called from the supervisor's connect-success callback. Spec 044 US2.
+func (r *Runtime) MarkFirstConnectedServerForActivation() {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstConnectedServer(db); err != nil {
+		r.logger.Debug("activation: MarkFirstConnectedServer failed", zap.Error(err))
+	}
 }
 
 // GetServerCount returns the total number of configured servers (implements telemetry.RuntimeStats).
@@ -2135,27 +2833,82 @@ func (r *Runtime) IsQuarantineEnabled() bool {
 	return r.cfg.IsQuarantineEnabled()
 }
 
+// dockerProbeTTLPositive is how long a successful docker daemon probe stays
+// cached. 15m is a balance between avoiding the 2s `docker info` cost on
+// every heartbeat and not sitting on a stale "true" if the user stops Docker.
+const dockerProbeTTLPositive = 15 * time.Minute
+
+// dockerProbeTTLNegative is how long a failed probe stays cached. Kept short
+// (5m) so users who launch Docker Desktop *after* mcpproxy started see
+// `server_docker_available_bool` flip at the next heartbeat rather than the
+// next process restart.
+const dockerProbeTTLNegative = 5 * time.Minute
+
 // IsDockerAvailable reports whether the host has a reachable Docker daemon
-// (implements telemetry.RuntimeStats, schema v3). The probe runs at most
-// once per process via sync.Once — `docker info` has non-trivial cost and
-// daemon presence doesn't meaningfully change within a session. A
-// subsequent `docker` install/uninstall mid-process won't reflect here
-// until the next restart; acceptable trade-off for daily-cadence telemetry.
+// (implements telemetry.RuntimeStats, schema v3). Uses a time-based cache —
+// see dockerProbeTTLPositive / dockerProbeTTLNegative for reasoning.
 func (r *Runtime) IsDockerAvailable() bool {
-	r.dockerProbeOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}")
-		if err := cmd.Run(); err != nil {
-			r.dockerProbeResult = false
-			if r.logger != nil {
-				r.logger.Debug("docker daemon probe failed (telemetry)", zap.Error(err))
-			}
-			return
+	r.dockerProbeMu.Lock()
+	defer r.dockerProbeMu.Unlock()
+
+	if r.dockerProbeKnown {
+		age := time.Since(r.dockerProbedAt)
+		ttl := dockerProbeTTLPositive
+		if !r.dockerProbeResult {
+			ttl = dockerProbeTTLNegative
 		}
-		r.dockerProbeResult = true
-	})
+		if age < ttl {
+			return r.dockerProbeResult
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// Resolve docker via shellwrap so we find Docker Desktop / Homebrew /
+	// Colima installs even when mcpproxy was launched from a LaunchAgent /
+	// tray with a minimal inherited PATH (see issue: tray "Docker daemon not
+	// available" warning despite healthy daemon + socket).
+	dockerBin, resolveErr := shellwrap.ResolveDockerPath(r.logger)
+	var err error
+	var newResult bool
+	if resolveErr != nil || dockerBin == "" {
+		// Honest availability (#696): if the CLI can't be resolved to an
+		// absolute path, Docker-isolated servers can't spawn it — report
+		// unavailable rather than probing a bare "docker" that is not the
+		// binary used for spawning.
+		err = resolveErr
+		newResult = false
+	} else {
+		cmd := exec.CommandContext(ctx, dockerBin, "info", "--format", "{{.ServerVersion}}")
+		err = cmd.Run()
+		newResult = err == nil
+	}
+
+	// Log only on state changes (or first probe) so repeated heartbeats don't
+	// spam the log. Rationale: users care about transitions ("Docker just
+	// became available") far more than steady-state telemetry probes.
+	if r.logger != nil && (!r.dockerProbeKnown || r.dockerProbeResult != newResult) {
+		if newResult {
+			r.logger.Info("docker daemon probe: available")
+		} else {
+			r.logger.Info("docker daemon probe: unavailable", zap.Error(err))
+		}
+	}
+
+	r.dockerProbeResult = newResult
+	r.dockerProbedAt = time.Now()
+	r.dockerProbeKnown = true
 	return r.dockerProbeResult
+}
+
+// GetDockerCLISource returns the coarse, fixed-enum branch that resolved the
+// docker CLI — "path" | "bundled" | "login_shell" | "absent" (implements
+// telemetry.RuntimeStats, schema v5 / MCP-2745). This is the direct #696 fleet
+// signal (docker installed but not on the spawn PATH). It delegates to
+// shellwrap.ResolveDockerSource, which shares the process-wide docker-path
+// cache, so this is cheap on the heartbeat path. NEVER returns the path itself.
+func (r *Runtime) GetDockerCLISource() string {
+	return shellwrap.ResolveDockerSource(r.logger)
 }
 
 // GetDockerIsolatedServerCount returns how many currently-configured servers
@@ -2205,6 +2958,26 @@ func (r *Runtime) GetActivity(id string) (*storage.ActivityRecord, error) {
 	return r.storageManager.GetActivity(id)
 }
 
+// AggregateToolUsage rolls up tool_call activity per (server,tool) since the
+// given time (spec 050). Returns an empty map when storage is unavailable.
+func (r *Runtime) AggregateToolUsage(since time.Time) (map[string]storage.ToolUsageStat, error) {
+	if r.storageManager == nil {
+		return map[string]storage.ToolUsageStat{}, nil
+	}
+	return r.storageManager.AggregateToolUsage(since)
+}
+
+// UsageSnapshot returns the actor-owned in-memory usage aggregate snapshot
+// (spec 069 A2/A3). Reads are lock-free; the returned value is immutable and
+// must be treated as read-only. Returns nil when the activity service is
+// unavailable.
+func (r *Runtime) UsageSnapshot() *UsageAggregate {
+	if r.activityService == nil {
+		return nil
+	}
+	return r.activityService.UsageSnapshot()
+}
+
 // StreamActivities returns a channel that yields activity records matching the filter.
 func (r *Runtime) StreamActivities(filter storage.ActivityFilter) <-chan *storage.ActivityRecord {
 	if r.storageManager == nil {
@@ -2229,4 +3002,42 @@ func (r *Runtime) GetToolApproval(serverName, toolName string) (*storage.ToolApp
 		return nil, fmt.Errorf("storage not available")
 	}
 	return r.storageManager.GetToolApproval(serverName, toolName)
+}
+
+// GetOnboardingState returns the current wizard engagement state (Spec 046).
+func (r *Runtime) GetOnboardingState() (*storage.OnboardingState, error) {
+	if r.storageManager == nil {
+		return &storage.OnboardingState{}, nil
+	}
+	return r.storageManager.GetOnboardingState()
+}
+
+// GetActivationFirstMCPClient returns Spec 044's FirstMCPClientEver flag and
+// the capped list of recognized client names from the activation bucket. Used
+// by the v2 onboarding wizard (Spec 046 v2) Verify tab. Nil-safe: when
+// telemetry/activation isn't wired (CI/test or telemetry disabled) returns
+// (false, nil).
+func (r *Runtime) GetActivationFirstMCPClient() (bool, []string) {
+	if r.telemetryService == nil {
+		return false, nil
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return false, nil
+	}
+	st, err := store.Load(db)
+	if err != nil {
+		r.logger.Debug("activation: Load failed for onboarding verify", zap.Error(err))
+		return false, nil
+	}
+	return st.FirstMCPClientEver, st.MCPClientsSeenEver
+}
+
+// SaveOnboardingState persists the wizard engagement state (Spec 046).
+func (r *Runtime) SaveOnboardingState(state *storage.OnboardingState) error {
+	if r.storageManager == nil {
+		return fmt.Errorf("storage not available")
+	}
+	return r.storageManager.SaveOnboardingState(state)
 }

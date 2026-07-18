@@ -20,6 +20,12 @@ struct TrayMenu: View {
 
         Divider()
 
+        // MARK: - Spec 044 Fix Issues (classified diagnostics)
+        if !appState.serversWithDiagnostic.isEmpty {
+            fixIssuesSection
+            Divider()
+        }
+
         // MARK: - Attention / Quarantine
         if !appState.serversNeedingAttention.isEmpty {
             attentionSection
@@ -96,6 +102,37 @@ struct TrayMenu: View {
         }
     }
 
+    // MARK: - Fix Issues Section (Spec 044)
+
+    /// Renders the "Fix issues" group, one entry per server that has a
+    /// classified diagnostic with warn/error severity. Clicking opens the
+    /// server detail page in the web UI where ErrorPanel renders the
+    /// full fix_steps list.
+    @ViewBuilder
+    private var fixIssuesSection: some View {
+        let affected = appState.serversWithDiagnostic
+        Text("⚠ Fix issues (\(affected.count))")
+            .font(.caption)
+            .foregroundStyle(.orange)
+
+        ForEach(affected) { server in
+            Button {
+                openWebUI(path: "servers/\(server.name)")
+            } label: {
+                HStack {
+                    Image(systemName: severityIcon(for: server.diagnostic?.severity))
+                        .foregroundStyle(severityColor(for: server.diagnostic?.severity))
+                    VStack(alignment: .leading) {
+                        Text(server.name)
+                        Text(server.diagnostic?.code ?? "")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Attention Section
 
     @ViewBuilder
@@ -113,6 +150,16 @@ struct TrayMenu: View {
                     VStack(alignment: .leading) {
                         Text(server.name)
                         Text(server.health?.summary ?? "")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    // MCP-1819/T3 — surface the "Sign in" verb explicitly for the
+                    // OAuth login-required state so the actionable affordance is
+                    // clear, not buried. Scoped to login (this issue's concern);
+                    // other attention actions keep their prior icon-only row.
+                    if server.isOAuthLoginRequired, let label = server.health?.healthAction?.label {
+                        Spacer()
+                        Text(label)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -207,9 +254,10 @@ struct TrayMenu: View {
             }
         }
 
-        // OAuth Login (shown when action is "login")
-        if server.health?.action == "login" {
-            Button("Log In") {
+        // OAuth Sign in (shown when login is required) — calm, actionable
+        // affordance, not error framing (MCP-1819/T3).
+        if server.isOAuthLoginRequired {
+            Button("Sign in") {
                 Task {
                     try? await apiClient?.loginServer(server.id)
                 }
@@ -303,7 +351,7 @@ struct TrayMenu: View {
         }
         .disabled(!updateService.canCheckForUpdates)
 
-        if let available = appState.updateAvailable {
+        if let available = appState.updateAvailable ?? updateService.latestVersion {
             Text("Update available: v\(available)")
                 .font(.caption)
                 .foregroundStyle(.blue)
@@ -329,6 +377,24 @@ struct TrayMenu: View {
             }
         }
         return server.connected ? .green : .red
+    }
+
+    /// Spec 044 — map a diagnostic severity string to an SF Symbol name.
+    private func severityIcon(for severity: String?) -> String {
+        switch severity {
+        case "error": return "xmark.octagon.fill"
+        case "warn":  return "exclamationmark.triangle.fill"
+        default:      return "info.circle"
+        }
+    }
+
+    /// Spec 044 — map a diagnostic severity string to a colour.
+    private func severityColor(for severity: String?) -> Color {
+        switch severity {
+        case "error": return .red
+        case "warn":  return .orange
+        default:      return .blue
+        }
     }
 
     private func actionIcon(for action: String) -> String {

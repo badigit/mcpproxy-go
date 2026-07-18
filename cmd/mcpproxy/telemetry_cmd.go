@@ -5,14 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.etcd.io/bbolt"
+	"go.uber.org/zap"
 
 	clioutput "github.com/smart-mcp-proxy/mcpproxy-go/internal/cli/output"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 )
 
@@ -23,6 +25,10 @@ type TelemetryStatus struct {
 	Endpoint        string `json:"endpoint"`
 	EnvOverride     bool   `json:"env_override,omitempty"`
 	EnvOverrideName string `json:"env_override_name,omitempty"`
+	// Spec 044 (T042): activation funnel snapshot, rendered from the BBolt
+	// store when reachable. Omitted (nil) when the DB is locked by a running
+	// daemon or not present.
+	Activation *telemetry.ActivationState `json:"activation,omitempty"`
 }
 
 // GetTelemetryCommand returns the telemetry management command.
@@ -75,15 +81,14 @@ func runTelemetryShowPayload(_ *cobra.Command, _ []string) error {
 
 	// Require running daemon so runtime stats are populated. Offline mode
 	// would emit zero-valued runtime fields and mislead users.
-	socketPath := socket.DetectSocketPath(cfg.DataDir)
-	if !socket.IsSocketAvailable(socketPath) {
+	client, ok := newDaemonClient(cfg, nil)
+	if !ok {
 		return fmt.Errorf("telemetry show-payload requires running daemon. Start with: mcpproxy serve")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client := cliclient.NewClient(socketPath, nil)
 	payload, err := client.GetTelemetryPayload(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get telemetry payload from daemon: %w", err)
@@ -143,6 +148,14 @@ func runTelemetryStatus(cmd *cobra.Command, _ []string) error {
 		status.Enabled = false
 	}
 
+	// Spec 044 (T042): try to render the activation funnel from the BBolt
+	// store when the DB is reachable. If a daemon has the DB locked, we
+	// silently omit — the same data is available via `/api/v1/status` when
+	// the daemon is running.
+	if snap, ok := loadActivationSnapshot(cfg.DataDir); ok {
+		status.Activation = &snap
+	}
+
 	format := clioutput.ResolveFormat(globalOutputFormat, globalJSONOutput)
 	switch format {
 	case "json":
@@ -175,9 +188,51 @@ func runTelemetryStatus(cmd *cobra.Command, _ []string) error {
 			fmt.Printf("  %-14s %s\n", "Anonymous ID:", status.AnonymousID)
 		}
 		fmt.Printf("  %-14s %s\n", "Endpoint:", status.Endpoint)
+		if status.Activation != nil {
+			a := status.Activation
+			fmt.Println()
+			fmt.Println("Activation Funnel")
+			fmt.Printf("  %-28s %v\n", "first_connected_server:", a.FirstConnectedServerEver)
+			fmt.Printf("  %-28s %v\n", "first_mcp_client:", a.FirstMCPClientEver)
+			fmt.Printf("  %-28s %v\n", "first_retrieve_tools:", a.FirstRetrieveToolsCallEver)
+			fmt.Printf("  %-28s %d\n", "retrieve_tools_calls_24h:", a.RetrieveToolsCalls24h)
+			fmt.Printf("  %-28s %s\n", "tokens_saved_24h_bucket:", a.EstimatedTokensSaved24hBucket)
+			if len(a.MCPClientsSeenEver) > 0 {
+				fmt.Printf("  %-28s %s\n", "mcp_clients_seen_ever:", strings.Join(a.MCPClientsSeenEver, ", "))
+			}
+			if a.ConfiguredIDECount > 0 {
+				fmt.Printf("  %-28s %d\n", "configured_ide_count:", a.ConfiguredIDECount)
+			}
+		}
 	}
 
 	return nil
+}
+
+// loadActivationSnapshot attempts to open the BBolt DB in read-only mode at
+// the standard path and load the activation bucket. Returns (zero, false)
+// when the DB file does not exist, is locked (daemon running), or read errs.
+// We use a short Timeout so a locked DB fails fast rather than hanging the
+// CLI.
+func loadActivationSnapshot(dataDir string) (telemetry.ActivationState, bool) {
+	if dataDir == "" {
+		return telemetry.ActivationState{}, false
+	}
+	dbPath := filepath.Join(dataDir, "config.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return telemetry.ActivationState{}, false
+	}
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 200 * time.Millisecond, ReadOnly: true})
+	if err != nil {
+		return telemetry.ActivationState{}, false
+	}
+	defer db.Close()
+	store := telemetry.NewActivationStore()
+	st, err := store.Load(db)
+	if err != nil {
+		return telemetry.ActivationState{}, false
+	}
+	return st, true
 }
 
 func runTelemetryEnable(cmd *cobra.Command, _ []string) error {
@@ -210,6 +265,13 @@ func runTelemetryDisable(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// Capture the EFFECTIVE resolved state BEFORE mutating, so we only beacon on
+	// a genuine enabled->disabled transition (MCP-2482). Effective resolution
+	// includes env overrides (DO_NOT_TRACK / CI), so an install where telemetry
+	// was never actually enabled emits nothing. A second `disable` when already
+	// disabled also emits nothing (wasEnabled == false).
+	wasEnabled := telemetry.EffectiveTelemetryEnabled(cfg)
+
 	if cfg.Telemetry == nil {
 		cfg.Telemetry = &config.TelemetryConfig{}
 	}
@@ -221,7 +283,23 @@ func runTelemetryDisable(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
+	// The disable is now persisted and effective — confirm immediately so the
+	// command never appears to hang on the (best-effort) beacon below.
 	fmt.Println("Telemetry disabled.")
+
+	// One-time opt-out beacon. When a daemon is running it does NOT auto-reload
+	// this file (there is no fsnotify watcher), so the CLI is responsible for the
+	// beacon in the CLI-driven path. Route it through the SAME guarded server-side
+	// entry point (EmitOptOutBeacon applies the dev-build/semver, env, and
+	// anon-id guards and owns the single send) rather than duplicating the send
+	// or bypassing a guard. A short timeout keeps this from blocking on a slow
+	// endpoint; the CLI is short-lived so the send must complete before exit.
+	if wasEnabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		beaconSvc := telemetry.New(cfg, "", version, Edition, zap.NewNop())
+		beaconSvc.EmitOptOutBeacon(ctx)
+	}
 	return nil
 }
 

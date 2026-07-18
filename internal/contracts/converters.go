@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -28,6 +29,16 @@ func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool
 		Updated:        cfg.Updated,
 		ReconnectCount: 0, // TODO: Get from runtime status
 		Authenticated:  authenticated,
+		// MCP-901: carry registry provenance so the approval/quarantine view
+		// can show a server's origin. Empty for manually-configured servers.
+		SourceRegistryID:         cfg.SourceRegistryID,
+		SourceRegistryProvenance: cfg.SourceRegistryProvenance,
+		// MCP-2940: surface the per-server auto-approve intent (tri-state *bool)
+		// so the Web UI toggle reflects the persisted value.
+		AutoApproveToolChanges: cfg.AutoApproveToolChanges,
+		// MCP-3322: surface the per-server init_timeout override so callers can
+		// read back a configured handshake deadline.
+		InitTimeout: cfg.InitTimeout,
 	}
 
 	// Convert OAuth config if present
@@ -41,15 +52,18 @@ func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool
 		}
 	}
 
-	// Convert isolation config if present
+	// Convert isolation config if present. The per-server overrides that
+	// actually live on config.IsolationConfig are Image/NetworkMode/
+	// ExtraArgs/WorkingDir; MemoryLimit/CPULimit/Timeout are still only
+	// available at the global DockerIsolationConfig level, so they stay
+	// empty here until that refactor lands.
 	if cfg.Isolation != nil {
 		server.Isolation = &IsolationConfig{
-			Enabled:     cfg.Isolation.IsEnabled(), // Dereference *bool safely
+			Enabled:     cfg.Isolation.IsEnabled(),
 			Image:       cfg.Isolation.Image,
-			MemoryLimit: "", // TODO: Move from DockerIsolationConfig
-			CPULimit:    "", // TODO: Move from DockerIsolationConfig
+			NetworkMode: cfg.Isolation.NetworkMode,
+			ExtraArgs:   append([]string(nil), cfg.Isolation.ExtraArgs...),
 			WorkingDir:  cfg.Isolation.WorkingDir,
-			Timeout:     "", // TODO: Move from DockerIsolationConfig
 		}
 	}
 
@@ -168,6 +182,21 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 		}
 		if quarantined, ok := generic["quarantined"].(bool); ok {
 			server.Quarantined = quarantined
+		}
+		// MCP-2940: tri-state *bool — only set the pointer when the key is
+		// present so an unset flag stays nil (the Web UI distinguishes unset
+		// from an explicit false).
+		if autoApprove, ok := generic["auto_approve_tool_changes"].(bool); ok {
+			v := autoApprove
+			server.AutoApproveToolChanges = &v
+		}
+		// MCP-3322: init_timeout serializes as a duration string (e.g. "120s").
+		// Parse it back into a *config.Duration so the GET payload round-trips.
+		if initTimeout, ok := generic["init_timeout"].(string); ok && initTimeout != "" {
+			if d, err := time.ParseDuration(initTimeout); err == nil {
+				v := config.Duration(d)
+				server.InitTimeout = &v
+			}
 		}
 		if connected, ok := generic["connected"].(bool); ok {
 			server.Connected = connected
@@ -302,6 +331,31 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			server.LastReconnectAt = &lastReconnectAt
 		}
 
+		// Spec 044 — carry structured diagnostic + stable error code through
+		// the legacy fallback path. The management service does the same for
+		// the happy path; this ensures the REST envelope never drops them.
+		if errCode, ok := generic["error_code"].(string); ok && errCode != "" {
+			server.ErrorCode = errCode
+		}
+		if diagRaw, ok := generic["diagnostic"].(map[string]interface{}); ok && diagRaw != nil {
+			d := &Diagnostic{}
+			// JSON round-trip handles both named-string types (diagnostics.Code,
+			// diagnostics.Severity) and plain strings (after a JSON decode).
+			if raw, err := json.Marshal(diagRaw); err == nil {
+				_ = json.Unmarshal(raw, d)
+			}
+			server.Diagnostic = d
+		}
+
+		// MCP-901 — registry provenance, carried through the legacy fallback
+		// projection in parity with the management.ListServers happy path.
+		if regID, ok := generic["source_registry_id"].(string); ok && regID != "" {
+			server.SourceRegistryID = regID
+		}
+		if prov, ok := generic["source_registry_provenance"].(string); ok && prov != "" {
+			server.SourceRegistryProvenance = prov
+		}
+
 		servers = append(servers, server)
 	}
 
@@ -331,8 +385,14 @@ func ConvertGenericToolsToTyped(genericTools []map[string]interface{}) []Tool {
 			tool.Usage = usage
 		}
 
-		// Extract schema
-		if schema, ok := generic["schema"].(map[string]interface{}); ok {
+		// Extract schema. Every generic-map producer (runtime.GetServerTools,
+		// server.GetServerTools, mcp.go) emits the upstream input schema under the
+		// "inputSchema" key, so that is the authoritative source; "schema" is kept
+		// as a legacy fallback. Reading only "schema" silently dropped every schema
+		// from the /api/v1/tools response (MCP-3132/MCP-3167).
+		if schema, ok := generic["inputSchema"].(map[string]interface{}); ok {
+			tool.Schema = schema
+		} else if schema, ok := generic["schema"].(map[string]interface{}); ok {
 			tool.Schema = schema
 		}
 
@@ -495,6 +555,25 @@ func ConvertValidationErrors(configErrors []config.ValidationError) []Validation
 func ConvertConfigToContract(cfg *config.Config) interface{} {
 	if cfg == nil {
 		return nil
+	}
+
+	// Materialize the resolved telemetry.enabled value before marshaling.
+	// Telemetry is opt-out (default enabled), but DefaultConfig leaves the
+	// Telemetry field nil and Enabled is a pointer with `omitempty`, so a fresh
+	// install would omit the `telemetry` key entirely. Both the web UI and macOS
+	// clients coerce the missing bool to false, displaying telemetry as DISABLED
+	// even though Config.IsTelemetryEnabled() reports true (MCP-2477). Mirror that
+	// resolution into the serialized response without mutating the shared config.
+	if cfg.Telemetry == nil || cfg.Telemetry.Enabled == nil {
+		cfgCopy := *cfg
+		var tel config.TelemetryConfig
+		if cfg.Telemetry != nil {
+			tel = *cfg.Telemetry
+		}
+		enabled := cfg.IsTelemetryEnabled()
+		tel.Enabled = &enabled
+		cfgCopy.Telemetry = &tel
+		return &cfgCopy
 	}
 
 	// Return the config as-is for JSON marshaling

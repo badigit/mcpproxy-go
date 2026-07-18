@@ -176,6 +176,38 @@ Server scoping is enforced at two levels:
 1. **Tool discovery** (`retrieve_tools`) — only returns tools from allowed servers
 2. **Tool execution** (`call_tool_*`) — blocks calls to out-of-scope servers
 
+## Profile Pinning
+
+A [profile](./profiles.md) scopes tool discovery and calls to a named subset of upstream servers. With `--profile-pin`, you can **bind a token to a single profile** so it can never operate outside it — regardless of the URL it connects to or any `set_profile` call it makes.
+
+```bash
+# This token can ONLY ever see/use the "research" profile
+mcpproxy token create \
+  --name research-agent \
+  --servers "*" \
+  --permissions read \
+  --profile-pin research
+```
+
+Server-side enforcement (no client cooperation required):
+
+- **`set_profile("other")` is rejected** — a pinned token cannot switch its session to a different profile (switching to its own pinned profile, or clearing, is allowed).
+- **`/mcp/p/<other>` returns `403`** — connecting to any profile URL other than the pinned one is forbidden; the pinned profile's own URL works.
+- **The pin is the highest-precedence resolver source**, above an explicit `/mcp/p/<slug>` URL scope and above a session `set_profile` selection.
+
+Resolution precedence (highest wins):
+
+```
+1. agent-token profile_pin   (server-enforced; this section)
+2. /mcp/p/<slug> URL scope    (per-request override)
+3. set_profile session state  (base /mcp endpoint default for the session)
+4. none                        (no profile filtering — all allowed servers)
+```
+
+**Validation & config changes**: the pinned slug must name a configured profile at creation time (creation is rejected otherwise). If the profile is later removed from the configuration, requests are **warn-skipped** rather than hard-failed — the pin still blocks switching away, so the token can never silently widen its scope, but profile filtering falls through to the next precedence tier. Pinning composes with server scoping and permission tiers: a request must satisfy **all** of them.
+
+The pin is shown by `token list` (PROFILE PIN column) and `token show` (Profile Pin field), and is preserved across `token regenerate`.
+
 ## Managing Tokens
 
 ### List All Tokens
@@ -199,10 +231,21 @@ mcpproxy token show deploy-bot
 
 ### Revoke a Token
 
-Immediately invalidates the token:
+Immediately invalidates the token. Revoke is a **soft delete**: the record is kept
+(so the token name stays reserved) and any further use is rejected:
 
 ```bash
 mcpproxy token revoke deploy-bot
+```
+
+### Delete a Token
+
+Permanently removes the token, freeing its name for reuse. Unlike revoke, delete
+removes the record entirely — after deleting, you can create a new token with the
+same name:
+
+```bash
+mcpproxy token delete deploy-bot   # aliases: rm, remove
 ```
 
 ### Regenerate a Token
@@ -248,7 +291,8 @@ Agent tokens can also be managed via the REST API (requires admin API key):
 | `POST` | `/api/v1/tokens` | Create a new agent token |
 | `GET` | `/api/v1/tokens` | List all tokens |
 | `GET` | `/api/v1/tokens/{name}` | Get token details |
-| `DELETE` | `/api/v1/tokens/{name}` | Revoke a token |
+| `DELETE` | `/api/v1/tokens/{name}` | Revoke a token (soft delete; name stays reserved) |
+| `DELETE` | `/api/v1/tokens/{name}/permanent` | Permanently delete a token (frees the name for reuse) |
 | `POST` | `/api/v1/tokens/{name}/regenerate` | Regenerate token secret |
 
 ### Create Token via API
@@ -304,3 +348,4 @@ mcpproxy serve --require-mcp-auth    # Enforce /mcp authentication
 | `--servers` | Yes | — | Comma-separated server names or `"*"` |
 | `--permissions` | Yes | — | Comma-separated: `read`, `write`, `destructive` |
 | `--expires` | No | `30d` | Expiry duration (e.g., `7d`, `90d`, `365d`) |
+| `--profile-pin` | No | — | Pin the token to a single profile (see [Profile Pinning](#profile-pinning)) |

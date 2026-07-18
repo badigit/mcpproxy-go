@@ -34,7 +34,7 @@
         </div>
 
         <!-- Add Server Button -->
-        <button @click="showAddServerModal = true" class="btn btn-primary">
+        <button @click="showAddServerModal = true" class="btn btn-primary" data-test="header-add-server">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
           </svg>
@@ -43,7 +43,10 @@
       </div>
 
       <!-- Right: Stats + Proxy Info -->
-      <div class="hidden md:flex items-center space-x-3 flex-shrink-0">
+      <div class="hidden md:flex items-center space-x-3 shrink-0">
+        <!-- Profile switcher (Profiles v2 / MCP-3243) -->
+        <ProfileSwitcher />
+
         <!-- Servers -->
         <div class="flex items-center space-x-2 px-3 py-2 bg-base-200 rounded-lg text-sm">
           <div
@@ -102,7 +105,7 @@
                 </div>
                 <button
                   @click.stop="copyEndpoint(ep)"
-                  class="btn btn-ghost btn-xs p-1 opacity-0 group-hover:opacity-100 transition-opacity tooltip tooltip-left flex-shrink-0 ml-2"
+                  class="btn btn-ghost btn-xs p-1 opacity-0 group-hover:opacity-100 transition-opacity tooltip tooltip-left shrink-0 ml-2"
                   :data-tip="ep.copyTooltip"
                 >
                   <svg v-if="ep.copyTooltip === 'Copied!'" class="w-3.5 h-3.5 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -137,6 +140,7 @@ import { useSystemStore } from '@/stores/system'
 import { useServersStore } from '@/stores/servers'
 import { useAuthStore } from '@/stores/auth'
 import AddServerModal from './AddServerModal.vue'
+import ProfileSwitcher from './ProfileSwitcher.vue'
 
 const router = useRouter()
 const systemStore = useSystemStore()
