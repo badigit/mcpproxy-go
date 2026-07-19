@@ -488,6 +488,14 @@ type ServerConfig struct {
 	EnabledTools  []string `json:"enabled_tools,omitempty" mapstructure:"enabled_tools"`   // Allowlist: only these tools are exposed; mutually exclusive with disabled_tools
 	DisabledTools []string `json:"disabled_tools,omitempty" mapstructure:"disabled_tools"` // Denylist: these tools are hidden; mutually exclusive with enabled_tools
 
+	// AnnotationDefaults provides fallback tool annotations for servers whose
+	// tools arrive without them. Per MCP spec a missing hint means "most
+	// permissive", so an upstream that simply omits readOnlyHint has all its
+	// tools dropped by the read_only_only discovery filter. Defaults declared
+	// here fill only the hints the upstream left nil — explicit upstream values
+	// are never overridden (see mergeAnnotationDefaults in upstream/core).
+	AnnotationDefaults *ToolAnnotations `json:"annotation_defaults,omitempty" mapstructure:"annotation-defaults"`
+
 	// SourceRegistryID records which registry this server was added from (empty
 	// for manually-configured servers). MCP-866: surfaced in the approval /
 	// quarantine view so a reviewer can see a server's origin.

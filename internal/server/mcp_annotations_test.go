@@ -227,8 +227,8 @@ func TestAnnotationFiltering_ReadOnlyOnly(t *testing.T) {
 		},
 		{
 			serverName:  "s1",
-			toolName:    "unknown_tool",
-			annotations: nil, // nil readOnlyHint defaults to not read-only
+			toolName:    "delete_item",
+			annotations: nil, // no readOnlyHint; "delete" verb => destructive, excluded
 		},
 	}
 
@@ -236,6 +236,60 @@ func TestAnnotationFiltering_ReadOnlyOnly(t *testing.T) {
 
 	assert.Len(t, filtered, 1)
 	assert.Equal(t, "list_items", filtered[0].toolName)
+}
+
+// The three tests below pin the fork's deliberate deviation from the strict MCP
+// reading of read_only_only. Upstream keeps ONLY tools with an explicit
+// readOnlyHint=true, which silently drops every tool from servers that ship no
+// annotations at all (Obsidian/mcpvault being the motivating case): retrieve_tools
+// would recommend call_tool_read for such a tool and then hide that very tool
+// behind read_only_only. The fork falls back to the verb classifier instead, so
+// unannotated READ verbs survive while write/destructive verbs still do not.
+// Trade-off, accepted knowingly: an unannotated tool whose leading verb is
+// unknown classifies as read (ClassifyOperationByName's default, matching
+// DeriveCallWith) and is therefore kept.
+
+func TestAnnotationFiltering_ReadOnlyOnly_UnannotatedReadVerbsKept(t *testing.T) {
+	tools := []annotatedSearchResult{
+		{serverName: "obsidian", toolName: "search_notes", annotations: nil},
+		{serverName: "obsidian", toolName: "read_note", annotations: nil},
+		{serverName: "obsidian", toolName: "list_directory", annotations: nil},
+		{serverName: "obsidian", toolName: "get_active_file", annotations: nil},
+		// Write/destructive verbs with no annotations must still be excluded.
+		{serverName: "obsidian", toolName: "create_note", annotations: nil},
+		{serverName: "obsidian", toolName: "delete_note", annotations: nil},
+	}
+
+	filtered := filterByAnnotations(tools, true, false, false)
+
+	got := make([]string, 0, len(filtered))
+	for _, f := range filtered {
+		got = append(got, f.toolName)
+	}
+	assert.ElementsMatch(t,
+		[]string{"search_notes", "read_note", "list_directory", "get_active_file"},
+		got,
+		"unannotated read-verb tools must be kept; write/destructive verbs excluded")
+}
+
+func TestAnnotationFiltering_ReadOnlyOnly_ExplicitFalseExcluded(t *testing.T) {
+	tools := []annotatedSearchResult{
+		{
+			serverName:  "beget",
+			toolName:    "get_thing",                                           // read-ish name ...
+			annotations: &config.ToolAnnotations{ReadOnlyHint: boolPtr(false)}, // ... but server says NOT read-only
+		},
+		{
+			serverName:  "obsidian",
+			toolName:    "search_notes",
+			annotations: nil, // unannotated read verb => kept
+		},
+	}
+
+	filtered := filterByAnnotations(tools, true, false, false)
+
+	assert.Len(t, filtered, 1)
+	assert.Equal(t, "search_notes", filtered[0].toolName)
 }
 
 func TestAnnotationFiltering_ExcludeDestructive(t *testing.T) {

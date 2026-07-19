@@ -335,10 +335,15 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		// because SaveConfiguration rebuilds the JSON config's server list from
 		// these records — without it the REST/UI toggle would be wiped on save.
 		"AutoApproveToolChanges": true,
-		"ReconnectOnUse":         true, // Spec 354: persisted to BBolt for on-demand reconnection
-		"LauncherWaitTimeout":    true, // Spec 046: persisted to BBolt so REST-API-added launcher servers survive restarts
-		"EnabledTools":           true, // feat/config-tool-allowlist: persisted to BBolt
-		"DisabledTools":          true, // feat/config-tool-allowlist: persisted to BBolt
+		// Fork: per-server annotation defaults. Persisted to BBolt for exactly the
+		// same reason as AutoApproveToolChanges — SaveConfiguration rebuilds the
+		// JSON server list from these records, so a non-persisted field is wiped
+		// from mcp_config.json on the next mutation.
+		"AnnotationDefaults":  true,
+		"ReconnectOnUse":      true, // Spec 354: persisted to BBolt for on-demand reconnection
+		"LauncherWaitTimeout": true, // Spec 046: persisted to BBolt so REST-API-added launcher servers survive restarts
+		"EnabledTools":        true, // feat/config-tool-allowlist: persisted to BBolt
+		"DisabledTools":       true, // feat/config-tool-allowlist: persisted to BBolt
 		// MCP-866: persisted to BBolt so a server's registry origin/provenance
 		// (and the custom-origin skip_quarantine guard) survive a restart.
 		"SourceRegistryID":         true,
@@ -454,5 +459,95 @@ func TestManagerStopAsyncDrainsThenCloseIsIdempotent(t *testing.T) {
 	manager.StopAsync()
 	if err := manager.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestAnnotationDefaultsRoundTrip verifies the fork's per-server
+// annotation_defaults survives a Save → Get / List cycle through BBolt.
+//
+// This is the persistence half of the feature and the reason the field lives in
+// UpstreamRecord at all: SaveConfiguration replaces the JSON config's server
+// list wholesale with records rebuilt from BBolt (runtime/lifecycle.go —
+// `configCopy.Servers = latestServers`). A field that does not round-trip here
+// is silently erased from mcp_config.json on the next mutation — adding a
+// server, approving a tool out of quarantine, or a plain restart — and the
+// read_only_only filter would quietly start dropping the server's tools again.
+// Nothing fails loudly in that scenario, which is exactly why it needs a test.
+func TestAnnotationDefaultsRoundTrip(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "async_ops_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zaptest.NewLogger(t).Sugar()
+	manager, err := NewManager(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("Failed to create storage manager: %v", err)
+	}
+	defer manager.Close()
+
+	bp := func(b bool) *bool { return &b }
+	cases := []struct {
+		name     string
+		defaults *config.ToolAnnotations
+	}{
+		// The motivating case: an upstream that ships no hints at all, declared
+		// read-only via config so read_only_only stops dropping its tools.
+		{"obsidian-readonly", &config.ToolAnnotations{ReadOnlyHint: bp(true)}},
+		// Mixed hints must survive field-by-field, not just as "non-nil".
+		{"mixed-hints", &config.ToolAnnotations{
+			Title:           "Legacy upstream",
+			ReadOnlyHint:    bp(false),
+			DestructiveHint: bp(true),
+			IdempotentHint:  bp(false),
+			OpenWorldHint:   bp(true),
+		}},
+		// Absence must stay absence — not resurrect as a zero-valued struct.
+		{"unset", nil},
+	}
+
+	for _, tc := range cases {
+		sc := &config.ServerConfig{
+			Name:               tc.name,
+			URL:                "https://example.com/mcp",
+			Protocol:           "http",
+			Enabled:            true,
+			Created:            time.Now(),
+			AnnotationDefaults: tc.defaults,
+		}
+		if err := manager.SaveUpstreamServer(sc); err != nil {
+			t.Fatalf("[%s] SaveUpstreamServer: %v", tc.name, err)
+		}
+	}
+
+	for _, tc := range cases {
+		got, err := manager.GetUpstreamServer(tc.name)
+		if err != nil {
+			t.Fatalf("[%s] GetUpstreamServer: %v", tc.name, err)
+		}
+		if !reflect.DeepEqual(got.AnnotationDefaults, tc.defaults) {
+			t.Errorf("[%s] Get: AnnotationDefaults = %+v, want %+v",
+				tc.name, got.AnnotationDefaults, tc.defaults)
+		}
+	}
+
+	listed, err := manager.ListUpstreamServers()
+	if err != nil {
+		t.Fatalf("ListUpstreamServers: %v", err)
+	}
+	byName := map[string]*config.ServerConfig{}
+	for _, s := range listed {
+		byName[s.Name] = s
+	}
+	for _, tc := range cases {
+		s, ok := byName[tc.name]
+		if !ok {
+			t.Fatalf("[%s] missing from ListUpstreamServers — SaveConfiguration would drop this server", tc.name)
+		}
+		if !reflect.DeepEqual(s.AnnotationDefaults, tc.defaults) {
+			t.Errorf("[%s] List: AnnotationDefaults = %+v, want %+v",
+				tc.name, s.AnnotationDefaults, tc.defaults)
+		}
 	}
 }

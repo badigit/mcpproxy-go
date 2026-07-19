@@ -143,10 +143,18 @@ type UpstreamRecord struct {
 	// server list from these records — a field absent here is wiped on the
 	// next mutation, so REST/UI toggling (MCP-2932) and runtime enforcement
 	// (MCP-2931) would not survive a save/restart without it.
-	AutoApproveToolChanges *bool           `json:"auto_approve_tool_changes,omitempty"`
-	LauncherWaitTimeout    config.Duration `json:"launcher_wait_timeout,omitempty"` // Spec 046: max wait for locally-launched HTTP/SSE upstream URL to become reachable
-	EnabledTools           []string        `json:"enabled_tools,omitempty"`         // Allowlist: only these tools are exposed
-	DisabledTools          []string        `json:"disabled_tools,omitempty"`        // Denylist: these tools are hidden
+	AutoApproveToolChanges *bool `json:"auto_approve_tool_changes,omitempty"`
+	// AnnotationDefaults (fork) supplies fallback tool hints for upstreams that
+	// ship none. Persisted for the same reason as AutoApproveToolChanges above:
+	// SaveConfiguration replaces the JSON config's server list wholesale with
+	// records rebuilt from BBolt, so a field absent here is silently wiped from
+	// mcp_config.json on the next mutation (add server, approve from quarantine,
+	// restart) — and the read_only_only filter would quietly start dropping the
+	// affected server's tools again.
+	AnnotationDefaults  *config.ToolAnnotations `json:"annotation_defaults,omitempty"`
+	LauncherWaitTimeout config.Duration         `json:"launcher_wait_timeout,omitempty"` // Spec 046: max wait for locally-launched HTTP/SSE upstream URL to become reachable
+	EnabledTools        []string                `json:"enabled_tools,omitempty"`         // Allowlist: only these tools are exposed
+	DisabledTools       []string                `json:"disabled_tools,omitempty"`        // Denylist: these tools are hidden
 	// MCP-866: persist a server's registry origin + provenance so the
 	// approval/quarantine view and the custom-origin skip_quarantine guard
 	// survive a restart.
