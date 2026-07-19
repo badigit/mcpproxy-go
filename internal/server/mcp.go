@@ -2222,6 +2222,40 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 	}
 
+	// MCP separates transport errors from tool errors. An upstream can return a
+	// protocol-level SUCCESS whose CallToolResult carries IsError=true — the call
+	// reached the server and the server refused it. The `err != nil` branch above
+	// only catches transport failures, so without this an upstream rejection is
+	// recorded in history and activity as a success. That is actively misleading
+	// for destructive operations: a retried delete that the upstream refused
+	// would read as a completed delete in the audit trail.
+	if upstreamResult, ok := result.(*mcp.CallToolResult); ok && upstreamResult != nil && upstreamResult.IsError {
+		errMsg := toolResultErrorMessage(upstreamResult)
+		toolCallRecord.Error = errMsg
+
+		if storeErr := p.storage.RecordToolCall(toolCallRecord); storeErr != nil {
+			p.logger.Warn("Failed to record upstream error result", zap.Error(storeErr))
+		}
+
+		if sessionID != "" && tokenMetrics != nil {
+			p.markSessionWorked(ctx, sessionID)
+			p.sessionStore.UpdateSessionStats(sessionID, tokenMetrics.TotalTokens)
+		}
+
+		var intentMap map[string]interface{}
+		if intent != nil {
+			intentMap = intent.ToMap()
+		}
+		errorTruncated := tokenMetrics != nil && tokenMetrics.WasTruncated
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, duration.Milliseconds(), activityArgs, response, errorTruncated, toolVariant, intentMap, contentTrust, profileSlug, activityRequestBytes, activityResponseBytes, toonDetectionText, toonDecisions)
+
+		internalToolName := "call_tool_" + intent.OperationType
+		p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "error", errMsg, time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
+
+		// The payload still reaches the caller unchanged — only how we record it changes.
+		return forwarded, nil
+	}
+
 	// Store successful tool call in history
 	if err := p.storage.RecordToolCall(toolCallRecord); err != nil {
 		p.logger.Warn("Failed to record successful tool call", zap.Error(err))
@@ -5828,4 +5862,16 @@ func rawByteSize(v interface{}) int {
 		return 0
 	}
 	return len(b)
+}
+
+// toolResultErrorMessage extracts a human-readable message from an upstream
+// error result. MCP carries the failure reason in the content blocks rather
+// than in a dedicated field, so the first non-empty text block is the message.
+func toolResultErrorMessage(result *mcp.CallToolResult) string {
+	for _, content := range result.Content {
+		if text, ok := content.(mcp.TextContent); ok && text.Text != "" {
+			return text.Text
+		}
+	}
+	return "upstream tool returned an error result"
 }
