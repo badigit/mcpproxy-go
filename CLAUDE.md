@@ -157,6 +157,41 @@ tail -f ~/Library/Logs/mcpproxy/main.log  # main log (macOS; Linux: ~/.mcpproxy/
 - **macOS tray dev** (build / replace / verify with `mcpproxy-ui-test`): [docs/development/macos-tray.md](docs/development/macos-tray.md).
 - **Windows installer**: [docs/github-actions-windows-wix-research.md](docs/github-actions-windows-wix-research.md). **Prerelease** (`next` branch + `v*-rc.*` tags, opt-in, off stable channels): [docs/prerelease-builds.md](docs/prerelease-builds.md).
 
+## Production Deployment — TRUE flow (fork-specific; agents: read before "deploy")
+
+**Pushing to `badigit/mcpproxy-go` does NOT deploy production, and this repo publishes
+no images at all.** The fork's own `docker-publish.yml` was removed: it burned ~3 min of
+CI per push to publish `:main`/`:sha-<short>` images that nothing consumed, and it built
+from the Dockerfile below — which is not viable for the production stack (see the warning
+at the end of this section).
+
+**Production** runs on **beget-vps**, compose at `/opt/infra-docker/beget-vps/mcp-gateway/`,
+container `mcpproxy-go`, image `ghcr.io/badigit/mcpproxy-go:**latest**`. `:latest` is built
+ONLY by the **`badigit/infra-docker`** workflow `build-mcpproxy-go.yml`, which:
+1. builds from `beget-vps/mcp-gateway/mcpproxy-go/Dockerfile` (clones this fork and
+   `git checkout <MCPPROXY_REF>`, default `main`), pushing `:latest` + `:infra-<sha>`;
+2. SSHes to beget-vps → `git pull && docker compose pull mcpproxy-go && up -d` → verifies.
+
+Its triggers: manual `workflow_dispatch`, push to `beget-vps/mcp-gateway/mcpproxy-go/**`,
+or `repository_dispatch: mcpproxy-core-updated`. **The fork does NOT send that dispatch**
+(no outbound wire), so fork pushes never auto-deploy.
+
+**To deploy a fork commit to prod** (data needed: only `gh` access — SSH key/host live in
+infra-docker workflow secrets):
+```bash
+gh workflow run build-mcpproxy-go.yml -R badigit/infra-docker -f mcpproxy_ref=<branch|sha>
+gh run watch -R badigit/infra-docker <run-id>   # build (~4m) + deploy + verify
+```
+Pin a SHA for reproducibility. Deploy is deliberate/on-demand by design.
+
+⚠️ **Do not ship the image built from this repo's `Dockerfile`.** It is upstream's, and its
+runtime stage is `gcr.io/distroless/static-debian12` — no shell at all. `internal/shellwrap`
+wraps *every* plain stdio spawn in `/bin/bash -l -c` unconditionally (no container detection,
+no opt-out flag), so every stdio upstream — github, obsidian, remna, kontur-diadoc — dies with
+`fork/exec /bin/bash: no such file or directory`. The production Dockerfile in infra-docker is
+a separate file that starts from `alpine` and installs bash + nodejs + python3 for exactly this
+reason. Use this repo's Dockerfile for local Go builds only.
+
 ## Recent Changes
 - 084-toon-output: Adaptive TOON encoding of `call_tool_*` result text blocks (`internal/toonenc/`, seam in `internal/server/toon_encode.go`). Config `toon_output` (off|adaptive|always, per-server override) + `toon_min_savings_pct`; off by default, hot-reloadable; never-larger by construction; sanitise-before-encode, detection-parity, truncate-after-encode invariants. **New dependency: `github.com/toon-format/toon-go`** (the production encoder; shared with the spec-083 profiler). Docs: [docs/features/toon-output.md](docs/features/toon-output.md).
 - 083-discovery-profiler: Added Go 1.24 (bench package, same module as mcpproxy-go); Node.js ≥20 for the TSCG arm subprocess (CI-provided, matches existing E2E prereqs); Python via `uv` for dataset fetch + LAP (CI only)
