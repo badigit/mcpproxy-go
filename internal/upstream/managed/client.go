@@ -1332,6 +1332,14 @@ func (mc *Client) isConnectionError(err error) bool {
 		"Failed to reconnect SSE stream",
 		"Maximum reconnection attempts",
 		"connect ECONNREFUSED",
+		// Stale MCP session under a LIVE transport: when an upstream app restarts
+		// behind a persistent rathole tunnel, TCP stays up, so the only signal of
+		// the dead session is the app-level "Server not initialized" (or "client
+		// not initialized"). Classify it as a connection error so the health-check
+		// flips state to Error and the reconnect path performs a fresh MCP
+		// initialize — otherwise the upstream loops on "Failed to list tools ...
+		// Server not initialized" forever. Regression: tvp-wm0z / infra-eaj.
+		"not initialized",
 	}
 
 	for _, connErr := range connectionErrors {
