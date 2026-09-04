@@ -395,52 +395,63 @@ func findAvailablePort(t *testing.T) int {
 	return port
 }
 
+// buildTestConfig returns the test configuration as a JSON document.
+//
+// The config is assembled as Go values and marshalled, never formatted into a
+// JSON string literal: dataDir comes from os.MkdirTemp and on Windows contains
+// backslashes (`C:\Users\...`) which, pasted raw into JSON, become invalid
+// escapes (\U, \A). The binary then exits with a config error and every binary
+// E2E test in internal/server dies on a 60s WaitForReady timeout instead of
+// reporting the real cause.
+func buildTestConfig(port int, dataDir string) ([]byte, error) {
+	config := map[string]interface{}{
+		"listen":              fmt.Sprintf(":%d", port),
+		"data_dir":            dataDir,
+		"api_key":             TestAPIKey,
+		"enable_tray":         false,
+		"debug_search":        true,
+		"top_k":               10,
+		"tools_limit":         50,
+		"tool_response_limit": 20000,
+		"call_tool_timeout":   "30s",
+		"mcpServers": []map[string]interface{}{
+			{
+				"name":        "memory",
+				"protocol":    "stdio",
+				"command":     "npx",
+				"args":        []string{"-y", "@modelcontextprotocol/server-memory"},
+				"enabled":     true,
+				"quarantined": false,
+				"created":     "2025-01-01T00:00:00Z",
+			},
+		},
+		"environment": map[string]interface{}{
+			"inherit_system_safe": true,
+			"allowed_system_vars": []string{
+				"PATH",
+				"HOME",
+				"TMPDIR",
+				"TEMP",
+				"TMP",
+				"NODE_PATH",
+				"NPM_CONFIG_PREFIX",
+			},
+		},
+		"quarantine_enabled": false,
+		"docker_isolation": map[string]interface{}{
+			"enabled": false,
+		},
+	}
+
+	return json.MarshalIndent(config, "", "  ")
+}
+
 // createTestConfig creates a test configuration file
 func createTestConfig(t *testing.T, configPath string, port int, dataDir string) {
-	config := fmt.Sprintf(`{
-  "listen": ":%d",
-  "data_dir": "%s",
-  "api_key": "%s",
-  "enable_tray": false,
-  "debug_search": true,
-  "top_k": 10,
-  "tools_limit": 50,
-  "tool_response_limit": 20000,
-  "call_tool_timeout": "30s",
-  "mcpServers": [
-    {
-      "name": "memory",
-      "protocol": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ],
-      "enabled": true,
-      "quarantined": false,
-      "created": "2025-01-01T00:00:00Z"
-    }
-  ],
-  "environment": {
-    "inherit_system_safe": true,
-    "allowed_system_vars": [
-      "PATH",
-      "HOME",
-      "TMPDIR",
-      "TEMP",
-      "TMP",
-      "NODE_PATH",
-      "NPM_CONFIG_PREFIX"
-    ]
-  },
-  "quarantine_enabled": false,
-  "docker_isolation": {
-    "enabled": false
-  }
-}`, port, dataDir, TestAPIKey)
-
-	err := os.WriteFile(configPath, []byte(config), 0600)
+	config, err := buildTestConfig(port, dataDir)
 	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(configPath, config, 0600))
 }
 
 // MCPCallRequest represents an MCP call_tool request
