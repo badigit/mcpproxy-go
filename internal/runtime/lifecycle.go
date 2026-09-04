@@ -422,10 +422,15 @@ func (r *Runtime) DiscoverAndIndexToolsForServer(ctx context.Context, serverName
 
 // applyDifferentialToolUpdate performs differential update of tools for a server.
 // It compares new tools with existing indexed tools and applies only the changes:
-// - Removed tools are deleted from the index
-// - Added tools are indexed (unless blocked by tool-level quarantine)
-// - Modified tools (different hash) are re-indexed (unless blocked by tool-level quarantine)
-// - Tools blocked by quarantine are removed from the index if previously indexed
+//   - Removed tools are deleted from the index
+//   - Added tools are indexed (unless blocked by tool-level quarantine)
+//   - Modified tools are re-indexed (unless blocked by tool-level quarantine). A tool
+//     counts as modified when its upstream hash changed OR when the aliases attached
+//     to it by configuration changed (search_aliases / tool_aliases / domain_tags).
+//     Aliases are merged into the bleve document only at (re-)index time, so without
+//     the second condition an alias edit would never reach the index — see the
+//     AliasHash comments in config.ToolMetadata and index.AliasHash.
+//   - Tools blocked by quarantine are removed from the index if previously indexed
 func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName string, newTools []*config.ToolMetadata) error {
 	// Check tool-level quarantine approvals before indexing
 	approvalResult, err := r.checkToolApprovals(serverName, newTools)
@@ -436,6 +441,11 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 		approvalResult = &ToolApprovalResult{BlockedTools: make(map[string]bool)}
 	}
 
+	// Aliases the current configuration would attach to these tools. Computed
+	// once up front because it is needed twice: for change detection below and
+	// for the (re-)index calls further down.
+	aliasesMap := r.buildAliasesMap(serverName, newTools)
+
 	// Query existing tools from the index
 	existingTools, err := r.indexManager.GetToolsByServer(serverName)
 	if err != nil {
@@ -444,7 +454,7 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Error(err))
 		// Filter out blocked tools before full batch index
 		allowedTools := filterBlockedTools(newTools, approvalResult.BlockedTools)
-		return r.indexManager.BatchIndexToolsWithAliases(allowedTools, r.buildAliasesMap(serverName, allowedTools))
+		return r.indexManager.BatchIndexToolsWithAliases(allowedTools, aliasesMap)
 	}
 
 	// Build maps for efficient lookup
@@ -481,7 +491,16 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			// Tool is new
 			addedTools = append(addedTools, newTool)
 		} else if oldTool.Hash != newTool.Hash {
-			// Tool exists but has changed (different hash)
+			// Tool exists but its upstream data changed (different hash)
+			modifiedTools = append(modifiedTools, newTool)
+		} else if oldTool.AliasHash != index.AliasHash(aliasesMap[newTool.Name]) {
+			// Upstream data is identical, but the aliases configured for this
+			// tool changed (or aliases were added/removed). Re-index so the
+			// new keywords reach bleve; the tool hash is untouched, so the
+			// Spec 032 quarantine does not see this as a rug pull.
+			r.logger.Info("Tool aliases changed, scheduling re-index",
+				zap.String("server", serverName),
+				zap.String("tool", newTool.Name))
 			modifiedTools = append(modifiedTools, newTool)
 		}
 		// else: tool unchanged, no action needed
@@ -565,7 +584,7 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 			zap.Int("count", len(allowedAddedTools)),
 			zap.Int("blocked", len(addedTools)-len(allowedAddedTools)))
 
-		if err := r.indexManager.BatchIndexToolsWithAliases(allowedAddedTools, r.buildAliasesMap(serverName, allowedAddedTools)); err != nil {
+		if err := r.indexManager.BatchIndexToolsWithAliases(allowedAddedTools, aliasesMap); err != nil {
 			return fmt.Errorf("failed to index added tools: %w", err)
 		}
 	}
@@ -586,7 +605,7 @@ func (r *Runtime) applyDifferentialToolUpdate(ctx context.Context, serverName st
 				zap.String("new_hash", tool.Hash))
 		}
 
-		if err := r.indexManager.BatchIndexToolsWithAliases(allowedModifiedTools, r.buildAliasesMap(serverName, allowedModifiedTools)); err != nil {
+		if err := r.indexManager.BatchIndexToolsWithAliases(allowedModifiedTools, aliasesMap); err != nil {
 			return fmt.Errorf("failed to re-index modified tools: %w", err)
 		}
 	}

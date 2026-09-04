@@ -1,6 +1,8 @@
 package index
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -55,4 +57,21 @@ func ResolveDomain(serverCfg *config.ServerConfig, enriched *storage.EnrichedToo
 		return serverCfg.DomainTags[0]
 	}
 	return ""
+}
+
+// AliasHash returns a stable fingerprint of an aliases string as produced by
+// CollectAliases. An empty aliases string hashes to "" (not to the sha256 of
+// the empty input) so that "no aliases configured" is representable and
+// comparable across index documents written before aliases existed.
+//
+// This hash intentionally lives beside the tool hash instead of inside it:
+// the tool hash describes upstream data and drives the Spec 032 quarantine,
+// so folding config-derived aliases into it would make an alias edit look
+// like a rug pull.
+func AliasHash(aliases string) string {
+	if aliases == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(aliases))
+	return hex.EncodeToString(sum[:])
 }

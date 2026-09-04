@@ -517,11 +517,18 @@ func ConvertFromCursorFormat(cursorConfig *CursorMCPConfig) []*ServerConfig {
 
 // ToolMetadata represents tool information stored in the index
 type ToolMetadata struct {
-	Name        string           `json:"name"`
-	ServerName  string           `json:"server_name"`
-	Description string           `json:"description"`
-	ParamsJSON  string           `json:"params_json"`
-	Hash        string           `json:"hash"`
+	Name        string `json:"name"`
+	ServerName  string `json:"server_name"`
+	Description string `json:"description"`
+	ParamsJSON  string `json:"params_json"`
+	Hash        string `json:"hash"`
+	// AliasHash is the SHA-256 of the aliases string attached to this tool at
+	// index time (see index.CollectAliases / index.AliasHash). It is derived
+	// from proxy configuration, NOT from upstream data, and is deliberately
+	// kept out of Hash: Hash feeds the Spec 032 quarantine, where an alias
+	// edit must not look like a rug pull. Populated only when read back from
+	// the search index; empty everywhere else.
+	AliasHash   string           `json:"alias_hash,omitempty"`
 	Created     time.Time        `json:"created"`
 	Updated     time.Time        `json:"updated"`
 	Annotations *ToolAnnotations `json:"annotations,omitempty"`

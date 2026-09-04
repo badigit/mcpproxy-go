@@ -20,7 +20,9 @@ import (
 )
 
 // enruAnalyzerName is the custom analyzer chained as
-//   unicode tokenizer → lowercase → stop_en → stop_ru → stemmer_en → stemmer_ru.
+//
+//	unicode tokenizer → lowercase → stop_en → stop_ru → stemmer_en → stemmer_ru.
+//
 // Applied to all text fields that may contain Russian or English content
 // (description, aliases, searchable_text, tags). This fixes BM25 ranking on
 // inflected Russian queries — "лицензий" and "лицензии" reduce to the same
@@ -33,7 +35,8 @@ const enruAnalyzerName = "enru"
 // when analyzers or field types change — older indexes are detected via the
 // version marker file and rebuilt from scratch on next startup. Version 1 =
 // pre-enru (standard analyzer on text fields). Version 2 = enru analyzer.
-const bleveMappingVersion = 2
+// Version 3 = stored alias_hash field (differential re-index on alias edits).
+const bleveMappingVersion = 3
 
 // mappingVersionFile is the sentinel written next to the bleve directory.
 // We deliberately do NOT put it inside index.bleve/ so wiping the index
@@ -49,19 +52,24 @@ type BleveIndex struct {
 
 // ToolDocument represents a tool document in the index
 type ToolDocument struct {
-	ToolName       string `json:"tool_name"`      // Just the tool name (without server prefix)
-	FullToolName   string `json:"full_tool_name"` // Complete server:tool format
-	ServerName     string `json:"server_name"`
-	Description    string `json:"description"`
-	ParamsJSON     string `json:"params_json"`
-	Hash           string `json:"hash"`
-	Tags           string `json:"tags"`
+	ToolName     string `json:"tool_name"`      // Just the tool name (without server prefix)
+	FullToolName string `json:"full_tool_name"` // Complete server:tool format
+	ServerName   string `json:"server_name"`
+	Description  string `json:"description"`
+	ParamsJSON   string `json:"params_json"`
+	Hash         string `json:"hash"`
+	Tags         string `json:"tags"`
 	// Aliases collects keywords from per-server SearchAliases, per-tool
 	// ToolAliases, DomainTags, and LLM enrichment (keywords +
 	// example_queries). Indexed with boost=3 via SearchTools so a match
 	// here outranks a match in Description. Stored so we can return it
 	// to debug consumers; empty when no aliases are configured.
-	Aliases        string `json:"aliases,omitempty"`
+	Aliases string `json:"aliases,omitempty"`
+	// AliasHash fingerprints Aliases (see index.AliasHash). Stored but not
+	// indexed: it exists so the runtime's differential update can notice an
+	// aliases-only change and re-index the tool even when its upstream hash
+	// is untouched. Empty when the tool has no aliases.
+	AliasHash      string `json:"alias_hash,omitempty"`
 	SearchableText string `json:"searchable_text"` // Combined searchable content
 }
 
@@ -205,6 +213,14 @@ func createBleveIndex(indexPath string) (bleve.Index, error) {
 	hashField.Index = false // Don't index hash for search
 	toolMapping.AddFieldMappingsAt("hash", hashField)
 
+	// Alias hash field (keyword analyzer, stored only). Used by the runtime
+	// to detect aliases-only changes; never queried by users.
+	aliasHashField := bleve.NewTextFieldMapping()
+	aliasHashField.Analyzer = keyword.Name
+	aliasHashField.Store = true
+	aliasHashField.Index = false
+	toolMapping.AddFieldMappingsAt("alias_hash", aliasHashField)
+
 	// Tags field — bilingual analyzer (operators may put russian domain tags).
 	tagsField := bleve.NewTextFieldMapping()
 	tagsField.Analyzer = enruAnalyzerName
@@ -279,6 +295,7 @@ func (b *BleveIndex) IndexToolWithAliases(toolMeta *config.ToolMetadata, aliases
 		Hash:           toolMeta.Hash,
 		Tags:           "",
 		Aliases:        aliases,
+		AliasHash:      AliasHash(aliases),
 		SearchableText: searchableText,
 	}
 
@@ -461,6 +478,7 @@ func (b *BleveIndex) BatchIndexWithAliases(tools []*config.ToolMetadata, aliases
 			Hash:           toolMeta.Hash,
 			Tags:           "",
 			Aliases:        aliases,
+			AliasHash:      AliasHash(aliases),
 			SearchableText: searchableText,
 		}
 
@@ -496,7 +514,7 @@ func (b *BleveIndex) GetToolsByServer(serverName string) ([]*config.ToolMetadata
 	// Create search request with high limit to get all tools
 	searchReq := bleve.NewSearchRequest(query)
 	searchReq.Size = 10000 // Maximum tools per server
-	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash"}
+	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "hash", "alias_hash"}
 
 	b.logger.Debug("Querying tools by server", zap.String("server", serverName))
 
@@ -514,6 +532,7 @@ func (b *BleveIndex) GetToolsByServer(serverName string) ([]*config.ToolMetadata
 			Description: getStringField(hit.Fields, "description"),
 			ParamsJSON:  getStringField(hit.Fields, "params_json"),
 			Hash:        getStringField(hit.Fields, "hash"),
+			AliasHash:   getStringField(hit.Fields, "alias_hash"),
 		}
 		tools = append(tools, toolMeta)
 	}

@@ -2,6 +2,7 @@ package index
 
 import (
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -348,7 +349,8 @@ func TestBleveMappingMigration(t *testing.T) {
 	markerPath := tmpDir + string(os.PathSeparator) + mappingVersionFile
 	data, err := os.ReadFile(markerPath)
 	require.NoError(t, err, "marker file must be written on first boot")
-	assert.Contains(t, string(data), "2", "marker should record current mapping version")
+	assert.Contains(t, string(data), strconv.Itoa(bleveMappingVersion),
+		"marker should record current mapping version")
 
 	// Pretend an older binary wrote version 1 (pre-enru). Reopen and verify
 	// the index gets rebuilt — easiest tell is that the previous documents
