@@ -22,6 +22,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 )
 
 // TestEnvironment holds all test dependencies
@@ -1839,6 +1840,109 @@ func TestE2E_RequestID_ActivityFiltering(t *testing.T) {
 	})
 
 	t.Log("✅ All Request ID Activity Filtering E2E tests passed")
+}
+
+// TestE2E_Activity_UpstreamErrorResult verifies that an MCP error result
+// (IsError=true, nil Go error) is persisted as a failed tool call. This is
+// important for destructive calls: a retry after a successful delete must not
+// be represented as a successful audit event when the upstream returned an
+// error result.
+func TestE2E_Activity_UpstreamErrorResult(t *testing.T) {
+	env := NewTestEnvironment(t)
+	defer env.Cleanup()
+
+	const serverName = "error-result-server"
+	const toolName = "always_fails"
+
+	mockServer := env.CreateMockUpstreamServer(serverName, nil)
+	mockServer.server.AddTool(mcp.Tool{
+		Name:        toolName,
+		Description: "Returns an MCP error result for activity logging tests.",
+		InputSchema: mcp.ToolInputSchema{Type: "object"},
+	}, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultError("upstream rejected destructive operation"), nil
+	})
+
+	mcpClient := env.CreateProxyClient()
+	defer mcpClient.Close()
+	env.ConnectClient(mcpClient)
+
+	ctx := context.Background()
+	addRequest := mcp.CallToolRequest{}
+	addRequest.Params.Name = "upstream_servers"
+	addRequest.Params.Arguments = map[string]interface{}{
+		"operation": "add",
+		"name":      serverName,
+		"url":       mockServer.addr,
+		"protocol":  "streamable-http",
+		"enabled":   true,
+	}
+	addResult, err := mcpClient.CallTool(ctx, addRequest)
+	require.NoError(t, err)
+	require.False(t, addResult.IsError, "test upstream must be added")
+
+	serverConfig, err := env.proxyServer.runtime.StorageManager().GetUpstreamServer(serverName)
+	require.NoError(t, err)
+	serverConfig.Quarantined = false
+	require.NoError(t, env.proxyServer.runtime.StorageManager().SaveUpstreamServer(serverConfig))
+	servers, err := env.proxyServer.runtime.StorageManager().ListUpstreamServers()
+	require.NoError(t, err)
+	cfg := env.proxyServer.runtime.Config()
+	cfg.Servers = servers
+	require.NoError(t, env.proxyServer.runtime.LoadConfiguredServers(cfg))
+	time.Sleep(3 * time.Second)
+	require.NoError(t, env.proxyServer.runtime.DiscoverAndIndexTools(ctx))
+	time.Sleep(3 * time.Second)
+
+	callRequest := mcp.CallToolRequest{}
+	callRequest.Params.Name = contracts.ToolVariantDestructive
+	callRequest.Params.Arguments = map[string]interface{}{
+		"name": serverName + ":" + toolName,
+		"args": map[string]interface{}{},
+		"intent": map[string]interface{}{
+			"operation_type":   contracts.OperationTypeDestructive,
+			"data_sensitivity": contracts.DataSensitivityInternal,
+			"reason":           "Regression test for upstream MCP error result",
+		},
+	}
+	result, err := mcpClient.CallTool(ctx, callRequest)
+	require.NoError(t, err)
+	require.True(t, result.IsError, "the proxy must forward the upstream MCP error result")
+	// Activity writes are asynchronous.
+	time.Sleep(100 * time.Millisecond)
+
+	records, _, err := env.proxyServer.runtime.ListActivities(storage.ActivityFilter{
+		Server:                 serverName,
+		Tool:                   toolName,
+		Limit:                  10,
+		ExcludeCallToolSuccess: false,
+	})
+	require.NoError(t, err)
+	var toolCall *storage.ActivityRecord
+	for _, record := range records {
+		if record.Type == storage.ActivityTypeToolCall {
+			toolCall = record
+		}
+	}
+	require.NotNil(t, toolCall)
+	assert.Equal(t, "error", toolCall.Status)
+	assert.Contains(t, toolCall.ErrorMessage, "upstream rejected destructive operation")
+
+	internalRecords, _, err := env.proxyServer.runtime.ListActivities(storage.ActivityFilter{
+		Server:                 serverName,
+		Limit:                  10,
+		ExcludeCallToolSuccess: false,
+	})
+	require.NoError(t, err)
+	var internalCall *storage.ActivityRecord
+	for _, record := range internalRecords {
+		if record.Type == storage.ActivityTypeInternalToolCall && record.ToolName == contracts.ToolVariantDestructive {
+			internalCall = record
+			break
+		}
+	}
+	require.NotNil(t, internalCall)
+	assert.Equal(t, "error", internalCall.Status)
 }
 
 // ============================================================================

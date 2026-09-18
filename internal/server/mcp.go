@@ -1838,6 +1838,36 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		return p.createDetailedErrorResponse(err, serverName, actualToolName), nil
 	}
 
+	// MCP separates transport errors from tool errors. An upstream can return a
+	// successful protocol response whose CallToolResult has IsError=true. Treat
+	// that as a failed execution for history and activity; otherwise a retried
+	// destructive operation is misleadingly recorded as a success.
+	if upstreamResult, ok := result.(*mcp.CallToolResult); ok && upstreamResult != nil && upstreamResult.IsError {
+		errMsg := toolResultErrorMessage(upstreamResult)
+		toolCallRecord.Error = errMsg
+		toolCallRecord.Response = result
+
+		if storeErr := p.storage.RecordToolCall(toolCallRecord); storeErr != nil {
+			p.logger.Warn("Failed to record upstream error result", zap.Error(storeErr))
+		}
+
+		if sessionID != "" && tokenMetrics != nil {
+			p.sessionStore.UpdateSessionStats(sessionID, tokenMetrics.TotalTokens)
+		}
+
+		forwarded, response, wasTruncated := forwardContentResult(result, p.truncator, p.cacheManager, toolName, args)
+		var intentMap map[string]interface{}
+		if intent != nil {
+			intentMap = intent.ToMap()
+		}
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, duration.Milliseconds(), activityArgs, response, wasTruncated, toolVariant, intentMap, contentTrust)
+
+		internalToolName := "call_tool_" + intent.OperationType
+		p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "error", errMsg, time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
+
+		return forwarded, nil
+	}
+
 	// Record successful response
 	toolCallRecord.Response = result
 
@@ -1902,6 +1932,15 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
 
 	return forwarded, nil
+}
+
+func toolResultErrorMessage(result *mcp.CallToolResult) string {
+	for _, content := range result.Content {
+		if text, ok := content.(mcp.TextContent); ok && text.Text != "" {
+			return text.Text
+		}
+	}
+	return "upstream tool returned an error result"
 }
 
 // handleCallTool is the LEGACY call_tool handler - returns error directing to new variants (Spec 018)
