@@ -1,9 +1,6 @@
 name: Prerelease
 
 on:
-  push:
-    branches: [next]
-    tags: ["v*-rc.*", "v*-next.*"]
   workflow_dispatch:
 
 permissions:

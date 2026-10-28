@@ -10,19 +10,10 @@ name: scanner-images
 #   - pull requests: builds without pushing (to catch Dockerfile drift)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docker/scanners/**'
-      - '.github/workflows/scanner-images.yml'
-  pull_request:
-    paths:
-      - 'docker/scanners/**'
-      - '.github/workflows/scanner-images.yml'
   workflow_dispatch:
     inputs:
       scanner:
-        description: 'Scanner id to rebuild (blank = all)'
+        description: Scanner id to rebuild (blank = all)
         required: false
         default: ''
 

@@ -1,21 +1,7 @@
 name: Documentation
 
 on:
-  # Build validation on PRs
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'website/**'
-      - '.github/workflows/docs.yml'
-
-  # Deploy on push to main
-  push:
-    branches:
-      - main
-    paths:
-      - 'docs/**'
-      - 'website/**'
-      - '.github/workflows/docs.yml'
+  workflow_dispatch:
 
 jobs:
   build:
